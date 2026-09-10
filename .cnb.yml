@@ -1,0 +1,19 @@
+main:
+  push:
+    - name: req-guard verify
+      stages:
+        - name: rust
+          image: rust:1-slim-bookworm
+          script: |
+            set -e
+            rustup component add clippy rustfmt
+            cargo fmt --all --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test
+            cargo build --release
+            if command -v python3 >/dev/null 2>&1; then
+              python3 scripts/verify_gate.py
+            else
+              echo "本镜像无 python3，跳过拦截脚本场景验证；"
+              echo "请在本地或 GitHub Actions 执行：python3 scripts/verify_gate.py"
+            fi

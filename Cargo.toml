@@ -1,0 +1,12 @@
+[package]
+name = "req-guard"
+version = "0.1.0"
+edition = "2021"
+description = "AI 需求门禁：三段清单审核（需求分解/技术方案/测试计划）+ 硬拦截"
+
+# 零外部依赖：CLI 手写解析，模板用内置 {{var}} 替换，拦截判定用 grep/sed 脚本。
+# 目的是开箱即 build、无供应链面，且可被 gates-toolkit 的 setup-gates 直接分发。
+
+[[bin]]
+name = "req-guard"
+path = "src/main.rs"
