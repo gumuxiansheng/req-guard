@@ -28,10 +28,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: 静态检查（零警告为门槛）
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: 单元测试
-        run: cargo test
+      - name: 单元测试（全 workspace）
+        run: cargo test --workspace
 
       - name: 拦截脚本场景验证
         shell: bash
@@ -39,5 +39,8 @@ jobs:
           PY=$(command -v python3 || command -v python || echo python)
           "$PY" scripts/verify_gate.py
 
-      - name: 构建 release
+      - name: 构建 release（默认：零 UI 依赖）
         run: cargo build --release
+
+      - name: 构建 release（含 TUI）
+        run: cargo build -p req-guard --release --features tui

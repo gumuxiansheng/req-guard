@@ -12,6 +12,12 @@ path = "src/main.rs"
 # 需要界面时再开 feature（见《UI架构细化方案.md》§1.1）。
 [features]
 default = []
+# CLI + TUI（依赖小：ratatui + crossterm）
+tui = ["dep:req-guard-tui"]
+# 预留：GUI（eframe）—— P3 落地后改为 ["dep:req-guard-gui"]。
+# 先声明空 feature，让 `cfg!(feature = "gui")` 有确定语义。
+gui = []
 
 [dependencies]
 req-guard-core = { path = "../core" }
+req-guard-tui = { path = "../tui", optional = true }

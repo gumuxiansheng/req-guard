@@ -12,6 +12,7 @@ use req_guard_core::error::{GateError, Result};
 use req_guard_core::gate;
 use req_guard_core::requirement;
 use req_guard_core::status;
+use std::path::Path;
 
 fn main() {
     let parsed = match cli::parse() {
@@ -207,8 +208,48 @@ fn run(a: &cli::Args) -> Result<()> {
             println!("   令牌 : {}", p.display());
             println!("   到期后自动恢复硬拦截；请事后补齐清单审核。");
         }
+        Action::Ui => run_ui(root, a)?,
     }
     Ok(())
+}
+
+/// 打开门禁管理台：按**构建 feature + 运行环境**选择界面（见《UI架构细化方案.md》§3）。
+///
+/// 界面只做管理台，所有状态读写都走 core，与 CLI 行为完全等价。
+fn run_ui(root: &Path, a: &cli::Args) -> Result<()> {
+    use req_guard_core::ui_mode::{self, UiAvailability, UiMode};
+
+    let forced = if a.gui {
+        Some(UiMode::Gui)
+    } else if a.tui {
+        Some(UiMode::Tui)
+    } else {
+        None
+    };
+    let avail = UiAvailability {
+        gui: cfg!(feature = "gui"),
+        tui: cfg!(feature = "tui"),
+    };
+    let mode = ui_mode::detect(forced, avail, &ui_mode::EnvFacts::capture())?;
+
+    match mode {
+        UiMode::Tui => {
+            #[cfg(feature = "tui")]
+            {
+                req_guard_tui::run(root)
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                Err(GateError::Validation(format!(
+                    "本次构建未包含 TUI（项目 {}）。请用 `cargo build -p req-guard --features tui` 重新构建",
+                    root.display()
+                )))
+            }
+        }
+        UiMode::Gui => Err(GateError::Validation(
+            "GUI 管理台尚未提供（规划在 P3）。当前可用：req-guard ui --tui".into(),
+        )),
+    }
 }
 
 /// 身份：优先命令行参数，回退环境变量 `REQ_GUARD_REVIEWER`，都没有则报错。

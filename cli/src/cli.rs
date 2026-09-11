@@ -31,6 +31,8 @@ pub enum Action {
     Check,
     Install,
     Bypass,
+    /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
+    Ui,
 }
 
 pub struct Args {
@@ -50,6 +52,10 @@ pub struct Args {
     pub tools: Vec<String>,
     pub ttl: u64,
     pub refresh_anchors: bool,
+    /// `ui --gui`：强制图形界面。
+    pub gui: bool,
+    /// `ui --tui`：强制终端界面。
+    pub tui: bool,
 }
 
 pub struct Parsed {
@@ -80,6 +86,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "check" => Action::Check,
         "install" => Action::Install,
         "bypass" => Action::Bypass,
+        "ui" => Action::Ui,
         "-h" | "--help" => return Err(help()),
         other => return Err(format!("未知命令: {}\n\n{}", other, help())),
     };
@@ -101,6 +108,8 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         tools: Vec::new(),
         ttl: 60,
         refresh_anchors: false,
+        gui: false,
+        tui: false,
     };
 
     while let Some(arg) = it.next() {
@@ -116,6 +125,8 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--reason" => a.reason = Some(next(&mut it, "--reason")?),
             "--blocking" => a.blocking = true,
             "--refresh-anchors" => a.refresh_anchors = true,
+            "--gui" => a.gui = true,
+            "--tui" => a.tui = true,
             "--tool" => {
                 let v = next(&mut it, "--tool")?;
                 for p in v.split(',') {
@@ -182,6 +193,9 @@ fn validate(a: &Args) -> std::result::Result<(), String> {
         Action::Bypass if a.reason.is_none() => {
             return Err("bypass 必须填写 --reason <原因>（用于审计追溯）".into());
         }
+        Action::Ui if a.gui && a.tui => {
+            return Err("--gui 与 --tui 不能同时使用（不指定则自动探测）".into());
+        }
         _ => {}
     }
     Ok(())
@@ -214,6 +228,7 @@ fn help() -> String {
   check                      手动拦截判定（退出码 0 放行 / 1 拦截）\n\
   install  [--tool <a,b>]    安装或修复拦截\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
+  ui       [--gui | --tui]   打开门禁管理台（需以 --features tui 构建）\n\
 \n\
 通用选项:\n\
   -p, --path <项目根>   默认当前目录\n\

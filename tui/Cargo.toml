@@ -1,0 +1,16 @@
+[package]
+name = "req-guard-tui"
+version = "0.1.0"
+edition = "2021"
+description = "req-guard 终端界面（ratatui + crossterm）"
+
+# 本 crate 是 **lib** 而非 bin：由 cli 用 feature 链进同一个二进制，
+# 实现「单文件分发 + 自动选界面」（见《UI架构细化方案.md》§1.1）。
+[dependencies]
+req-guard-core = { path = "../core" }
+ratatui = "0.30"
+crossterm = "0.29"
+
+[dev-dependencies]
+# 仅测试用：把 TestBackend 缓冲摊平成文本时，需要正确跳过宽字符（CJK）的占位 cell。
+unicode-width = "0.2"

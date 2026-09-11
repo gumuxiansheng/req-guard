@@ -65,8 +65,22 @@ req-guard check                                            # 手动判定（CI �
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass`
+`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `ui`
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`）
+
+## 门禁管理台（TUI）
+
+```bash
+cargo build -p req-guard --features tui   # 带 TUI 的构建（默认构建不含界面依赖）
+req-guard ui            # 自动探测：Windows/macOS → GUI（规划中），SSH 会话 → TUI
+req-guard ui --tui      # 强制终端界面
+```
+
+键位：`↑↓` 选择需求 · `←→/Tab` 切段 · `a` 批准 · `r` 打回 · `n` 新建 · `g` 门禁检查 ·
+`b` 应急绕过 · `L` 审计日志 · `R` 刷新 · `?` 帮助 · `q` 退出。
+
+> 界面只做**管理台**：状态读写全部走 core，与 CLI 行为完全等价（不会出现"界面放行、CLI 拦截"）。
+> 清单正文在 TUI 中**只读**——正文由 AI/编辑器维护，界面只负责审核决策。
 
 ## 与 gates-toolkit 的关系
 
@@ -86,18 +100,31 @@ req-guard check                                            # 手动判定（CI �
 
 ## 构建与验证
 
+工程为 cargo workspace：`core`（零依赖 lib）+ `cli`（唯一 bin）+ `tui`（界面 lib）。
+
 ```bash
-cargo build --release                  # 零依赖，仅需 rustc
+cargo build --release                  # 默认只构建 core + cli：零 UI 依赖、秒级
+cargo build -p req-guard --features tui --release   # 含 TUI
 cargo zigbuild --target x86_64-pc-windows-gnu   # 交叉编译（本机既有工作流）
 
 cargo fmt --all                        # 格式
-cargo clippy --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test                             # 单元测试（26 用例）
+cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
+cargo test --workspace                 # 单元测试（44 用例）
 python scripts/verify_gate.py          # 拦截脚本真机场景（10 场景）
 ```
 
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，
 > 直接 `cargo build` 会失败。需把 MSVC `bin/Hostx64/x64` 前置到 `PATH`，并设置 `LIB`
 > 指向 MSVC `lib/x64` 与 Windows Kits 的 `um/x64`、`ucrt/x64`。
+
+## 源码结构
+
+```
+core/  req-guard-core   零依赖 lib：error / requirement / comment / gate / status / ui_mode
+cli/   req-guard        唯一 bin：main + cli（参数解析）+ render（文本渲染）
+tui/   req-guard-tui    终端界面 lib：app（状态机）+ ui（渲染）
+```
+
+判定逻辑只有一份，在 `core`；三个前端只负责渲染——这是"GUI 与 CLI 不会行为漂移"的根本保证。
 
 详细设计见《技术方案.md》《需求分析报告.md》；架构决策见 dev-scaffold `架构决策记录.md` ADR-001。

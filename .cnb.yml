@@ -8,9 +8,10 @@ main:
             set -e
             rustup component add clippy rustfmt
             cargo fmt --all --check
-            cargo clippy --all-targets -- -D warnings
-            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
             cargo build --release
+            cargo build -p req-guard --release --features tui
             if command -v python3 >/dev/null 2>&1; then
               python3 scripts/verify_gate.py
             else

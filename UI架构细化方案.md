@@ -293,14 +293,14 @@ cc.egui_ctx.set_fonts(fonts);
 
 ## 7. 落地清单（分阶段）
 
-| 阶段 | 内容 | 产出 | 验证 |
-| --- | --- | --- | --- |
-| **P0** | workspace 化：建 `core`/`cli`/`tui`/`gui` 骨架；`src/*.rs` 迁入 core；`resolver="2"` | 目录 + Cargo.toml | `cargo build` 后所有 CLI 命令输出与迁移前一致 |
-| **P1** | core API 结构化：新增 `ReqStatus`/`StepStatus`/`GateVerdict`；`print_status` 改为返回数据 | core API | 单测：状态机与解析 |
-| **P2** | **TUI 先行**：ratatui 0.30 + crossterm 0.29，列表/详情/批准/打回/审计 | `req-guard ui --tui` | 真机键盘全流程 |
-| **P3** | GUI：eframe 0.36.1 + Noto Sans SC 子集 + rfd | `req-guard ui --gui` | 真机截图 + 中文无豆腐块 |
-| **P4** | 合一：`ui` 子命令自动探测 + GUI 失败回退 TUI + `--features full` | 单二进制 | 桌面走 GUI、SSH 走 TUI、无图形的 Linux 会回退 |
-| **P5** | CI 多平台矩阵 + 文档更新 | 产物 + 文档 | 三平台可下载 |
+| 阶段 | 内容 | 产出 | 验证 | 状态（2026-09-11） |
+| --- | --- | --- | --- | --- |
+| **P0** | workspace 化：建 `core`/`cli` 骨架；`src/*.rs` 迁入 core；`resolver="2"` | 目录 + Cargo.toml | `cargo build` 后所有 CLI 命令输出与迁移前一致 | ✅ 完成（git mv 保留历史；12 命令逐项比对一致） |
+| **P1** | core API 结构化：新增 `ReqStatus`/`StepStatus`/`GateVerdict`/`UiMode`；`print_status` 改为返回数据 | core API | 单测：状态机与解析 | ✅ 完成（+13 单测；渲染下沉到 `cli::render`） |
+| **P2** | **TUI 先行**：ratatui 0.30 + crossterm 0.29，列表/详情/批准/打回/审计 | `req-guard ui --tui` | 真机键盘全流程 | ✅ 完成（+5 渲染冒烟测试；真机可起界面） |
+| **P3** | GUI：eframe 0.36.1 + Noto Sans SC 子集 + rfd | `req-guard ui --gui` | 真机截图 + 中文无豆腐块 | ⬜ 未开始 |
+| **P4** | 合一：`ui` 子命令自动探测 + GUI 失败回退 TUI + `--features full` | 单二进制 | 桌面走 GUI、SSH 走 TUI、无图形的 Linux 会回退 | 🔶 部分（探测决策表与 `ui` 子命令已就绪，GUI 分支待 P3） |
+| **P5** | CI 多平台矩阵 + 文档更新 | 产物 + 文档 | 三平台可下载 | 🔶 部分（三平台 fmt/clippy/test 已接入，产物矩阵待补） |
 
 ### 为什么 TUI 先行（P2 早于 P3）
 
