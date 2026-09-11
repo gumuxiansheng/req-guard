@@ -44,3 +44,8 @@ jobs:
 
       - name: 构建 release（含 TUI）
         run: cargo build -p req-guard --release --features tui
+
+      - name: 构建 release（含 GUI）
+        if: runner.os != 'Linux'
+        # Linux 需要 X11/Wayland 系统库（libxcb/libxkbcommon 等），交给 P5 的产物矩阵处理
+        run: cargo build -p req-guard --release --features gui

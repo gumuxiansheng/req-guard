@@ -14,10 +14,12 @@ path = "src/main.rs"
 default = []
 # CLI + TUI（依赖小：ratatui + crossterm）
 tui = ["dep:req-guard-tui"]
-# 预留：GUI（eframe）—— P3 落地后改为 ["dep:req-guard-gui"]。
-# 先声明空 feature，让 `cfg!(feature = "gui")` 有确定语义。
-gui = []
+# CLI + GUI（依赖大：eframe ≈ 18–64MB，含内嵌中文字体）
+gui = ["dep:req-guard-gui"]
+# 三合一：单二进制自动探测（桌面 → GUI，SSH → TUI）
+full = ["tui", "gui"]
 
 [dependencies]
 req-guard-core = { path = "../core" }
 req-guard-tui = { path = "../tui", optional = true }
+req-guard-gui = { path = "../gui", optional = true }

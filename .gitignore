@@ -1,1 +1,4 @@
 /target
+# 字体中间产物（完整版 8MB，子集化后由脚本删除；见 scripts/make_font_subset.py）
+gui/assets/*.full.otf
+gui/assets/unicodes.txt

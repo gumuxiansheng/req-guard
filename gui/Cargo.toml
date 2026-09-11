@@ -1,0 +1,15 @@
+[package]
+name = "req-guard-gui"
+version = "0.1.0"
+edition = "2021"
+description = "req-guard 桌面门禁管理台（eframe / egui）"
+
+# 本 crate 是 **lib**：由 cli 用 feature 链进同一个二进制，
+# 实现「单文件分发 + 自动选界面」（见《UI架构细化方案.md》§1.1）。
+#
+# 依赖说明：GUI 是唯一引入重量依赖的地方（eframe ≈ 18–64MB），
+# 因此必须 feature 门控，绝不污染 default 构建。
+[dependencies]
+req-guard-core = { path = "../core" }
+eframe = { version = "0.36.1", default-features = false, features = ["wgpu"] }
+rfd = "0.15"

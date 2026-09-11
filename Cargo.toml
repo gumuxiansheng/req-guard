@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "tui"]
+members = ["core", "cli", "tui", "gui"]
 # 默认只构建零依赖的 core + cli：根目录 `cargo build` 依然是秒级、无 UI 依赖。
 # 需要界面时显式指定：`cargo build -p req-guard --features tui`。
 default-members = ["core", "cli"]

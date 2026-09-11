@@ -68,19 +68,27 @@ req-guard check                                            # 手动判定（CI �
 `init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `ui`
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`）
 
-## 门禁管理台（TUI）
+## 门禁管理台（TUI / GUI）
 
 ```bash
-cargo build -p req-guard --features tui   # 带 TUI 的构建（默认构建不含界面依赖）
-req-guard ui            # 自动探测：Windows/macOS → GUI（规划中），SSH 会话 → TUI
+cargo build -p req-guard --features tui   # CLI + 终端界面（依赖小）
+cargo build -p req-guard --features gui   # CLI + 桌面界面（依赖大，含内嵌中文字体）
+cargo build -p req-guard --features full  # 三合一，单二进制自动探测
+
+req-guard ui            # 自动探测：Windows/macOS → GUI，SSH 会话 / 无图形环境 → TUI
 req-guard ui --tui      # 强制终端界面
+req-guard ui --gui      # 强制桌面界面
 ```
 
-键位：`↑↓` 选择需求 · `←→/Tab` 切段 · `a` 批准 · `r` 打回 · `n` 新建 · `g` 门禁检查 ·
+TUI 键位：`↑↓` 选择需求 · `←→/Tab` 切段 · `a` 批准 · `r` 打回 · `n` 新建 · `g` 门禁检查 ·
 `b` 应急绕过 · `L` 审计日志 · `R` 刷新 · `?` 帮助 · `q` 退出。
 
+GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段折叠清单（状态 + 审核人 + 只读正文 + 批准/打回）、
+底部操作区（创建/刷新/检查/绕过/审计），另可切换项目根目录。
+
 > 界面只做**管理台**：状态读写全部走 core，与 CLI 行为完全等价（不会出现"界面放行、CLI 拦截"）。
-> 清单正文在 TUI 中**只读**——正文由 AI/编辑器维护，界面只负责审核决策。
+> 清单正文在界面中**只读**——正文由 AI/编辑器维护，界面只负责审核决策。
+> GUI 启动失败（无图形栈 / wgpu 初始化失败）时会**自动回退到 TUI**（`full` 特性下）。
 
 ## 与 gates-toolkit 的关系
 
@@ -123,8 +131,12 @@ python scripts/verify_gate.py          # 拦截脚本真机场景（10 场景）
 core/  req-guard-core   零依赖 lib：error / requirement / comment / gate / status / ui_mode
 cli/   req-guard        唯一 bin：main + cli（参数解析）+ render（文本渲染）
 tui/   req-guard-tui    终端界面 lib：app（状态机）+ ui（渲染）
+gui/   req-guard-gui    桌面界面 lib：app + fonts（内嵌 Noto Sans SC 子集）
 ```
 
 判定逻辑只有一份，在 `core`；三个前端只负责渲染——这是"GUI 与 CLI 不会行为漂移"的根本保证。
+
+中文字体：`gui/assets/NotoSansSC-Regular.otf`（Noto Sans SC 子集，SIL OFL 许可，见
+`gui/assets/OFL-NOTO.txt`）；用 `scripts/make_font_subset.py` 可重新生成。
 
 详细设计见《技术方案.md》《需求分析报告.md》；架构决策见 dev-scaffold `架构决策记录.md` ADR-001。

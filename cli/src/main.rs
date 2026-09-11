@@ -246,9 +246,35 @@ fn run_ui(root: &Path, a: &cli::Args) -> Result<()> {
                 )))
             }
         }
-        UiMode::Gui => Err(GateError::Validation(
-            "GUI 管理台尚未提供（规划在 P3）。当前可用：req-guard ui --tui".into(),
-        )),
+        UiMode::Gui => {
+            #[cfg(feature = "gui")]
+            {
+                // 兜底：GUI 启动失败（无图形栈 / wgpu 初始化失败）时回退到 TUI，
+                // 而不是让整个工具崩掉（见《UI架构细化方案.md》§3.1 第 8 条）。
+                #[cfg(feature = "tui")]
+                {
+                    match req_guard_gui::run(root) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            eprintln!("⚠️ GUI 启动失败，已回退到 TUI：{}", e);
+                            req_guard_tui::run(root)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "tui"))]
+                {
+                    req_guard_gui::run(root)
+                }
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                Err(GateError::Validation(format!(
+                    "本次构建未包含 GUI（项目 {}）。请用 `cargo build -p req-guard --features gui（或 full）` 重新构建，\
+                     或改用 req-guard ui --tui",
+                    root.display()
+                )))
+            }
+        }
     }
 }
 
