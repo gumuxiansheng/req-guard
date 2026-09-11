@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "src" / "gate.rs"
+# HOOK_SH 常量随业务逻辑住在 core（workspace 拆分后）。
+SRC = ROOT / "core" / "src" / "gate.rs"
 REQ_DIR = ".gates/requirements"
 HOOK_REL = ".gates/hooks/req-guard-check.sh"
 

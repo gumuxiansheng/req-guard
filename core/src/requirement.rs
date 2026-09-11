@@ -260,56 +260,6 @@ pub fn review(
     Ok(r)
 }
 
-/// 打印单个或多个需求的状态（含是否解锁）。
-pub fn print_status(root: &Path, id: Option<&str>) -> Result<()> {
-    let reqs = match id {
-        Some(i) => vec![find(root, i)?],
-        None => list(root)?,
-    };
-    if reqs.is_empty() {
-        println!("尚未创建任何需求清单。");
-        println!("  创建：req-guard create -t \"<需求标题>\"");
-        return Ok(());
-    }
-    for r in reqs {
-        let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
-            path: Some(r.path.clone()),
-            source: e,
-        })?;
-        let head = head_status(&content);
-        println!("需求 {} {}", r.id, r.title);
-        println!("  文件 : {}", r.path.display());
-        println!("  状态 : {}", head);
-        println!("  步骤 :");
-        let mut all_ok = true;
-        for s in STEPS {
-            let st = step_status(&content, s.0);
-            let rv = step_reviewer(&content, s.0);
-            let mark = if st == "approved" { "✓" } else { " " };
-            if st != "approved" {
-                all_ok = false;
-            }
-            let shown = if st.is_empty() {
-                "pending".to_string()
-            } else {
-                st
-            };
-            if rv.is_empty() || rv == "-" {
-                println!("    [{}] {:<8} {}", mark, s.0, shown);
-            } else {
-                println!("    [{}] {:<8} {}（审核人: {}）", mark, s.0, shown, rv);
-            }
-        }
-        if all_ok {
-            println!("  判定 : 已解锁，AI 可以开始编写代码");
-        } else {
-            println!("  判定 : 未解锁，AI 不得编写/修改源码（门禁拦截）");
-        }
-        println!();
-    }
-    Ok(())
-}
-
 // ===================== 解析辅助 =====================
 
 /// 取 GATE 标记行中 `key=value` 的值；未命中返回空串。
@@ -359,6 +309,13 @@ pub fn step_status(content: &str, step: &str) -> String {
 pub fn step_reviewer(content: &str, step: &str) -> String {
     step_line(content, step)
         .map(|l| token(l, "reviewer"))
+        .unwrap_or_default()
+}
+
+/// 指定步骤的审核时间。
+pub fn step_updated(content: &str, step: &str) -> String {
+    step_line(content, step)
+        .map(|l| token(l, "updated"))
         .unwrap_or_default()
 }
 

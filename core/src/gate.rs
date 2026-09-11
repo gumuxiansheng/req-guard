@@ -211,9 +211,45 @@ pub fn audit(root: &Path, entry: &str) {
     let _ = fs::write(&log, content);
 }
 
-/// 执行拦截检查（供 `req-guard check` 手动调用，或 CI 使用）。
-/// 复用与 hook 完全相同的脚本，保证"本地验证的即真实拦截的"。
-pub fn check(root: &Path) -> Result<bool> {
+/// 门禁裁决结果（结构化）。
+///
+/// 裁决**只来自拦截脚本的退出码**（唯一判定逻辑），这里只是把脚本输出整理成
+/// 前端可直接消费的形态——因此不会出现"CLI 放行、GUI 拦截"这类漂移。
+#[derive(Debug, Clone)]
+pub enum GateVerdict {
+    /// 放行：三段已批准且无未解决的阻塞性评论（或命中应急绕过窗口）。
+    Pass { summary: String },
+    /// 拦截：`detail` 为脚本给出的逐行原因（原样透传，便于 AI/人排查）。
+    Block {
+        summary: String,
+        detail: Vec<String>,
+    },
+}
+
+impl GateVerdict {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, GateVerdict::Pass { .. })
+    }
+
+    pub fn summary(&self) -> &str {
+        match self {
+            GateVerdict::Pass { summary } | GateVerdict::Block { summary, .. } => summary,
+        }
+    }
+
+    /// 拦截原因明细（放行时为空）。
+    pub fn detail(&self) -> &[String] {
+        match self {
+            GateVerdict::Pass { .. } => &[],
+            GateVerdict::Block { detail, .. } => detail,
+        }
+    }
+}
+
+/// 执行拦截脚本，返回 `(是否放行, stdout, stderr)`。
+///
+/// 脚本是唯一判定逻辑（见《技术方案.md》§1.2），本函数只负责调用与收集输出。
+fn run_hook(root: &Path) -> Result<(bool, String, String)> {
     let sh = root.join(HOOK_SH_REL);
     let ps1 = root.join(HOOK_PS1_REL);
 
@@ -257,15 +293,53 @@ pub fn check(root: &Path) -> Result<bool> {
             stderr: e.to_string(),
         })?;
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stderr.trim().is_empty() {
-        eprintln!("{}", stderr.trim_end());
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+/// 执行门禁检查，返回**结构化裁决**（CLI / TUI / GUI / CI 共用）。
+pub fn gate_check(root: &Path) -> Result<GateVerdict> {
+    let (ok, stdout, stderr) = run_hook(root)?;
+    let detail: Vec<String> = format!("{}\n{}", stdout, stderr)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if ok {
+        Ok(GateVerdict::Pass {
+            summary: "✅ 门禁放行：三段已批准且无未解决的阻塞性评论".to_string(),
+        })
+    } else {
+        Ok(GateVerdict::Block {
+            summary: detail
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "⛔ 门禁拦截".to_string()),
+            detail,
+        })
     }
-    if !stdout.trim().is_empty() {
-        println!("{}", stdout.trim_end());
+}
+
+/// 读取审计日志尾部 `n` 行（供 UI 展示）。
+///
+/// 日志可能由 PowerShell 首次写入而带 UTF-8 BOM，这里统一清洗掉。
+pub fn audit_tail(root: &Path, n: usize) -> Result<Vec<String>> {
+    let log = root.join(".gates/audit/gate-audit.log");
+    if !log.exists() {
+        return Ok(Vec::new());
     }
-    Ok(out.status.success())
+    let content = fs::read_to_string(&log).map_err(|e| GateError::Io {
+        path: Some(log.clone()),
+        source: e,
+    })?;
+    let content = content.trim_start_matches('\u{feff}');
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let start = lines.len().saturating_sub(n);
+    Ok(lines[start..].to_vec())
 }
 
 /// 生成有时效的应急绕过令牌（写入 `.gates/.bypass`，并记审计）。
@@ -864,7 +938,7 @@ mod tests {
             "pre-commit 块必须引用 {}",
             HOOK_SH_REL
         );
-        let frag = include_str!("../templates/hooks/fragments/reqguard-check.sh");
+        let frag = include_str!("../../templates/hooks/fragments/reqguard-check.sh");
         assert!(
             frag.contains(HOOK_SH_REL),
             "片段调用的脚本名必须与 req-guard install 生成的一致（{}）",
@@ -923,6 +997,43 @@ mod tests {
         assert!(content.contains("expires_epoch="));
         let audit = fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap();
         assert!(audit.contains("BYPASS-OPEN"), "绕过必须留痕：{}", audit);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn gate_check_未安装脚本时报错() {
+        let root = temp_dir("gate-uninstalled");
+        let e = gate_check(&root).unwrap_err();
+        assert!(e.to_string().contains("未安装"), "应提示先 install：{}", e);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn audit_tail_取尾部并清洗bom() {
+        let root = temp_dir("audit-tail");
+        assert!(audit_tail(&root, 10).unwrap().is_empty(), "无日志时返回空");
+
+        let log = root.join(".gates/audit/gate-audit.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(
+            &log,
+            "\u{feff}2026-09-11 10:00:00 PASS a\n\
+             2026-09-11 10:00:01 BLOCK b\n\
+             2026-09-11 10:00:02 PASS c\n",
+        )
+        .unwrap();
+
+        let tail = audit_tail(&root, 2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(tail[1].contains("PASS c"));
+
+        let all = audit_tail(&root, 99).unwrap();
+        assert_eq!(all.len(), 3, "n 超过总行数时返回全部");
+        assert!(
+            all[0].starts_with("2026-09-11"),
+            "首行 BOM 应被清洗：{:?}",
+            all[0]
+        );
         cleanup(&root);
     }
 }

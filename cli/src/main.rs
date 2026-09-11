@@ -1,22 +1,17 @@
-//! req-guard —— AI 需求门禁（Rust，零依赖）。
+//! req-guard CLI 入口：参数解析 + 文本输出。
 //!
-//! 职责：AI 在项目中实现新需求前，必须按步骤完成
-//! **需求分解 → 技术方案 → 测试计划** 三段清单，且每段由审核人显式批准；
-//! 存在未解决的阻塞性评论时同样拦截。审核人**只评论、不修改正文**，
-//! AI 读取评论自行修改，**但 AI 不能关闭评论**。
+//! 业务逻辑（清单生命周期、审核评论、门禁判定）全部在 `req-guard-core`；
+//! 本 crate 只做参数翻译与文本渲染，**不做任何判定**——判定唯一真相在 core。
 
 mod cli;
-mod comment;
-mod error;
-mod gate;
-mod requirement;
-
-#[cfg(test)]
-mod testutil;
+mod render;
 
 use cli::Action;
-use error::GateError;
-use std::path::Path;
+use req_guard_core::comment;
+use req_guard_core::error::{GateError, Result};
+use req_guard_core::gate;
+use req_guard_core::requirement;
+use req_guard_core::status;
 
 fn main() {
     let parsed = match cli::parse() {
@@ -32,7 +27,7 @@ fn main() {
     }
 }
 
-fn run(a: &cli::Args) -> error::Result<()> {
+fn run(a: &cli::Args) -> Result<()> {
     let root = &a.root;
     match a.action {
         Action::Init | Action::Install => {
@@ -99,8 +94,8 @@ fn run(a: &cli::Args) -> error::Result<()> {
                 )?;
                 println!("   已附加评论 {}", c.id);
             }
-            requirement::print_status(root, Some(&r.id))?;
-            print_comment_summary(root, &r.id)?;
+            render::print_status(root, Some(&r.id))?;
+            render::print_comment_summary(&status::req_get(root, &r.id)?);
         }
         Action::Comment => {
             let id = a.id.as_deref().unwrap_or("");
@@ -133,7 +128,7 @@ fn run(a: &cli::Args) -> error::Result<()> {
             } else if c.quote.is_some() {
                 println!("   ⚠️ 锚点 : 未能在正文中定位到引用，已降级为步骤级");
             }
-            print_comment_summary(root, id)?;
+            render::print_comment_summary(&status::req_get(root, id)?);
         }
         Action::Resolve => {
             let id = a.id.as_deref().unwrap_or("");
@@ -141,16 +136,16 @@ fn run(a: &cli::Args) -> error::Result<()> {
             let author = resolve_identity(a.author.as_deref(), "审核人", "--author")?;
             comment::resolve(root, id, cid, &author)?;
             println!("✅ 已关闭评论 {}（需求 {}，审核人 {}）", cid, id, author);
-            print_comment_summary(root, id)?;
+            render::print_comment_summary(&status::req_get(root, id)?);
         }
         Action::Status => {
             let id = a.id.as_deref();
-            requirement::print_status(root, id)?;
+            render::print_status(root, id)?;
             if let Some(i) = id {
-                print_comment_summary(root, i)?;
+                render::print_comment_summary(&status::req_get(root, i)?);
             }
         }
-        Action::List => requirement::print_status(root, None)?,
+        Action::List => render::print_status(root, None)?,
         Action::Comments => {
             let id = a.id.as_deref().unwrap_or("");
             if a.refresh_anchors {
@@ -194,10 +189,10 @@ fn run(a: &cli::Args) -> error::Result<()> {
             }
         }
         Action::Check => {
-            let ok = gate::check(root)?;
-            if ok {
-                println!("✅ 门禁放行：三段已批准且无未解决的阻塞性评论");
-            } else {
+            // 裁决来自拦截脚本（唯一判定逻辑），这里只做渲染与退出码。
+            let verdict = gate::gate_check(root)?;
+            render::print_verdict(&verdict);
+            if !verdict.is_pass() {
                 std::process::exit(1);
             }
         }
@@ -217,7 +212,7 @@ fn run(a: &cli::Args) -> error::Result<()> {
 }
 
 /// 身份：优先命令行参数，回退环境变量 `REQ_GUARD_REVIEWER`，都没有则报错。
-fn resolve_identity(v: Option<&str>, label: &str, flag: &str) -> error::Result<String> {
+fn resolve_identity(v: Option<&str>, label: &str, flag: &str) -> Result<String> {
     if let Some(s) = v {
         if !s.trim().is_empty() {
             return Ok(s.trim().to_string());
@@ -232,20 +227,4 @@ fn resolve_identity(v: Option<&str>, label: &str, flag: &str) -> error::Result<S
         "缺少{}：请使用 {} <姓名>，或设置环境变量 REQ_GUARD_REVIEWER",
         label, flag
     )))
-}
-
-fn print_comment_summary(root: &Path, req_id: &str) -> error::Result<()> {
-    let (open, blocking) = comment::summary(root, req_id)?;
-    if open == 0 {
-        return Ok(());
-    }
-    if blocking > 0 {
-        println!(
-            "   评论 : {} 条待处理（其中 {} 条阻塞，将拦截编码）",
-            open, blocking
-        );
-    } else {
-        println!("   评论 : {} 条待处理（非阻塞）", open);
-    }
-    Ok(())
 }

@@ -1,0 +1,9 @@
+[package]
+name = "req-guard-core"
+version = "0.1.0"
+edition = "2021"
+description = "req-guard 核心库：AI 需求门禁业务逻辑（零外部依赖）"
+
+# ★ 立身之本：本 crate **永远不加 [dependencies]**。
+# 目的是开箱即 build、无供应链面，也是 CLI 能秒级构建的前提。
+# 需要 UI 依赖的是 tui / gui 两个前端 crate，与这里无关。

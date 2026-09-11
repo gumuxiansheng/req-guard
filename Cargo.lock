@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "req-guard"
 version = "0.1.0"
+dependencies = [
+ "req-guard-core",
+]
+
+[[package]]
+name = "req-guard-core"
+version = "0.1.0"

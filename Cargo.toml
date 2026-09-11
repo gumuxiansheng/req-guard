@@ -1,12 +1,18 @@
-[package]
-name = "req-guard"
+[workspace]
+resolver = "2"
+members = ["core", "cli"]
+
+# 目标形态（《UI架构细化方案.md》§1.1）：
+#   core  req-guard-core   零依赖 lib：全部业务逻辑
+#   cli   req-guard        唯一 bin：参数解析 + 文本输出（feature 门控 TUI/GUI）
+#   tui   req-guard-tui    lib：终端界面（ratatui）—— P2
+#   gui   req-guard-gui    lib：桌面管理台（eframe）—— P3
+# tui / gui 设计为 **lib**，可被 feature 链进同一个二进制，实现"单文件 + 自动选界面"。
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "AI 需求门禁：三段清单审核（需求分解/技术方案/测试计划）+ 硬拦截"
 
-# 零外部依赖：CLI 手写解析，模板用内置 {{var}} 替换，拦截判定用 grep/sed 脚本。
-# 目的是开箱即 build、无供应链面，且可被 gates-toolkit 的 setup-gates 直接分发。
-
-[[bin]]
-name = "req-guard"
-path = "src/main.rs"
+[profile.release]
+opt-level = 3
+strip = true

@@ -1,0 +1,17 @@
+[package]
+name = "req-guard"
+version = "0.1.0"
+edition = "2021"
+description = "AI 需求门禁：三段清单审核（需求分解/技术方案/测试计划）+ 硬拦截"
+
+[[bin]]
+name = "req-guard"
+path = "src/main.rs"
+
+# default 不含任何 UI 依赖：`cargo build` 仍是零依赖、秒级构建。
+# 需要界面时再开 feature（见《UI架构细化方案.md》§1.1）。
+[features]
+default = []
+
+[dependencies]
+req-guard-core = { path = "../core" }
