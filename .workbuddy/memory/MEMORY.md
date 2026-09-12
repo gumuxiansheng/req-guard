@@ -25,6 +25,10 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
 - 命名统一 `req-guard-*`（常量 `gate::HOOK_SH_REL`/`HOOK_PS1_REL` 为唯一真相）；ps1 强制 UTF-8 BOM；
   `strict_order` 真实生效；install 幂等追加 `.gitignore`；评论/绕过事件入审计；AI 只能 reply 不得 resolve。
 - 已 git init + 6 次提交（最新见 git log）+ GitHub Actions 三平台矩阵 + CNB 流水线 + `.gitattributes`(sh=LF)。
+- **多平台 Release 流程已落地**（2026-09-12，对齐 sql-guard）：`.cargo/config.toml`（rust-lld + link-self-contained）、
+  `scripts/build-release.sh`（5 目标 × 2 变体 + SHA256SUMS）、`.cnb.yml` 的 `"v*": tag_push`
+  （`git:release` → 构建 → `cnbcool/attachments` 传 `./dist/*`）、`req-guard -V` 版本自证。
+  产物命名 `req-guard[-ui]-<target>[.exe]`；tag 规则 `v<Cargo.toml version>`；镜像 `rust:1.88` + `RUSTUP_TOOLCHAIN=1.88.0`。
 
 ## 关键坑（复用）
 - `cargo test` 在 workspace 根**只跑 default-members**，TUI 测试要用 `cargo test --workspace`。
@@ -34,7 +38,13 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   `CollapsingHeader::open(Option<bool>)` 按值。核对 API 直接读 registry 源码最快。
 - 字体源：noto-cjk 仓库结构已变，正确路径 `Sans/SubsetOTF/SC/`（jsdelivr 分发）。
 - 本机构建见 2026-09-11.md：Git Bash 下需前置 MSVC bin 到 PATH 并设 LIB，否则 GNU `link` 抢先。
+- **工具链下限 1.88.0**（ratatui 0.30.2 的 `rust-version`，edition 2024）——任何构建含 TUI 的环境（CI 镜像、
+  本地 toolchain）都不得低于此版本；sql-guard 的 `rust:1.80` 镜像不可照抄。
+- CLI+TUI 依赖链**零 C 代码**（无 cc/psm/stacker）→ 交叉编译无需 Zig 当 C 编译器；但
+  windows-gnu **必须**装 mingw（换 `rust-lld` 会 `unable to find library -lkernel32`）。
+- **GUI 无法从 Linux 交叉编译**（需 X11/Wayland/GTK），只能原生执行机构建，勿加入交叉矩阵。
 
 ## 已知未完成
-- **P5 三平台产物矩阵**（CI 构建全绿，产物上传/发布未做）。
-- 未配置远端 remote（无 push）。
+- **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
+  CNB 流水线尚未在真实 tag 上端到端跑过一次（需先 push `v0.1.0`）。
+- CNB 远端 `https://cnb.cool/mikezhu/req-guard` 已配置（remote 名 `cnb`），但尚未 push。

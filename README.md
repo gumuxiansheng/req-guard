@@ -113,7 +113,8 @@ GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段�
 ```bash
 cargo build --release                  # 默认只构建 core + cli：零 UI 依赖、秒级
 cargo build -p req-guard --features tui --release   # 含 TUI
-cargo zigbuild --target x86_64-pc-windows-gnu   # 交叉编译（本机既有工作流）
+cargo build --release --target x86_64-pc-windows-gnu # 交叉编译（需 mingw-w64 工具链，见「多平台 Release」）
+bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目标 × 2 变体）
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
@@ -124,6 +125,71 @@ python scripts/verify_gate.py          # 拦截脚本真机场景（10 场景）
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，
 > 直接 `cargo build` 会失败。需把 MSVC `bin/Hostx64/x64` 前置到 `PATH`，并设置 `LIB`
 > 指向 MSVC `lib/x64` 与 Windows Kits 的 `um/x64`、`ucrt/x64`。
+
+## 多平台 Release 构建与发布
+
+流程与 sql-guard 的 CNB 流水线保持一致：**推 tag → 创建 Release → 交叉编译 → 上传附件**。
+
+```bash
+# 1) 把 Cargo.toml 的 [workspace.package] version 改到目标版本（如 0.2.0）
+# 2) 提交后打 tag（tag 名必须是 v + 该版本号，两者会被流水线交叉校验）
+git tag v0.2.0 && git push cnb main --tags
+```
+
+CNB 上 `v*` 触发 `req-guard release` 流水线（`.cnb.yml`），三个阶段：
+
+| 阶段 | 动作 |
+|---|---|
+| 创建 Release | 内置任务 `git:release`，tag/标题 = 触发 tag，`overlying: true`（同 tag 重跑不报错） |
+| 构建多平台二进制 | `bash scripts/build-release.sh`，在 Linux x86_64 执行机上交叉编译到 `dist/` |
+| 上传 Release 附件 | `cnbcool/attachments` 上传 `./dist/*`（`git:release` 本身不支持附件） |
+
+**产物矩阵**（每目标 2 个变体，命名规则 `req-guard-<target>[.exe]`）：
+
+| target | 平台 | 默认变体（零依赖 CLI） | TUI 变体（CLI + 终端界面） |
+|---|---|---|---|
+| `x86_64-unknown-linux-musl` | Linux amd64（静态，无 glibc 依赖） | `req-guard-x86_64-unknown-linux-musl` | `req-guard-ui-x86_64-unknown-linux-musl` |
+| `aarch64-unknown-linux-musl` | Linux arm64（静态） | `req-guard-aarch64-unknown-linux-musl` | `req-guard-ui-aarch64-unknown-linux-musl` |
+| `x86_64-pc-windows-gnu` | Windows amd64 | `…-windows-gnu.exe` | `…-windows-gnu.exe` |
+| `x86_64-apple-darwin` | macOS Intel | `…-apple-darwin` | `…-apple-darwin` |
+| `aarch64-apple-darwin` | macOS Apple Silicon | `…-apple-darwin` | `…-apple-darwin` |
+
+另附 `dist/SHA256SUMS` 供下载后校验。
+
+- **版本号规则**：Release tag = `v` + `Cargo.toml` 的 `[workspace.package] version`。
+  脚本会做一致性检查（不一致只告警不阻断，但产物以 `Cargo.toml` 为准）。
+  `req-guard -V` 输出的就是编译期版本，可用于核对下载到的二进制。
+- **失败策略**：Linux/Windows 目标是**必需**的（失败即整体失败，避免发布缺件版本）；
+  两个 macOS 目标是 **best-effort**（拿不到 Zig/cargo-zigbuild 时跳过，不阻断）。
+  TUI 变体默认必需，可设 `REQGUARD_TUI_BEST_EFFORT=1` 降级为跳过。
+- **GUI 不参与交叉编译**：`gui`（eframe/wgpu/rfd）在 Linux 侧依赖 X11/Wayland/GTK
+  系统库，无法在 Linux 执行机上交叉编译，需由各平台原生执行机构建
+  （见 `.github/workflows/ci.yml`，GitHub Actions 已在 Windows/macOS 上构建 gui）。
+
+**本地复现**（任意 Linux x86_64，或 Windows 上单独验证某个 target）：
+
+```bash
+# 完整多平台构建（需联网 apt/下载 Zig），产物在 dist/
+bash scripts/build-release.sh
+
+# 只验证单个目标的链接配置（不改动 .cnb.yml 也能提前发现问题）
+cargo build --release -p req-guard --target x86_64-unknown-linux-musl        # 默认变体
+cargo build --release -p req-guard --target aarch64-unknown-linux-musl --features tui
+
+# 校验产物：ELF magic + 架构（3e00=x86-64, b700=aarch64）
+od -An -tx1 -N4 target/x86_64-unknown-linux-musl/release/req-guard
+```
+
+**如何验证发布结果**
+
+| 检查项 | 方法 | 期望 |
+|---|---|---|
+| 附件齐全 | Release 页面 / `cnbcool/attachments` 的 `FILES` 输出 | 10 个二进制 + `SHA256SUMS` |
+| 完整性 | `sha256sum -c SHA256SUMS` | 全部 OK |
+| 版本号 | `./req-guard-<target> -V` | `req-guard <tag 版本号>` |
+| 可用性 | Linux：`./req-guard-x86_64-unknown-linux-musl check`；Windows：`req-guard-…-windows-gnu.exe check` | 正常输出门禁判定（退出码 0/1） |
+| 静态性 | `ldd req-guard-aarch64-unknown-linux-musl` | `not a dynamic executable` |
+
 
 ## 源码结构
 

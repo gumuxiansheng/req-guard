@@ -1,0 +1,34 @@
+# 交叉编译链接配置（仅在显式指定 --target 时生效；本机构建 cargo build 完全不受影响）。
+#
+# 与 sql-guard 的 .cargo/config.toml 同源，但 req-guard 的依赖形态不同，故有两点差异：
+#   1. req-guard 的 CLI/TUI 依赖链 **零 C 代码**（依赖图中没有 cc / psm / stacker 等
+#      需要 C 编译器的 crate），因此 **不需要** sql-guard 里那套 "Zig 当交叉 C 编译器"
+#      的 CC_<target> 封装脚本；只要下面的自包含链接配置即可。
+#   2. GUI（eframe/wgpu/rfd）不参与交叉编译（Linux 需要 X11/Wayland/GTK 系统库），
+#      因此这里不为其声明任何跨平台链接配置，见 README「多平台 Release」。
+#
+# 关于 link-self-contained：stable 工具链上只认 y/yes/on/n/no/off/-linker，
+# 带 "+" 的细粒度写法（+crt-static、+linker,...）仍属 unstable、需要 -Z unstable-options。
+# 这里统一用稳定写法 yes（= 全部自包含），既自包含又不必依赖 nightly。
+
+# Linux x86_64 / aarch64（musl）：rust-lld + 自包含 musl CRT，产出**静态链接**二进制，
+# 不依赖目标机 glibc，可直接丢进任意发行版或 scratch 镜像。
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+# ⚠️ 交叉环境下宿主是 x86_64，rust-lld 由 rustc 自带（随 rust-std 分发），
+#    因此 aarch64 目标无需安装 aarch64 版 binutils 即可链接；
+#    但**剥离符号**仍需 aarch64-linux-gnu-strip（见 scripts/build-release.sh）。
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+# Windows x86_64（windows-gnu）：
+# 链接器沿用默认的 x86_64-w64-mingw32-gcc（由 build-release.sh 通过 apt 安装
+# gcc-mingw-w64-x86-64 提供），配合 link-self-contained=yes 使用 rust 自带的
+# Windows API 导入库与 mingw CRT 启动对象，无需在构建机上装 Windows SDK。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]
+
+# macOS 两个目标不在此声明：链接器与 SDK 全部由 cargo-zigbuild（Zig 自带）接管。

@@ -1,4 +1,6 @@
 /target
+# 多平台 Release 构建产物（scripts/build-release.sh 输出，由 CI 上传为 Release 附件）
+/dist
 # 字体中间产物（完整版 8MB，子集化后由脚本删除；见 scripts/make_font_subset.py）
 gui/assets/*.full.otf
 gui/assets/unicodes.txt

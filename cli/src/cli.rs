@@ -14,6 +14,7 @@
 //! req-guard check                       手动执行拦截判定（退出码 0 放行 / 1 拦截）
 //! req-guard install  [--tool <a,b>]
 //! req-guard bypass   --reason <原因> [--ttl 60]
+//! req-guard -V | --version              输出版本号（与 Cargo.toml / Release tag 一致）
 //! ```
 
 use std::path::PathBuf;
@@ -64,6 +65,13 @@ pub struct Parsed {
 
 pub fn parse() -> std::result::Result<Parsed, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // -V/--version 短路处理：输出版本号后正常退出（退出码 0）。
+    // 版本号取自编译期的 CARGO_PKG_VERSION，即 Cargo.toml 的版本，
+    // 因此「Release tag == 二进制自报版本」可直接用它校验（见 scripts/build-release.sh）。
+    if matches!(argv.first().map(String::as_str), Some("-V" | "--version")) {
+        println!("req-guard {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     parse_from(&argv)
 }
 
@@ -232,6 +240,8 @@ fn help() -> String {
 \n\
 通用选项:\n\
   -p, --path <项目根>   默认当前目录\n\
+  -V, --version         输出版本号\n\
+  -h, --help            输出本帮助\n\
 \n\
 步骤: decomposition(需求分解) -> solution(技术方案) -> testplan(测试计划)\n\
 规则: 三段全部 approved 且无未解决的阻塞性评论，AI 才被允许编写代码。\n"

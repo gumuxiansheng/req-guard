@@ -18,3 +18,61 @@ main:
               echo "本镜像无 python3，跳过拦截脚本场景验证；"
               echo "请在本地或 GitHub Actions 执行：python3 scripts/verify_gate.py"
             fi
+
+# =============================================================================
+# Release 流水线（对齐 sql-guard 的 CNB 配置）
+#   触发：推送 v* 形式的 tag（如 v0.1.0、v0.2.0-rc1）
+#   步骤：创建 Release → 交叉编译多平台二进制 → 上传为 Release 附件
+#
+# 关键点（均与 sql-guard 一致）：
+#   - 镜像在 **pipeline 级别** 用 docker.image 声明，所有 stage 默认在此镜像中执行；
+#     放在 stage 级别会被忽略，导致脚本跑在默认环境里找不到 rustc。
+#   - CNB 执行机是 Linux x86_64，5 个目标全部本机交叉编译（没有 macOS/Windows 执行机）。
+#   - 链接配置复用仓库内 .cargo/config.toml（rust-lld + link-self-contained）；
+#     macOS 目标用 cargo-zigbuild（Zig 自带链接器/SDK）。
+#   - 构建逻辑封装在 scripts/build-release.sh，便于本地复现与调试。
+#   - 先由内置任务 git:release 创建 Release，再由 cnbcool/attachments 上传附件
+#     （git:release 本身不支持附件，这是 CNB 的既定分工）。
+#
+# ⚠️ 与 sql-guard 唯一的硬性差异：镜像/toolchain 必须 ≥ 1.88.0
+#    ratatui 0.30.2 声明 rust-version = 1.88.0，而 sql-guard 用的是 rust:1.80。
+#    这里把 RUSTUP_TOOLCHAIN 显式锚定到镜像自带的 1.88.0，可省掉稳定版工具链
+#    的重复下载；若要跟最新 stable，删掉该 env 即可（rust-toolchain.toml 有 channel）。
+#
+# 注：若想对所有 tag（不限 v 前缀）生效，把下面的 "v*" 改成 "$"。
+# =============================================================================
+"v*":
+  tag_push:
+    - name: req-guard release
+      runner:
+        cpus: 4
+      docker:
+        image: rust:1.88
+      env:
+        CARGO_TERM_COLOR: always
+        RUSTUP_TOOLCHAIN: "1.88.0"
+      stages:
+        # 1) 为当前 tag 创建 Release（tag_push 事件下自动以 $CNB_BRANCH 作为 tag，
+        #    无需显式传 tag 参数；版本号规则 = tag 名，与 Cargo.toml 版本须一致）
+        - name: 创建 Release
+          type: git:release
+          options:
+            overlying: true
+            title: ${CNB_BRANCH}
+            description: "req-guard ${CNB_BRANCH} - 多平台二进制自动构建发布"
+
+        # 2) 交叉编译 5 目标 × 2 变体到 dist/
+        #    单独加长超时（下载 Zig/依赖 + 多次 release 构建）；
+        #    平台 watchdog 默认 10 分钟无输出即 kill，脚本内所有下载都带进度输出。
+        - name: 构建多平台二进制
+          timeout: 60m
+          script:
+            - bash scripts/build-release.sh
+
+        # 3) 把 dist/ 下全部产物（含 SHA256SUMS）上传为 Release 附件
+        - name: 上传 Release 附件
+          image: cnbcool/attachments:latest
+          settings:
+            tag: ${CNB_BRANCH}
+            attachments:
+              - "./dist/*"
