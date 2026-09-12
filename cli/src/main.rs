@@ -32,6 +32,22 @@ fn run(a: &cli::Args) -> Result<()> {
     let root = &a.root;
     match a.action {
         Action::Init | Action::Install => {
+            // --verify：只校验不写入（CI 步骤；§4.5 消除 L1 静默缺口）
+            if a.verify {
+                let problems = gate::verify_install(root);
+                if problems.is_empty() {
+                    println!("✅ 门禁校验通过：核心资产 / AI 工具 hook / pre-commit 全部就位");
+                    return Ok(());
+                }
+                for p in &problems {
+                    eprintln!("✗ {}", p);
+                }
+                eprintln!(
+                    "共 {} 项未通过；修复后重跑 req-guard install --verify",
+                    problems.len()
+                );
+                std::process::exit(1);
+            }
             let tools = if a.tools.is_empty() {
                 gate::default_tools()
             } else {
@@ -42,7 +58,10 @@ fn run(a: &cli::Args) -> Result<()> {
             for f in &created {
                 println!("   - {}", f.display());
             }
-            println!("   拦截：AI 工具 Write/Edit（PreToolUse）+ git pre-commit");
+            println!("   拦截：AI 工具 Write/Edit（PreToolUse）+ git pre-commit（fail-closed）");
+            println!(
+                "   CI  ：enforce.ci 默认 true——流水线须调用 req-guard check 并设为必需状态检查"
+            );
         }
         Action::Create => {
             let title = a.title.as_deref().unwrap_or("");
@@ -207,6 +226,19 @@ fn run(a: &cli::Args) -> Result<()> {
             );
             println!("   令牌 : {}", p.display());
             println!("   到期后自动恢复硬拦截；请事后补齐清单审核。");
+        }
+        Action::AuditDigest => {
+            let (path, hex, lines) = gate::audit_digest(root)?;
+            println!("✅ 审计摘要已写入：{}", path.display());
+            println!(
+                "   日志   : .gates/audit/gate-audit.log（{} 行，本机不入库）",
+                lines
+            );
+            println!("   sha256 : {}", hex);
+            println!(
+                "   请将 {} 随本次改动提交；PR 中可与各本机日志比对以发现篡改。",
+                path.display()
+            );
         }
         Action::Ui => run_ui(root, a)?,
     }

@@ -192,6 +192,9 @@ pub fn review(
     reason: &str,
     strict: bool,
 ) -> Result<Requirement> {
+    // 审批锁（§4.4 方案 A）：approve/reject 不得在 AI 执行上下文内发生，
+    // 否则 AI 经 Shell 自批即可把状态欺诈骗成 approved。
+    crate::auth::ensure_human(if pass { "approve" } else { "reject" })?;
     validate_step(step)?;
     let r = find(root, id)?;
     let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
@@ -257,6 +260,18 @@ pub fn review(
         path: Some(r.path.clone()),
         source: e,
     })?;
+
+    // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）
+    let event = format!(
+        "{} {} step={} reviewer={}",
+        if pass { "APPROVE" } else { "REJECT" },
+        r.id,
+        step,
+        safe_field(reviewer)
+    );
+    crate::gate::audit(root, &event);
+    crate::gate::audit_ledger(root, &event);
+
     Ok(r)
 }
 

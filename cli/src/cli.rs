@@ -12,8 +12,9 @@
 //! req-guard list
 //! req-guard comments <需求ID> [--refresh-anchors]
 //! req-guard check                       手动执行拦截判定（退出码 0 放行 / 1 拦截）
-//! req-guard install  [--tool <a,b>]
+//! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
 //! req-guard bypass   --reason <原因> [--ttl 60]
+//! req-guard audit-digest                 审计日志 SHA-256 摘要写入入库 DIGEST
 //! req-guard -V | --version              输出版本号（与 Cargo.toml / Release tag 一致）
 //! ```
 
@@ -32,6 +33,8 @@ pub enum Action {
     Check,
     Install,
     Bypass,
+    /// 生成审计摘要：本机 gate-audit.log 的 SHA-256 → 入库 DIGEST（PR 可比对）。
+    AuditDigest,
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
 }
@@ -53,6 +56,8 @@ pub struct Args {
     pub tools: Vec<String>,
     pub ttl: u64,
     pub refresh_anchors: bool,
+    /// `install --verify`：只校验门禁就位情况（CI 用），不写入任何文件。
+    pub verify: bool,
     /// `ui --gui`：强制图形界面。
     pub gui: bool,
     /// `ui --tui`：强制终端界面。
@@ -94,6 +99,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "check" => Action::Check,
         "install" => Action::Install,
         "bypass" => Action::Bypass,
+        "audit-digest" => Action::AuditDigest,
         "ui" => Action::Ui,
         "-h" | "--help" => return Err(help()),
         other => return Err(format!("未知命令: {}\n\n{}", other, help())),
@@ -116,6 +122,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         tools: Vec::new(),
         ttl: 60,
         refresh_anchors: false,
+        verify: false,
         gui: false,
         tui: false,
     };
@@ -133,6 +140,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--reason" => a.reason = Some(next(&mut it, "--reason")?),
             "--blocking" => a.blocking = true,
             "--refresh-anchors" => a.refresh_anchors = true,
+            "--verify" => a.verify = true,
             "--gui" => a.gui = true,
             "--tui" => a.tui = true,
             "--tool" => {
@@ -171,6 +179,9 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
 }
 
 fn validate(a: &Args) -> std::result::Result<(), String> {
+    if a.verify && !matches!(a.action, Action::Init | Action::Install) {
+        return Err("--verify 仅用于 install（例：req-guard install --verify）".into());
+    }
     match a.action {
         Action::Create => {
             if a.title.is_none() {
@@ -234,8 +245,9 @@ fn help() -> String {
   list                       列出全部需求\n\
   comments <需求ID> [--refresh-anchors]         查看评论 / 重算行号锚点\n\
   check                      手动拦截判定（退出码 0 放行 / 1 拦截）\n\
-  install  [--tool <a,b>]    安装或修复拦截\n\
+  install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
+  audit-digest               审计日志 SHA-256 摘要写入入库 DIGEST（PR 可比对）\n\
   ui       [--gui | --tui]   打开门禁管理台（需以 --features tui 构建）\n\
 \n\
 通用选项:\n\

@@ -82,24 +82,32 @@ pub fn strict_order(root: &Path) -> bool {
 struct ToolProfile {
     name: &'static str,
     config: &'static str,
+    /// 该工具配置支持**会话级环境变量注入**（如 Claude Code `settings.json` 的
+    /// `env` 段）——注入 [`crate::auth::AI_CTX_ENV`] 后，审批锁（方案 A）才能
+    /// 覆盖该工具会话内的 Shell 路径。未确认支持的暂为 false（P2 接原生 schema 时补）。
+    env_capable: bool,
 }
 
 const TOOL_PROFILES: [ToolProfile; 4] = [
     ToolProfile {
         name: "claude",
         config: ".claude/settings.json",
+        env_capable: true,
     },
     ToolProfile {
         name: "codex",
         config: ".codex/hooks.json",
+        env_capable: false,
     },
     ToolProfile {
         name: "codebuddy",
         config: ".codebuddy/hooks.json",
+        env_capable: false,
     },
     ToolProfile {
         name: "cursor",
         config: ".cursor/hooks.json",
+        env_capable: false,
     },
 ];
 
@@ -209,6 +217,69 @@ pub fn audit(root: &Path, entry: &str) {
     content.push_str(&line);
     // 审计失败不阻断主流程（门禁是安全机制，但审计是旁路证据）。
     let _ = fs::write(&log, content);
+}
+
+/// 入库审计台账（§4.6 审计可信化）：关键审批事件的**版本化**记录。
+///
+/// 与本机 `gate-audit.log`（`.gitignore` 忽略、clone 不可见）不同，
+/// 本文件随仓库提交——"谁在何时批了什么 / 是否绕过"在 PR diff 中可直接复核。
+/// 写入方：approve/reject（[`crate::requirement::review`]）、resolve /
+/// 阻塞性评论新增（[`crate::comment`]）、bypass（[`bypass`]）。
+pub const LEDGER_REL: &str = ".gates/audit/ledger.md";
+
+/// 审计摘要文件（[`audit_digest`] 追加写入），随仓库提交。
+pub const DIGEST_REL: &str = ".gates/audit/DIGEST";
+
+/// 关键事件追加到入库台账：Markdown 表格，一行一事件。
+pub fn audit_ledger(root: &Path, entry: &str) {
+    let path = root.join(LEDGER_REL);
+    if let Some(dir) = path.parent() {
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if content.is_empty() {
+        content.push_str("# 审计台账（关键审批事件，随仓库提交）\n\n");
+        content.push_str("| 时间 | 事件 |\n| --- | --- |\n");
+    }
+    // 表格行：压单行 + 转义竖线（reason 等自由文本可能含 |）
+    let safe = one_line(entry).replace('|', "\\|");
+    content.push_str(&format!("| {} | {} |\n", now_str(), safe));
+    let _ = fs::write(&path, content);
+}
+
+/// 生成审计摘要：对本机 `gate-audit.log` 计算 SHA-256，追加到入库的
+/// `.gates/audit/DIGEST`（时间 / 行数 / 摘要）。
+///
+/// 台账让人在 PR 里看清轨迹，摘要让**本机日志可被比对**——任何事后篡改
+/// （删改拦截/放行记录）都会使哈希对不上。返回 `(DIGEST 路径, 摘要, 日志行数)`。
+pub fn audit_digest(root: &Path) -> Result<(PathBuf, String, usize)> {
+    let log = root.join(".gates/audit/gate-audit.log");
+    if !log.exists() {
+        return Err(GateError::Validation(format!(
+            "尚无审计日志（{}）；产生拦截/审批事件后再执行 audit-digest",
+            log.display()
+        )));
+    }
+    let bytes = fs::read(&log).map_err(|e| GateError::Io {
+        path: Some(log.clone()),
+        source: e,
+    })?;
+    let lines = String::from_utf8_lossy(&bytes).lines().count();
+    let hex = crate::digest::sha256_hex(&bytes);
+
+    let path = root.join(DIGEST_REL);
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!("{} lines={} sha256={}\n", now_str(), lines, hex));
+    fs::write(&path, content).map_err(|e| GateError::Io {
+        path: Some(path.clone()),
+        source: e,
+    })?;
+    Ok((path, hex, lines))
 }
 
 /// 门禁裁决结果（结构化）。
@@ -344,6 +415,8 @@ pub fn audit_tail(root: &Path, n: usize) -> Result<Vec<String>> {
 
 /// 生成有时效的应急绕过令牌（写入 `.gates/.bypass`，并记审计）。
 pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Result<PathBuf> {
+    // 审批锁（§4.4 方案 A）：绕过同样是审批类动作，AI 会话内禁止自助开启。
+    crate::auth::ensure_human("bypass")?;
     if reason.trim().is_empty() {
         return Err(GateError::Validation(
             "应急绕过必须填写原因（--reason），否则无法追溯".into(),
@@ -364,15 +437,15 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         path: Some(audit_dir.clone()),
         source: e,
     })?;
-    audit(
-        root,
-        &format!(
-            "BYPASS-OPEN actor={} ttl={}min reason={}",
-            one_line(actor),
-            ttl_minutes,
-            one_line(reason)
-        ),
+    let bypass_event = format!(
+        "BYPASS-OPEN actor={} ttl={}min reason={}",
+        one_line(actor),
+        ttl_minutes,
+        one_line(reason)
     );
+    audit(root, &bypass_event);
+    // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）
+    audit_ledger(root, &bypass_event);
     write_file(root, ".gates/.bypass", &content)
 }
 
@@ -389,16 +462,26 @@ fn inject_tool(
         .find(|p| p.name == tool)
         .ok_or_else(|| GateError::Validation(format!("未知 AI 工具: {}", tool)))?;
     let path = root.join(prof.config);
-    let json = hook_json();
 
     if path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
         if existing.contains("req-guard-check") {
-            return Ok(()); // 幂等
+            // 幂等：hook 已在。但 env 注入型工具若缺审批锁标记，仍需提示补齐
+            // （旧版 install 写入的配置没有 env 段）。
+            if prof.env_capable && !existing.contains(crate::auth::AI_CTX_ENV) {
+                notes.push(format!(
+                    "{} 已含门禁 hook，但缺审批锁 env 段（\"{}\": \"1\"），\
+                     建议手工合并以防 AI 自批",
+                    prof.config,
+                    crate::auth::AI_CTX_ENV
+                ));
+            }
+            return Ok(());
         }
         notes.push(format!(
             "{} 已存在且不含 req-guard 门禁配置，为避免破坏既有配置未覆盖，请手工合并以下片段：\n{}",
-            prof.config, json
+            prof.config,
+            hook_json(prof.env_capable)
         ));
         return Ok(());
     }
@@ -408,7 +491,7 @@ fn inject_tool(
             source: e,
         })?;
     }
-    fs::write(&path, json).map_err(|e| GateError::Io {
+    fs::write(&path, hook_json(prof.env_capable)).map_err(|e| GateError::Io {
         path: Some(path.clone()),
         source: e,
     })?;
@@ -417,30 +500,106 @@ fn inject_tool(
 }
 
 /// 生成 AI 工具 hook 配置（Claude Code 风格 schema，其余工具形态相近）。
-fn hook_json() -> String {
+///
+/// `env_capable=true` 时同时注入会话级 `env` 段，把 [`crate::auth::AI_CTX_ENV`]
+/// 打进 AI 会话——`approve/reject/resolve/bypass` 检测到即自拒（审批锁，方案 A）。
+fn hook_json(env_capable: bool) -> String {
     let cmd = if cfg!(windows) {
         "powershell -NoProfile -ExecutionPolicy Bypass -File .gates/hooks/req-guard-check.ps1"
     } else {
         "sh .gates/hooks/req-guard-check.sh"
     };
+    let env = if env_capable {
+        format!(
+            "  \"env\": {{\n    \"{}\": \"1\"\n  }},\n",
+            crate::auth::AI_CTX_ENV
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{{\n  \"hooks\": {{\n    \"PreToolUse\": [\n      {{\n        \
+        "{{\n{}  \"hooks\": {{\n    \"PreToolUse\": [\n      {{\n        \
          \"matcher\": \"Write|Edit|MultiEdit|NotebookEdit\",\n        \
          \"hooks\": [\n          {{\n            \"type\": \"command\",\n            \
          \"command\": \"{}\"\n          }}\n        ]\n      }}\n    ]\n  }}\n}}\n",
-        cmd
+        env, cmd
     )
 }
 
+/// git pre-commit 追加块：**fail-closed**（与 gates-toolkit 片段 `030-reqguard` 语义一致）。
+///
+/// 门禁是安全机制：拦截脚本缺失必须**拦截提交并提示初始化**，不得静默放行——
+/// "看起来在拦，实际没拦"是本工具最危险的失败模式（见《AI工具合规保证规范.md》§4.2）。
 const PRE_COMMIT_BLOCK: &str = r#"
 # ===== req-guard（AI 需求门禁；追加在 gates-toolkit 之后） =====
-if [ -f .gates/hooks/req-guard-check.sh ]; then
-  sh .gates/hooks/req-guard-check.sh || exit 1
+# ⚠️ fail-closed：脚本缺失即拦截，不得静默放行（与片段 030-reqguard 语义一致）
+if [ ! -f .gates/hooks/req-guard-check.sh ]; then
+  echo "✗ req-guard 门禁脚本缺失（.gates/hooks/req-guard-check.sh），提交已被阻止。" >&2
+  echo "  请先执行 req-guard install 初始化门禁；确需跳过本次：git commit --no-verify" >&2
+  exit 1
 fi
+sh .gates/hooks/req-guard-check.sh || exit 1
 "#;
 
 /// `.gitignore` 需要忽略的门禁本机运行态文件。
 pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
+
+/// `req-guard install --verify`：校验门禁是否真正就位（§4.5，供 CI 使用）。
+///
+/// 返回**问题清单**：空 = 全部通过；非空 = 存在"静默缺口"，CI 应据此红。
+/// 校验规则（配置文件存在即视为该工具"在用"）：
+/// - 核心资产（拦截脚本 sh/ps1、门禁声明）缺失 → 问题；
+/// - 在用工具的配置不含 `req-guard-check` → **L1 静默缺口**（只装不生效）；
+/// - env 注入型工具（如 claude）缺 [`crate::auth::AI_CTX_ENV`] → 审批锁缺口；
+/// - 有 `.git` 但 pre-commit 未含拦截 → **L2 缺口**。
+///
+/// 未安装（配置不存在）的工具不要求——不制造噪音；未知新工具出现时，
+/// 由团队把它登记进 `TOOL_PROFILES` 后纳入校验白名单。
+pub fn verify_install(root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    for rel in [HOOK_SH_REL, HOOK_PS1_REL, ".gates/req-guard.yaml"] {
+        if !root.join(rel).exists() {
+            problems.push(format!("缺少门禁资产 {}（执行 req-guard install）", rel));
+        }
+    }
+
+    for prof in TOOL_PROFILES.iter() {
+        let p = root.join(prof.config);
+        if !p.exists() {
+            continue; // 未在用的工具不要求
+        }
+        let content = fs::read_to_string(&p).unwrap_or_default();
+        if !content.contains("req-guard-check") {
+            problems.push(format!(
+                "{} 已存在（在用）但未接入 req-guard hook——L1 静默缺口；\
+                 按 req-guard install 输出的片段手工合并",
+                prof.config
+            ));
+        }
+        if prof.env_capable && !content.contains(crate::auth::AI_CTX_ENV) {
+            problems.push(format!(
+                "{} 缺少 {} 会话标记——审批锁缺口（防 AI 自批）；手工合并 env 段后重验",
+                prof.config,
+                crate::auth::AI_CTX_ENV
+            ));
+        }
+    }
+
+    if root.join(".git").exists() {
+        match fs::read_to_string(root.join(".git/hooks/pre-commit")) {
+            Ok(c) if c.contains("req-guard-check") => {}
+            Ok(_) => problems.push(
+                ".git/hooks/pre-commit 未含 req-guard 拦截——L2 缺口；重跑 req-guard install".into(),
+            ),
+            Err(_) => {
+                problems.push("缺少 .git/hooks/pre-commit——L2 缺口；重跑 req-guard install".into())
+            }
+        }
+    }
+
+    problems
+}
 
 /// 追加 git pre-commit（幂等；不覆盖 gates-toolkit 已写入的内容）。
 fn append_pre_commit(
@@ -592,7 +751,7 @@ strict_order: true
 enforce:
   ai_tool_hook: true   # AI 工具 PreToolUse，拦截 Write/Edit —— 最硬的一层
   pre_commit: true     # git pre-commit 兜底
-  ci: false            # CI 侧拦截（需在流水线中调用 req-guard check）
+  ci: true             # CI 侧拦截：流水线须调用 req-guard check，并设为必需（required）状态检查
 
 # 被拦截的 AI 写操作（matcher 语法随工具而异）
 blocked_tools:
@@ -647,6 +806,17 @@ req-guard status REQ-001
 
 打回：`req-guard reject REQ-001 --step solution --reviewer 张三 --reason "缺少回滚方案"`
 
+## 审批锁：approve / resolve / bypass 须人类执行
+
+`--reviewer` / `--author` 只是名字，不构成身份保证。因此 req-guard 给支持会话环境
+注入的 AI 工具（如 Claude Code）写入 `"REQ_GUARD_AI_CTX": "1"`，`approve / reject /
+resolve / bypass` 检测到该标记即**拒绝执行**——AI 经 Shell 自批会被堵在命令层。
+
+- 审核人请在**自己的终端**（AI 会话之外）执行审批命令；
+- 人类误中拦截时：在不带该变量的终端重试，或先 `unset REQ_GUARD_AI_CTX`；
+- 该标记可被 `env -u` 剥离，属提高门槛而非强保证；生产环境请升级
+  reviewer token / 带外审批（见《AI工具合规保证规范.md》§4.4）。
+
 ## 应急绕过（有痕、有时效）
 
 ```bash
@@ -655,6 +825,26 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 
 绕过窗口内放行，但**每次都写审计日志** `.gates/audit/gate-audit.log`。
 `.gates/.bypass` 已被 `.gitignore` 忽略，不会入库。
+
+## L3 CI 强制门禁（部署规范）
+
+`.gates/req-guard.yaml` 默认 `enforce.ci: true`——CI 必须**独立重跑**门禁，
+本机任何绕过（含 `git commit --no-verify`）都会在服务端被抵消：
+
+1. 流水线中执行 `req-guard check`（退出码非 0 即失败）；CI 镜像内置 req-guard
+   二进制，版本与 Release tag 一致（`req-guard -V` 可核对）；
+2. 将该检查设为**必需（required）状态检查**：不通过禁止合并；
+3. 分支保护：禁止直推 `main` 等受保护分支；
+4. 建议追加一步 `req-guard install --verify`：任一在用 AI 工具缺 hook 即红，
+   消除 L1 静默缺口。
+
+## 审计台账与摘要（随仓库提交）
+
+- `.gates/audit/ledger.md`：approve / reject / resolve / bypass / 阻塞性评论等
+  关键事件的**入库台账**——PR diff 可直接复核"谁在何时批了什么"；
+- `.gates/audit/DIGEST`：`req-guard audit-digest` 生成本机 `gate-audit.log` 的
+  SHA-256 摘要；PR 中与本地日志比对即可发现事后篡改；
+- `gate-audit.log`（全量流水）与 `.bypass` 是本机运行态，已由 .gitignore 忽略。
 
 ## 与 gates-toolkit 的关系
 
@@ -951,6 +1141,23 @@ mod tests {
     }
 
     #[test]
+    fn pre_commit块缺失脚本时必须拦截() {
+        // fail-closed（§4.2）：脚本缺失不得静默放行，必须 exit 1 并提示初始化。
+        // 真机行为由 scripts/verify_gate.py 场景 11 实跑校验。
+        assert!(
+            PRE_COMMIT_BLOCK.contains("if [ ! -f .gates/hooks/req-guard-check.sh ]"),
+            "必须先判缺失即拦截：\n{}",
+            PRE_COMMIT_BLOCK
+        );
+        assert!(PRE_COMMIT_BLOCK.contains("exit 1"), "缺失分支必须 exit 1");
+        // 历史缺陷回归：不得再回到"存在才执行"的静默跳过形态（fail-open）
+        assert!(
+            !PRE_COMMIT_BLOCK.contains("if [ -f .gates/hooks/req-guard-check.sh ]; then"),
+            "不得用 if [ -f ] 包裹实现静默跳过"
+        );
+    }
+
+    #[test]
     fn install_生成资产且幂等() {
         let root = temp_dir("install");
         install(&root, &["none".to_string()], false).unwrap();
@@ -959,6 +1166,14 @@ mod tests {
         assert!(root.join(".gates/req-guard.yaml").exists());
         assert!(root.join(".gates/README.md").exists());
         assert!(has_utf8_bom(&root.join(".gates/hooks/req-guard-check.ps1")));
+
+        // L3 默认开启（§4.3）：ci 必须 true，避免"只装不接"
+        let y = fs::read_to_string(root.join(".gates/req-guard.yaml")).unwrap();
+        assert!(
+            y.contains("ci: true"),
+            "REQ_GUARD_YAML 模板 enforce.ci 必须默认 true：\n{}",
+            y
+        );
 
         let gi = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gi.contains(".gates/.bypass"), "绕过令牌必须被忽略：{}", gi);
@@ -983,6 +1198,190 @@ mod tests {
                 .count(),
             1,
             "gitignore 条目不应重复追加"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn hook注入含审批锁标记() {
+        // env 注入型工具（claude）：hook 与 AI_CTX 标记同步写入
+        let j = hook_json(true);
+        assert!(j.contains("req-guard-check"), "{}", j);
+        assert!(
+            j.contains(crate::auth::AI_CTX_ENV),
+            "审批锁标记必须随 env 段注入：{}",
+            j
+        );
+        assert!(j.contains("PreToolUse"));
+
+        // 非 env 型工具：只写 hook，不猜 env 段（避免破坏未确认的 schema）
+        let j = hook_json(false);
+        assert!(j.contains("req-guard-check"));
+        assert!(!j.contains(crate::auth::AI_CTX_ENV));
+    }
+
+    #[test]
+    fn install_claude写入审批锁env段() {
+        let root = temp_dir("install-claude");
+        install(&root, &["claude".to_string()], false).unwrap();
+        let c = fs::read_to_string(root.join(".claude/settings.json")).unwrap();
+        assert!(c.contains("req-guard-check"), "{}", c);
+        assert!(
+            c.contains(crate::auth::AI_CTX_ENV),
+            "审批锁标记必须随 hook 注入：{}",
+            c
+        );
+
+        // 幂等重装：已含 hook + env → 跳过且无提示
+        let mut created = Vec::new();
+        let mut notes = Vec::new();
+        inject_tool(&root, "claude", &mut created, &mut notes).unwrap();
+        assert!(notes.is_empty(), "完整配置重装不应有提示：{:?}", notes);
+
+        // 旧版配置（有 hook 无 env）→ 仍要提示补齐
+        fs::write(
+            root.join(".claude/settings.json"),
+            "{\"hooks\":{\"x\":[{\"command\":\"sh .gates/hooks/req-guard-check.sh\"}]}}",
+        )
+        .unwrap();
+        let mut notes = Vec::new();
+        inject_tool(&root, "claude", &mut created, &mut notes).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains(crate::auth::AI_CTX_ENV)),
+            "缺 env 段应提示手工合并：{:?}",
+            notes
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn verify_install_检出各层缺口() {
+        let root = temp_dir("verify");
+        // 1) 未安装：核心资产缺失即报
+        assert!(!verify_install(&root).is_empty());
+
+        // 2) 正常安装（claude：hook + env 齐备）→ 全绿
+        install(&root, &["claude".to_string()], false).unwrap();
+        assert!(
+            verify_install(&root).is_empty(),
+            "刚装完应通过：{:?}",
+            verify_install(&root)
+        );
+
+        // 3) 在用工具配置存在但不含 hook → L1 静默缺口
+        fs::write(root.join(".claude/settings.json"), "{\"other\":true}").unwrap();
+        let p = verify_install(&root);
+        assert!(
+            p.iter()
+                .any(|x| x.contains(".claude/settings.json") && x.contains("L1")),
+            "{:?}",
+            p
+        );
+
+        // 4) 含 hook 但缺审批锁 env → 审批锁缺口
+        fs::write(
+            root.join(".claude/settings.json"),
+            "{\"hooks\":{\"x\":[{\"command\":\"sh .gates/hooks/req-guard-check.sh\"}]}}",
+        )
+        .unwrap();
+        let p = verify_install(&root);
+        assert!(
+            p.iter().any(|x| x.contains(crate::auth::AI_CTX_ENV)),
+            "{:?}",
+            p
+        );
+
+        // 5) .git 存在但 pre-commit 缺拦截 → L2 缺口
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\necho lint\n").unwrap();
+        let p = verify_install(&root);
+        assert!(p.iter().any(|x| x.contains("L2")), "{:?}", p);
+
+        // 6) 修复 pre-commit（模拟重跑 install 的追加结果）后只剩第 4 项
+        let mut pc = "#!/bin/sh\n".to_string();
+        pc.push_str(PRE_COMMIT_BLOCK);
+        fs::write(root.join(".git/hooks/pre-commit"), pc).unwrap();
+        let p = verify_install(&root);
+        assert_eq!(p.len(), 1, "仅剩审批锁缺口：{:?}", p);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 审计台账_关键事件入库且转义竖线() {
+        let root = temp_dir("ledger");
+        audit_ledger(&root, "APPROVE REQ-001 step=solution reviewer=寇工");
+        audit_ledger(&root, "BYPASS-OPEN actor=kou | ttl=60min | reason=hot fix");
+        let c = fs::read_to_string(root.join(LEDGER_REL)).unwrap();
+        assert!(c.contains("| 时间 | 事件 |"), "首写应带表头：{}", c);
+        assert!(c.contains("APPROVE REQ-001 step=solution reviewer=寇工"));
+        assert!(
+            c.contains("BYPASS-OPEN actor=kou \\| ttl=60min \\| reason=hot fix"),
+            "自由文本中的竖线须转义：{}",
+            c
+        );
+        // 台账/摘要不在 gitignore 忽略范围（入库是 PR 可复核的前提）
+        assert!(
+            GITIGNORE_LINES
+                .iter()
+                .all(|g| !g.contains("ledger") && !g.contains("DIGEST")),
+            "{:?}",
+            GITIGNORE_LINES
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 审计摘要_写入入库digest并可复算() {
+        let root = temp_dir("audit-digest");
+        // 无日志 → 报错提示
+        assert!(audit_digest(&root).is_err());
+
+        // 有日志 → 摘要可与本地内容独立复算一致
+        audit(&root, "PASS REQ-001.md");
+        let (p, hex, lines) = audit_digest(&root).unwrap();
+        assert!(p.ends_with("DIGEST"));
+        assert_eq!(lines, 1);
+        let bytes = fs::read(root.join(".gates/audit/gate-audit.log")).unwrap();
+        assert_eq!(hex, crate::digest::sha256_hex(&bytes), "摘要必须可独立复算");
+
+        let d = fs::read_to_string(&p).unwrap();
+        assert!(d.contains(&format!("lines=1 sha256={}", hex)), "{}", d);
+
+        // 幂等追加：不覆盖历史摘要；日志变化后摘要必须变化
+        audit(&root, "BLOCK REQ-001.md");
+        let (_, hex2, lines2) = audit_digest(&root).unwrap();
+        assert_eq!(lines2, 2);
+        assert_ne!(hex, hex2, "日志变化后摘要必须变化");
+        let d = fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            d.lines().filter(|l| l.contains("sha256=")).count(),
+            2,
+            "历史摘要不得被覆盖：{}",
+            d
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn review与bypass事件进入台账() {
+        let root = temp_dir("ledger-events");
+        bypass(&root, "线上热修", "寇工", 60).unwrap();
+        let c = fs::read_to_string(root.join(LEDGER_REL)).unwrap();
+        assert!(c.contains("BYPASS-OPEN actor=寇工"), "{}", c);
+
+        let req = crate::requirement::create(&root, None, "台账测试").unwrap();
+        crate::requirement::review(&root, &req.id, "decomposition", "寇工", true, "", true)
+            .unwrap();
+        let c = fs::read_to_string(root.join(LEDGER_REL)).unwrap();
+        assert!(
+            c.contains(&format!(
+                "APPROVE {} step=decomposition reviewer=寇工",
+                req.id
+            )),
+            "{}",
+            c
         );
         cleanup(&root);
     }

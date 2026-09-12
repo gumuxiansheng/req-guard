@@ -156,5 +156,37 @@ for name, req, cmts, bp, stdin_data, expect, extra in CASES:
     ok = ok and good
     print(f"{'PASS' if good else 'FAIL'}  {name}: exit={rc} (期望 {expect})")
 
+
+def verify_pre_commit_fail_closed() -> bool:
+    """11_pre_commit缺失脚本即拦截（fail-closed，§4.2）。
+
+    从 gate.rs 抽取 PRE_COMMIT_BLOCK 拼成 pre-commit 脚本，
+    在"没有 .gates/hooks/req-guard-check.sh"的目录里实跑：必须 exit 1。
+    """
+    text = SRC.read_text(encoding="utf-8")
+    m = re.search(r"const PRE_COMMIT_BLOCK: &str = r#\"(.*?)\"#;", text, re.S)
+    if not m:
+        print("FAIL  11_pre_commit缺失脚本即拦截: 未能抽取 PRE_COMMIT_BLOCK")
+        return False
+    work = Path(tempfile.mkdtemp(prefix="reqguard-pc-"))
+    pc = work / ".git" / "hooks" / "pre-commit"
+    pc.parent.mkdir(parents=True)
+    pc.write_text("#!/bin/sh\n" + m.group(1), encoding="utf-8")
+    # 刻意不创建 .gates/hooks/req-guard-check.sh → 门禁脚本缺失
+    r = subprocess.run(
+        [SH, str(pc)], cwd=work, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    shutil.rmtree(work, ignore_errors=True)
+    good = r.returncode == 1
+    print(
+        f"{'PASS' if good else 'FAIL'}  11_pre_commit缺失脚本即拦截: "
+        f"exit={r.returncode} (期望 1)"
+    )
+    return good
+
+
+ok = ok and verify_pre_commit_fail_closed()
+
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)

@@ -11,6 +11,7 @@
 - **证据不可篡改**：评论独立文件，AI 禁止直接写、禁止 resolve（只能 reply）
 - **审计留痕**：拦截/放行/绕过/评论全部入 `audit/gate-audit.log`
 - **应急绕过**：有时效、必填原因；**不覆盖评论证据保护**
+- **审批锁**：`approve/reject/resolve/bypass` 检测 AI 会话标记（`REQ_GUARD_AI_CTX`）即拒，堵 AI 自批
 - 零外部依赖（纯 Rust 标准库），开箱即 build
 
 ## 快速上手
@@ -63,9 +64,24 @@ req-guard bypass --reason "线上热修，事后补审" --ttl 60   # 有痕、�
 req-guard check                                            # 手动判定（CI 用）
 ```
 
+## 合规部署（三层 + 锁）
+
+```bash
+req-guard install --verify   # 校验资产 / 各 AI 工具 hook / pre-commit 就位（CI 步骤，缺口退出码 1）
+req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gates/audit/DIGEST
+```
+
+- **L2 fail-closed**：`.gates/hooks/req-guard-check.sh` 缺失时 `git commit` 被阻止（非静默放行）
+- **L3 默认开启**：`enforce.ci: true`——流水线调 `req-guard check` 并设为必需状态检查 + 分支保护
+- **审批锁（方案 A）**：AI 会话注入 `REQ_GUARD_AI_CTX=1`（Claude Code 配置 `env` 段），
+  `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批
+- **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
+
+详见《AI工具合规保证规范.md》。
+
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `ui`
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`）
 
 ## 门禁管理台（TUI / GUI）
@@ -118,8 +134,8 @@ bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目�
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test --workspace                 # 单元测试（44 用例）
-python scripts/verify_gate.py          # 拦截脚本真机场景（10 场景）
+cargo test --workspace                 # 单元测试（55 用例）
+python scripts/verify_gate.py          # 拦截脚本真机场景（11 场景）
 ```
 
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，

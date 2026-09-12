@@ -46,6 +46,10 @@ req-guard 是 gates-toolkit 的流程门禁，管"AI **该不该写**"。本规�
 2. **审批动作必须鉴权**（人类持有、AI 环境拿不到的凭据），否则状态可被欺诈性置为 `approved`，L2/L3 照单全收；
 3. **L1 仅作 UX 快失败**，其缺位不得削弱 L2/L3。
 
+> **落地进展（2026-09）**：§4.2 L2 fail-closed、§4.3 `enforce.ci` 默认 true、
+> §4.4 方案 A（`REQ_GUARD_AI_CTX` 审批锁）、§4.5 `install --verify`、
+> §4.6 入库台账 + `audit-digest` 已实现；方案 B/C 与各工具原生 hook schema（P2）待做。
+
 ---
 
 ## 3. 保证架构：三层定位
@@ -89,7 +93,7 @@ AI 工具 A / B / C / ...（未知工具也算）
 | 支持工具 | 至少覆盖 `claude` / `codebuddy` / `codex` / `cursor` | `core/src/gate.rs` `TOOL_PROFILES` |
 | matcher | `Write\|Edit\|MultiEdit\|NotebookEdit` | `gate.rs::hook_json()` |
 | 幂等 | 已含 `req-guard-check` 则跳过 | `inject_tool()` |
-| 冲突 | 已存在配置**不含** hook 时，**不得静默跳过** | 现状是"提示手工合并"→ 见 4.5 改为 CI 报错 |
+| 冲突 | 已存在配置**不含** hook 时，**不得静默跳过** | 提示手工合并 + `install --verify` 在 CI 检出（见 4.5） |
 
 **校验清单（L1）**：
 - [ ] 每个在用 AI 工具的配置文件含 `req-guard-check` 调用
@@ -99,13 +103,16 @@ AI 工具 A / B / C / ...（未知工具也算）
 
 ### 4.2 L2 —— pre-commit 真 fail-closed（墙①，工具无关）
 
-**现状缺陷**：`core/src/gate.rs` 的 `PRE_COMMIT_BLOCK` 为
+**现状（已实现）**：`core/src/gate.rs` 的 `PRE_COMMIT_BLOCK` 为
 ```sh
-if [ -f .gates/hooks/req-guard-check.sh ]; then
-  sh .gates/hooks/req-guard-check.sh || exit 1
+if [ ! -f .gates/hooks/req-guard-check.sh ]; then
+  echo "✗ req-guard 门禁脚本缺失……提交已被阻止。" >&2
+  exit 1
 fi
+sh .gates/hooks/req-guard-check.sh || exit 1
 ```
-脚本缺失即**静默跳过**（fail-open），与"安全机制 fail-closed"原则冲突。
+脚本缺失即**拦截提交并提示初始化**（fail-closed），与 gates-toolkit `030-reqguard`
+片段语义一致；真机回归见 `scripts/verify_gate.py` 场景 11。
 
 **规范**：
 - 脚本/清单缺失 → `exit 1` 并提示初始化；
@@ -119,7 +126,9 @@ fi
 
 ### 4.3 L3 —— CI 强制门禁（墙②，服务端独立）
 
-**现状缺陷**：`req-guard.yaml` 默认 `enforce.ci: false`，多数项目"只装不接"。
+**现状（已实现）**：`REQ_GUARD_YAML` 模板默认 `enforce.ci: true`，`req-guard install`
+输出 CI 接入提示，`.gates/README.md`（随项目生成）含部署指引；流水线侧的
+必需状态检查与分支保护仍需各项目按指引自行配置。
 
 **规范**：
 - 默认 `enforce.ci: true`；流水线显式调用 `req-guard check`；
@@ -134,8 +143,12 @@ fi
 
 ### 4.4 锁 —— 审批动作鉴权（最关键，堵自批）
 
-**现状缺陷**：`cli/src/cli.rs::validate()` 仅校验参数**是否存在**，`--reviewer`/`--author` 是任意字符串；
-`comment.rs::resolve()` 仅拒 `author=ai` 字面量。AI 经 Shell 调 `req-guard approve REQ-001 --step decomposition --reviewer 寇工`（×3）即可自批；调 `req-guard resolve ... --author 寇工` 即可关阻塞评论。
+**现状（方案 A 已实现）**：`core/src/auth.rs` 提供 `ensure_human()`，在
+`requirement::review`（approve/reject）、`comment::resolve`、`gate::bypass` 入口
+统一检测 `REQ_GUARD_AI_CTX`，非空即拒（core 层生效，CLI/TUI/GUI 同约束）；
+`install` 给 claude 的 `settings.json` 注入 `"env": {"REQ_GUARD_AI_CTX": "1"}`
+使该工具会话（含 Shell 工具）自带标记。残留边界：标记可被 `env -u` 剥离；
+codex/cursor/codebuddy 的 env 注入待 P2 原生 schema 时补齐。
 
 **规范（任选其一，强度递增）**：
 
@@ -155,7 +168,11 @@ fi
 
 ### 4.5 L1 注入器：未知工具默认拒绝（消除静默缺口）
 
-`inject_tool()` 当前对"已存在但不含 hook"的配置文件**只提示手工合并、不写入**——这会导致 L1 对该工具静默缺失。
+**现状（已实现）**：提供 `req-guard install --verify`——核心资产缺失、在用工具配置
+缺 `req-guard-check`、env 注入型工具缺 `REQ_GUARD_AI_CTX`、`.git` 存在但 pre-commit
+缺拦截，任一命中即退出码 1；可直接作为 CI 步骤（见 4.1/4.3 校验清单）。
+注入器对"已存在但不含 hook"的配置仍不覆盖（避免破坏既有配置），改为提示手工合并 +
+`--verify` 在 CI 检出。
 
 **规范**：
 - 注入器在 `req-guard install` 后，提供 `req-guard install --verify` 或 CI 步骤，扫描所有已知工具配置是否含 `req-guard-check`；
@@ -168,7 +185,10 @@ fi
 
 ### 4.6 审计可信化
 
-**现状缺陷**：`.gates/audit/*.log` 被 `.gitignore` 忽略（`GITIGNORE_LINES`），审计仅留本机，别人 clone 看不到。
+**现状（已实现）**：关键事件（approve / reject / resolve / bypass / 阻塞性评论新增）
+同步写入**入库**的 `.gates/audit/ledger.md`（Markdown 台账，PR diff 可复核）；
+`req-guard audit-digest` 对本机 `gate-audit.log` 计算 SHA-256，追加到入库的
+`.gates/audit/DIGEST`，与本地日志比对即可发现事后篡改。
 
 **规范**：
 - 审计摘要或哈希定期提交到可审阅位置（版本控制 `audit/` 或中央日志）；

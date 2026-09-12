@@ -210,17 +210,19 @@ pub fn add(root: &Path, req_id: &str, d: NewComment<'_>) -> Result<Comment> {
     })?;
 
     let reply_id = reply.map(|r| r.to_string());
-    crate::gate::audit(
-        root,
-        &format!(
-            "COMMENT-ADD {} id={} author={} blocking={} reply={}",
-            req_id,
-            id,
-            safe_field(author),
-            blocking,
-            reply_id.as_deref().unwrap_or("-")
-        ),
+    let add_event = format!(
+        "COMMENT-ADD {} id={} author={} blocking={} reply={}",
+        req_id,
+        id,
+        safe_field(author),
+        blocking,
+        reply_id.as_deref().unwrap_or("-")
     );
+    crate::gate::audit(root, &add_event);
+    // 阻塞性评论改变门禁裁决 → 关键事件入入库台账（§4.6）
+    if blocking {
+        crate::gate::audit_ledger(root, &add_event);
+    }
 
     Ok(Comment {
         id,
@@ -241,6 +243,9 @@ pub fn add(root: &Path, req_id: &str, d: NewComment<'_>) -> Result<Comment> {
 
 /// 关闭（resolve）评论。**AI 被禁止调用**——只能 reply。
 pub fn resolve(root: &Path, req_id: &str, cid: &str, author: &str) -> Result<()> {
+    // 审批锁（§4.4 方案 A）：resolve 属审批类动作，AI 会话内禁止
+    // （否则 AI 用 --author 任意字符串冒充审核人即可关闭阻塞评论）。
+    crate::auth::ensure_human("resolve")?;
     if is_ai(author) {
         return Err(GateError::Validation(
             "AI 不能关闭（resolve）评论，只能 reply；关闭权归审核人".into(),
@@ -275,15 +280,15 @@ pub fn resolve(root: &Path, req_id: &str, cid: &str, author: &str) -> Result<()>
         path: Some(path),
         source: e,
     })?;
-    crate::gate::audit(
-        root,
-        &format!(
-            "COMMENT-RESOLVE {} id={} reviewer={}",
-            req_id,
-            cid,
-            safe_field(author)
-        ),
+    let resolve_event = format!(
+        "COMMENT-RESOLVE {} id={} reviewer={}",
+        req_id,
+        cid,
+        safe_field(author)
     );
+    crate::gate::audit(root, &resolve_event);
+    // 关评解除拦截 → 关键事件入入库台账（§4.6）
+    crate::gate::audit_ledger(root, &resolve_event);
     Ok(())
 }
 
