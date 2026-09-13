@@ -15,6 +15,18 @@ import tempfile
 import time
 from pathlib import Path
 
+# Windows CI（GitHub runners）默认用 cp1252：stdout 编码中文会 UnicodeEncodeError，
+# 子进程管道按 ANSI 解码中文输出会 UnicodeDecodeError（崩在 readerthread 里）。
+# 故无论平台一律显式 UTF-8；errors="replace" 保证控制台编码异常时也不至于中断。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):  # 极旧 Python / 流已被替换
+        pass
+
+# 子进程管道解码同样必须显式指定（text=True 会用 locale 编码 → Windows 上必崩）
+RUN_KW = {"encoding": "utf-8", "errors": "replace"}
+
 ROOT = Path(__file__).resolve().parent.parent
 # HOOK_SH 常量随业务逻辑住在 core（workspace 拆分后）。
 SRC = ROOT / "core" / "src" / "gate.rs"
@@ -68,7 +80,14 @@ def extract_const(name: str) -> str:
 
 HOOK = extract_const("HOOK_SH")
 DENY_HOOK = extract_const("DENY_SH")
-SH = shutil.which("sh") or "sh"
+# Windows CI 的 POSIX shell 由 Git for Windows 提供；缺失时给出可操作提示，
+# 而不是抛一串 FileNotFoundError 让人以为是脚本 bug。
+SH = shutil.which("sh")
+if not SH:
+    sys.exit(
+        "未找到 POSIX shell（sh）：本脚本实跑 .sh 拦截脚本，"
+        "Windows 请确认 Git for Windows 已安装且 sh 在 PATH 中。"
+    )
 
 
 def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=None):
@@ -99,6 +118,7 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
             capture_output=True,
             text=True,
             input=stdin_data,
+            **RUN_KW,
         )
     else:
         # DEVNULL 防止 pre-commit/手动 check 场景下 `cat` 挂起
@@ -108,6 +128,7 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
+            **RUN_KW,
         )
     shutil.rmtree(work.parent, ignore_errors=True)
     return r.returncode
@@ -176,7 +197,7 @@ def verify_pre_commit_fail_closed() -> bool:
     # 刻意不创建 .gates/hooks/req-guard-check.sh → 门禁脚本缺失
     r = subprocess.run(
         [SH, str(pc)], cwd=work, capture_output=True, text=True,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, **RUN_KW,
     )
     shutil.rmtree(work, ignore_errors=True)
     good = r.returncode == 1
@@ -211,7 +232,7 @@ def verify_deny_wrapper() -> bool:
         (work / REQ_DIR / "REQ-001.md").write_text(make_req(status), encoding="utf-8")
         r = subprocess.run(
             [SH, str(work / deny_rel)], cwd=work, capture_output=True, text=True,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, **RUN_KW,
         )
         shutil.rmtree(work, ignore_errors=True)
         good = r.returncode == expect

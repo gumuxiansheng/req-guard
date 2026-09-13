@@ -7,6 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Windows runner 默认用 cp1252：Python 步骤一输出中文就 UnicodeEncodeError
+  # （脚本内部亦已显式 UTF-8，此处是第二道保险）
+  PYTHONIOENCODING: utf-8
 
 jobs:
   verify:
