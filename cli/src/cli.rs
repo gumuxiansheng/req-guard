@@ -62,6 +62,8 @@ pub struct Args {
     pub refresh_anchors: bool,
     /// 审批令牌（方案 B）：approve/reject/resolve/bypass 提供以通过鉴权。
     pub token: Option<String>,
+    /// 带外审批声明（方案 C）：approve/reject/resolve/bypass 显式声明来自带外渠道。
+    pub oob: bool,
     /// `install --verify`：只校验门禁就位情况（CI 用），不写入任何文件。
     pub verify: bool,
     /// `ui --gui`：强制图形界面。
@@ -82,6 +84,12 @@ pub fn parse() -> std::result::Result<Parsed, String> {
     if matches!(argv.first().map(String::as_str), Some("-V" | "--version")) {
         println!("req-guard {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
+    }
+    // `req-guard oob <命令>`：带外前端——等价于 `<命令> --oob`（方案 C 渠道声明）。
+    if matches!(argv.first().map(String::as_str), Some("oob")) {
+        let mut v = argv[1..].to_vec();
+        v.push("--oob".to_string());
+        return parse_from(&v);
     }
     parse_from(&argv)
 }
@@ -145,6 +153,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         ttl: 60,
         refresh_anchors: false,
         token: None,
+        oob: false,
         verify: false,
         gui: false,
         tui: false,
@@ -182,6 +191,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
                     .map_err(|_| format!("--ttl 需为整数分钟，当前: {}", v))?;
             }
             "--token" => a.token = Some(next(&mut it, "--token")?),
+            "--oob" => a.oob = true,
             "-p" | "--path" => a.root = PathBuf::from(next(&mut it, "--path")?),
             "-h" | "--help" => return Err(help()),
             other => {
@@ -281,6 +291,8 @@ fn help() -> String {
   -p, --path <项目根>   默认当前目录\n\
   -V, --version         输出版本号\n\
   -h, --help            输出本帮助\n\
+  --token <令牌>        审批令牌（方案 B）；或用 REQ_GUARD_TOKEN\n\
+  --oob                 声明带外审批渠道（方案 C；亦可写 req-guard oob <命令>）\n\
 \n\
 步骤: decomposition(需求分解) -> solution(技术方案) -> testplan(测试计划)\n\
 规则: 三段全部 approved 且无未解决的阻塞性评论，AI 才被允许编写代码。\n"

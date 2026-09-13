@@ -261,13 +261,15 @@ pub fn review(
         source: e,
     })?;
 
-    // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）
+    // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）；
+    // 渠道标注（方案 C）让"审批来自带外/交互"可审计。
     let event = format!(
-        "{} {} step={} reviewer={}",
+        "{} {} step={} reviewer={} channel={}",
         if pass { "APPROVE" } else { "REJECT" },
         r.id,
         step,
-        safe_field(reviewer)
+        safe_field(reviewer),
+        crate::auth::declared_channel()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);

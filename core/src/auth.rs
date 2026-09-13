@@ -8,11 +8,14 @@
 //!   原文由人类带外持有（存入密码管理器/自身会话）。库文件只存 SHA-256 哈希于
 //!   `~/.config/req-guard/guard.cfg`。一旦**启用令牌**（[`crate::token::load()`] 命中），
 //!   审批必须携带有效令牌——AI 不知道令牌值，无法自批。
+//! - **方案 C**（带外审批，流程化）：审批必须**显式声明来自带外渠道**（`--oob` /
+//!   `req-guard oob …`）。可全局关闭 `REQ_GUARD_OOB_ONLY=1` 强制"仅接受带外审批"。
+//!   零依赖下不引入非对称签名；其隔离与留痕通过"渠道声明 + 审计台账 `channel=` 标注"实现。
 //!
-//! ## 判级
-//! [`ensure_human`] 行为：
-//! - 已启用令牌（[`crate::token::token_mode()`]）→ 必须校验 `REQ_GUARD_TOKEN`；
-//! - 未启用令牌 → 回退方案 A（`REQ_GUARD_AI_CTX` 软标记拒绝）。
+//! ## 判级（三者正交叠加）
+//! [`ensure_human`] 依次要求：
+//! 1. 令牌或非 AI 上下文可通过（B / A）；
+//! 2. 若 `REQ_GUARD_OOB_ONLY=1` → 必须已声明带外渠道（C 强制）。
 //!
 //! 鉴权点放在 core（而非 CLI），TUI / GUI 与 CLI 自动获得同一约束。
 
@@ -20,6 +23,12 @@ use crate::error::{GateError, Result};
 
 /// AI 执行上下文标记环境变量名（方案 A）。
 pub const AI_CTX_ENV: &str = "REQ_GUARD_AI_CTX";
+
+/// 带外审批声明环境变量名（方案 C）：进程声明本次审批来自带外渠道。
+pub const OOB_DECL_ENV: &str = "REQ_GUARD_OOB";
+
+/// 仅带外审批开关环境变量名（方案 C）：置非空则强制审批必须带 `--oob`/`oob …`。
+pub const OOB_ONLY_ENV: &str = "REQ_GUARD_OOB_ONLY";
 
 /// 按给定标记取值判断是否处于 AI 执行上下文（存在且非空即视为是）。
 fn is_ai_ctx_value(v: Option<&str>) -> bool {
@@ -35,13 +44,59 @@ pub fn is_ai_context() -> bool {
 ///
 /// 供 [`crate::requirement::review`]（approve/reject）、[`crate::comment::resolve`]、
 /// [`crate::gate::bypass`] 在入口调用；`action` 用于错误提示点名动作。
-/// 令牌模式优先；未启用令牌时回退方案 A。
+/// 依次要求：主鉴权（令牌 B 或方案 A），再由方案 C 判定（若仅带外开关开启）。
 pub fn ensure_human(action: &str) -> Result<()> {
+    ensure_human_gate(action)?;
+    check_oob_forced(action)
+}
+
+/// 主鉴权：令牌模式优先，未启用则回退方案 A。
+fn ensure_human_gate(action: &str) -> Result<()> {
     if crate::token::token_mode() {
         return guard_token(action);
     }
     // 方案 A：软标记拒绝
     ensure_human_with(std::env::var(AI_CTX_ENV).ok().as_deref(), action)
+}
+
+/// 方案 C：当前进程是否**已声明带外渠道**（`--oob` / `req-guard oob …`）。
+fn declared_oob() -> bool {
+    std::env::var(OOB_DECL_ENV)
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 方案 C 判定的可测核心：`oob_only` 为"仅带外开关是否开启"，`declared` 为
+/// "本次审批是否已声明带外渠道"。仅当开关开启且未声明才拒绝。
+fn check_oob_forced_with(oob_only: bool, declared: bool, action: &str) -> Result<()> {
+    if oob_only && !declared {
+        return Err(GateError::Validation(format!(
+            "{} 属于审批类动作：本机已开启\"仅带外审批\"（{}），\
+             审批必须在带外渠道执行并显式声明。\n\
+             请在命令中加 --oob，或改用它：req-guard oob <命令>。",
+            action, OOB_ONLY_ENV
+        )));
+    }
+    Ok(())
+}
+
+/// 方案 C 入口（读进程环境）。
+fn check_oob_forced(action: &str) -> Result<()> {
+    let oob_only = std::env::var(OOB_ONLY_ENV)
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    check_oob_forced_with(oob_only, declared_oob(), action)
+}
+
+/// 本次审批的**渠道标注**（供审计台账 `channel=` 使用）：`oob` 或 `interactive`。
+pub fn declared_channel() -> &'static str {
+    if declared_oob() {
+        "oob"
+    } else {
+        "interactive"
+    }
 }
 
 /// 令牌模式守卫：必须携带有效 `REQ_GUARD_TOKEN`，否则拒绝（fail-closed）。
@@ -137,5 +192,21 @@ mod tests {
         // 提供了错误令牌 → 报无效/过期（真实 verify 依赖 HOME，此处只验错误提示形态）
         let e = guard_token_with(Some("deadbeef".to_string()), "resolve").unwrap_err();
         assert!(e.to_string().contains("RESOLVE") || e.to_string().contains("resolve"));
+    }
+
+    #[test]
+    fn 仅带外模式未声明即拒() {
+        // 开关开启 + 未声明 → 拒绝并提示带外渠道
+        let e = check_oob_forced_with(true, false, "approve").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("approve"));
+        assert!(msg.contains(OOB_ONLY_ENV));
+        assert!(msg.contains("--oob"));
+
+        // 开关开启 + 已声明 → 通过
+        assert!(check_oob_forced_with(true, true, "approve").is_ok());
+        // 开关关闭 → 无论是否声明都通过
+        assert!(check_oob_forced_with(false, false, "approve").is_ok());
+        assert!(check_oob_forced_with(false, true, "approve").is_ok());
     }
 }

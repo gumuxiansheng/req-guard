@@ -491,10 +491,11 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         source: e,
     })?;
     let bypass_event = format!(
-        "BYPASS-OPEN actor={} ttl={}min reason={}",
+        "BYPASS-OPEN actor={} ttl={}min reason={} channel={}",
         one_line(actor),
         ttl_minutes,
-        one_line(reason)
+        one_line(reason),
+        crate::auth::declared_channel()
     );
     audit(root, &bypass_event);
     // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）

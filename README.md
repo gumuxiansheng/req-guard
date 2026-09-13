@@ -79,14 +79,16 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
   `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批
 - **审批令牌（方案 B）**：`req-guard token issue` 签发短期令牌（原文仅打印一次，人类带外持有），
   启用后审批必须携带有效令牌，AI 拿不到 → 无法自批；`token status/revoke` 查询与撤销
+- **带外审批（方案 C）**：审批显式声明带外渠道 `--oob` 或 `req-guard oob <命令>`；
+  设 `REQ_GUARD_OOB_ONLY=1` 可强制"仅接受带外审批"；台账按 `channel=oob|interactive` 留痕
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见《AI工具合规保证规范.md》。
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `ui`
-（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`）
+`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
 
 ## 门禁管理台（TUI / GUI）
 
@@ -139,7 +141,7 @@ bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目�
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test --workspace                 # 单元测试（61 用例）
+cargo test --workspace                 # 单元测试（62 用例）
 python scripts/verify_gate.py          # 拦截脚本真机场景（13 场景）
 ```
 

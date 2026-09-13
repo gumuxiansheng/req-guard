@@ -211,12 +211,13 @@ pub fn add(root: &Path, req_id: &str, d: NewComment<'_>) -> Result<Comment> {
 
     let reply_id = reply.map(|r| r.to_string());
     let add_event = format!(
-        "COMMENT-ADD {} id={} author={} blocking={} reply={}",
+        "COMMENT-ADD {} id={} author={} blocking={} reply={} channel={}",
         req_id,
         id,
         safe_field(author),
         blocking,
-        reply_id.as_deref().unwrap_or("-")
+        reply_id.as_deref().unwrap_or("-"),
+        crate::auth::declared_channel()
     );
     crate::gate::audit(root, &add_event);
     // 阻塞性评论改变门禁裁决 → 关键事件入入库台账（§4.6）
@@ -281,10 +282,11 @@ pub fn resolve(root: &Path, req_id: &str, cid: &str, author: &str) -> Result<()>
         source: e,
     })?;
     let resolve_event = format!(
-        "COMMENT-RESOLVE {} id={} reviewer={}",
+        "COMMENT-RESOLVE {} id={} reviewer={} channel={}",
         req_id,
         cid,
-        safe_field(author)
+        safe_field(author),
+        crate::auth::declared_channel()
     );
     crate::gate::audit(root, &resolve_event);
     // 关评解除拦截 → 关键事件入入库台账（§4.6）

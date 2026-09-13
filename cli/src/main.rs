@@ -37,6 +37,10 @@ fn run(a: &cli::Args) -> Result<()> {
             std::env::set_var(req_guard_core::token::TOKEN_ENV, t);
         }
     }
+    // 方案 C：审批显式声明带外渠道（供 core 校验与台账 channel 标注）。
+    if a.oob {
+        std::env::set_var(req_guard_core::auth::OOB_DECL_ENV, "1");
+    }
     match a.action {
         Action::Init | Action::Install => {
             // --verify：只校验不写入（CI 步骤；§4.5 消除 L1 静默缺口）
