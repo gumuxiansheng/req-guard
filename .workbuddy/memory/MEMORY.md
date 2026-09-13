@@ -24,6 +24,9 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   生成脚本 `scripts/make_font_subset.py`。
 - 命名统一 `req-guard-*`（常量 `gate::HOOK_SH_REL`/`HOOK_PS1_REL` 为唯一真相）；ps1 强制 UTF-8 BOM；
   `strict_order` 真实生效；install 幂等追加 `.gitignore`；评论/绕过事件入审计；AI 只能 reply 不得 resolve。
+- **跨平台原则**：渲染出的 hook 命令可平台相关（`hook_script_rel()` 按 `cfg!(windows)` 选 .ps1/.sh，唯一真相），
+  但"配置是否已接入门禁"的 marker 必须**平台中立**（取脚本名词干 `req-guard-check`/`req-guard-deny`，不取后缀），
+  否则 `install` 幂等检查与 `install --verify` 在各平台假红；测试断言不得写死 `.sh`/`.ps1`。
 - 已 git init + 6 次提交（最新见 git log）+ GitHub Actions 三平台矩阵 + CNB 流水线 + `.gitattributes`(sh=LF)。
 - **多平台 Release 流程已落地**（2026-09-12，对齐 sql-guard）：`.cargo/config.toml`（rust-lld + link-self-contained）、
   `scripts/build-release.sh`（5 目标 × 2 变体 + SHA256SUMS）、`.cnb.yml` 的 `"v*": tag_push`

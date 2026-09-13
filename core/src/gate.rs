@@ -33,14 +33,37 @@ pub const DENY_SH_REL: &str = ".gates/hooks/req-guard-deny.sh";
 /// deny 包装脚本（Windows）相对路径。
 pub const DENY_PS1_REL: &str = ".gates/hooks/req-guard-deny.ps1";
 
+/// 当前平台注入工具配置时引用的拦截脚本**相对路径**（Windows→`.ps1`，其余→`.sh`）。
+///
+/// 与 [`run_hook`] 同规则：按**编译目标平台**选，不按"哪个文件存在"（install 在任意平台
+/// 都会同时落盘 .sh/.ps1 作为跨平台资产）。`hook_json` 与测试断言共用此函数，
+/// 避免平台差异在两个地方各写一遍而漂移。
+fn hook_script_rel(use_deny: bool) -> &'static str {
+    match (cfg!(windows), use_deny) {
+        (true, true) => DENY_PS1_REL,
+        (true, false) => HOOK_PS1_REL,
+        (false, true) => DENY_SH_REL,
+        (false, false) => HOOK_SH_REL,
+    }
+}
+
 /// 某工具注入时，判断"配置已含门禁"的 marker 子串：deny 型工具注入的 command
 /// 指向 deny 包装（不含 `req-guard-check` 字样），须按 derive 判定。
+///
+/// 取脚本名**词干**（去掉 `.sh` / `.ps1` 后缀）而非完整文件名：工具配置通常随仓库入库，
+/// 同一仓库可能被 Windows（配置里落 `.ps1`）与 Linux/macOS（落 `.sh`）的开发者先后
+/// install。若 marker 只认 `.sh`，Windows 侧 `install` 幂等检查会凭空冒出"请手工合并"
+/// 提示、`install --verify` 会报不存在的 L1 缺口（跨平台假红）。
 fn marker_of(prof: &ToolProfile) -> &'static str {
-    if prof.use_deny {
-        DENY_SH_REL.rsplit('/').next().unwrap_or("req-guard-deny")
+    let rel = if prof.use_deny {
+        DENY_SH_REL
     } else {
-        HOOK_SH_REL.rsplit('/').next().unwrap_or("req-guard-check")
-    }
+        HOOK_SH_REL
+    };
+    rel.rsplit('/')
+        .next()
+        .and_then(|name| name.split('.').next())
+        .unwrap_or("req-guard-check")
 }
 
 /// 创建父目录并写入文件，返回完整路径。
@@ -583,22 +606,12 @@ fn inject_tool(
 ///   Codex/Cursor 改连 `req-guard-deny` 包装（把 exit 1 转成其能识别的 exit 2）。
 fn hook_json(prof: &ToolProfile) -> String {
     let cmd = if cfg!(windows) {
-        let script = if prof.use_deny {
-            DENY_PS1_REL
-        } else {
-            HOOK_PS1_REL
-        };
         format!(
             "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
-            script
+            hook_script_rel(prof.use_deny)
         )
     } else {
-        let script = if prof.use_deny {
-            DENY_SH_REL
-        } else {
-            HOOK_SH_REL
-        };
-        format!("sh {}", script)
+        format!("sh {}", hook_script_rel(prof.use_deny))
     };
     let env = if prof.env_capable {
         format!(
@@ -670,8 +683,8 @@ pub fn verify_install(root: &Path) -> Vec<String> {
         let marker = marker_of(prof);
         if !content.contains(marker) {
             problems.push(format!(
-                "{} 已存在（在用）但未接入 req-guard hook（缺 `{}`）——L1 静默缺口；\
-                 按 req-guard install 输出的片段手工合并",
+                "{} 已存在（在用）但未接入 req-guard hook（缺 `{}` 的 .sh / .ps1 任一形式）\
+                 ——L1 静默缺口；按 req-guard install 输出的片段手工合并",
                 prof.config, marker
             ));
         }
@@ -1343,31 +1356,34 @@ mod tests {
 
     #[test]
     fn hook_json按工具渲染原生schema() {
+        // 注入的命令按**平台**选解释器与脚本（Windows: powershell + .ps1；其余: sh + .sh），
+        // 与 run_hook 取用规则一致。断言一律走 hook_script_rel，避免把平台差异写死。
+        let check = hook_script_rel(false);
+        let deny = hook_script_rel(true);
+        let prefix = if cfg!(windows) {
+            "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        } else {
+            "sh "
+        };
+        let cmd = |rel: &str| format!("command\": \"{}{}\"", prefix, rel);
+
         // Claude：settings.json 事件大驼峰 + Write 系 matcher + 支持 env 注入
         let j = hook_json(tp("claude"));
         assert!(j.contains("\"env\""), "{}", j);
         assert!(j.contains("REQ_GUARD_AI_CTX"), "{}", j);
         assert!(j.contains("\"PreToolUse\""), "{}", j);
         assert!(j.contains("Write|Edit|MultiEdit|NotebookEdit"), "{}", j);
-        assert!(
-            j.contains("req-guard-check.sh"),
-            "claude 直连 check.sh：{}",
-            j
-        );
+        assert!(j.contains(&cmd(check)), "claude 直连 check 脚本：{}", j);
         assert!(
             !j.contains("req-guard-deny"),
             "claude 不需 deny 包装：{}",
             j
         );
 
-        // CodeBuddy：settings.json（路径已修正）+ env 段 + 直连 check.sh
+        // CodeBuddy：settings.json（路径已修正）+ env 段 + 直连 check 脚本
         let j = hook_json(tp("codebuddy"));
         assert!(j.contains("REQ_GUARD_AI_CTX"), "codebuddy 支持 env：{}", j);
-        assert!(
-            j.contains("req-guard-check.sh"),
-            "codebuddy 直连 check.sh：{}",
-            j
-        );
+        assert!(j.contains(&cmd(check)), "codebuddy 直连 check 脚本：{}", j);
         assert_eq!(tp("codebuddy").config, ".codebuddy/settings.json");
 
         // Codex：无 env、matcher=apply_patch、走 deny 包装
@@ -1378,10 +1394,10 @@ mod tests {
             "codex matcher 应为 apply_patch：{}",
             j
         );
-        assert!(j.contains("req-guard-deny.sh"), "codex 走 deny 包装：{}", j);
+        assert!(j.contains(&cmd(deny)), "codex 走 deny 包装：{}", j);
         assert!(
-            !j.contains("req-guard-check.sh"),
-            "codex 不得直连 check.sh：{}",
+            !j.contains("req-guard-check"),
+            "codex 不得直连 check 脚本：{}",
             j
         );
 
@@ -1393,11 +1409,7 @@ mod tests {
             "cursor 用原生小驼峰事件名：{}",
             j
         );
-        assert!(
-            j.contains("req-guard-deny.sh"),
-            "cursor 走 deny 包装：{}",
-            j
-        );
+        assert!(j.contains(&cmd(deny)), "cursor 走 deny 包装：{}", j);
     }
 
     #[test]
@@ -1438,8 +1450,19 @@ mod tests {
             cb
         );
         let cx = fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
-        assert!(cx.contains("req-guard-deny.sh"), "codex deny：{}", cx);
+        assert!(cx.contains("req-guard-deny"), "codex deny：{}", cx);
         assert!(cx.contains("apply_patch"), "codex matcher：{}", cx);
+        // 注入的实际脚本须是**本平台**那支（且随 install 落盘）
+        assert!(
+            cx.contains(hook_script_rel(true)),
+            "codex 应引用本平台 deny 脚本 {}：{}",
+            hook_script_rel(true),
+            cx
+        );
+        assert!(
+            root.join(hook_script_rel(true)).exists(),
+            "注入引用的脚本必须已落盘"
+        );
         let cur = fs::read_to_string(root.join(".cursor/hooks.json")).unwrap();
         assert!(cur.contains("\"preToolUse\""), "cursor 事件名：{}", cur);
         cleanup(&root);
@@ -1477,7 +1500,10 @@ mod tests {
         // 旧版配置（有 hook 无 env）→ 仍要提示补齐
         fs::write(
             root.join(".claude/settings.json"),
-            "{\"hooks\":{\"x\":[{\"command\":\"sh .gates/hooks/req-guard-check.sh\"}]}}",
+            format!(
+                "{{\"hooks\":{{\"x\":[{{\"command\":\"{}\"}}]}}}}",
+                hook_script_rel(false)
+            ),
         )
         .unwrap();
         let mut notes = Vec::new();
@@ -1487,6 +1513,46 @@ mod tests {
             "缺 env 段应提示手工合并：{:?}",
             notes
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 门禁识别跨平台_已装配置不因平台后缀误判() {
+        // 回归（Windows CI 假红）：工具配置随仓库入库，常被不同平台的开发者先后 install
+        // ——Windows 落 `.ps1`、Linux/macOS 落 `.sh`。识别 marker 若只认某一种后缀，
+        // 就会在另一平台上虚报 L1 缺口 / 凭空提示"请手工合并"。
+        let root = temp_dir("cross-platform");
+        install(&root, &["claude".to_string()], false).unwrap();
+
+        let cfg = root.join(".claude/settings.json");
+        for rel in [HOOK_SH_REL, HOOK_PS1_REL] {
+            fs::write(
+                &cfg,
+                format!(
+                    "{{\"hooks\":{{\"x\":[{{\"command\":\"{}\"}}]}},\"env\":{{\"{}\":\"1\"}}}}",
+                    rel,
+                    crate::auth::AI_CTX_ENV
+                ),
+            )
+            .unwrap();
+            assert!(
+                verify_install(&root).is_empty(),
+                "{} 形态的既有配置应被识别为已接入：{:?}",
+                rel,
+                verify_install(&root)
+            );
+
+            let mut created = Vec::new();
+            let mut notes = Vec::new();
+            inject_tool(&root, "claude", &mut created, &mut notes).unwrap();
+            assert!(
+                notes.is_empty(),
+                "{} 形态不应触发合并提示：{:?}",
+                rel,
+                notes
+            );
+        }
 
         cleanup(&root);
     }
@@ -1516,6 +1582,8 @@ mod tests {
         );
 
         // 4) 含 hook 但缺审批锁 env → 审批锁缺口
+        //    这里刻意用 POSIX 形态（`sh ...check.sh`）：即便在 Windows 上跑，
+        //    "已接入 hook"也必须被识别（跨平台配置互认），只报 env 缺口。
         fs::write(
             root.join(".claude/settings.json"),
             "{\"hooks\":{\"x\":[{\"command\":\"sh .gates/hooks/req-guard-check.sh\"}]}}",
