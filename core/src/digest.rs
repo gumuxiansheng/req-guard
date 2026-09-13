@@ -35,8 +35,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    // 分块压缩
-    for chunk in msg.chunks_exact(64) {
+    // 分块压缩（按 64 字节定长块）
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, b) in chunk.iter().enumerate() {
             let j = i / 4;

@@ -163,7 +163,7 @@ fn random_hex(bytes: usize) -> String {
                 .wrapping_add(pid)
                 .wrapping_add(i as u128 * 0x9e37_79b9_7f4a_7c15)
                 ^ (i as u128).wrapping_mul(0x1000_0000_0123);
-            *b = (mix >> (i % 8) * 8) as u8;
+            *b = (mix >> ((i % 8) * 8)) as u8;
         }
     }
     let mut s = String::with_capacity(bytes * 2);

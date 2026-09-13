@@ -556,7 +556,7 @@ fn inject_tool(
         notes.push(format!(
             "{} 已存在且不含 req-guard 门禁配置，为避免破坏既有配置未覆盖，请手工合并以下片段：\n{}",
             prof.config,
-            hook_json(&prof)
+            hook_json(prof)
         ));
         return Ok(());
     }
@@ -566,7 +566,7 @@ fn inject_tool(
             source: e,
         })?;
     }
-    fs::write(&path, hook_json(&prof)).map_err(|e| GateError::Io {
+    fs::write(&path, hook_json(prof)).map_err(|e| GateError::Io {
         path: Some(path.clone()),
         source: e,
     })?;
