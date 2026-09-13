@@ -8,8 +8,11 @@ main:
             set -e
             rustup component add clippy rustfmt
             cargo fmt --all --check
-            cargo clippy --workspace --all-targets -- -D warnings
-            cargo test --workspace
+            # ├ clippy/test 排除 req-guard-gui：GUI（eframe/winit）依赖 X11/Wayland 系统库，
+            # │ 而本执行机是 Linux 且无图形栈；按既定架构 gui 交 GitHub Actions 的 Windows/macOS
+            # │ 原生平台构建（见 README「GUI 不参与交叉编译」）。core/cli/tui 仍全量检查。
+            cargo clippy --workspace --exclude req-guard-gui --all-targets -- -D warnings
+            cargo test --workspace --exclude req-guard-gui
             cargo build --release
             cargo build -p req-guard --release --features tui
             if command -v python3 >/dev/null 2>&1; then
