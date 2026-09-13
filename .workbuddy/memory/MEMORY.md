@@ -46,6 +46,11 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
 - CLI+TUI 依赖链**零 C 代码**（无 cc/psm/stacker）→ 交叉编译无需 Zig 当 C 编译器；但
   windows-gnu **必须**装 mingw（换 `rust-lld` 会 `unable to find library -lkernel32`）。
 - **GUI 无法从 Linux 交叉编译**（需 X11/Wayland/GTK），只能原生执行机构建，勿加入交叉矩阵。
+- **GitHub windows runner 的 Python 步骤默认 cp1252**：中文 print / `subprocess(text=True)` 解码
+  必崩（`UnicodeEncodeError` / `UnicodeDecodeError`）。脚本须自切 UTF-8
+  （`reconfigure(encoding="utf-8", errors="replace")` + `subprocess(encoding="utf-8")`），CI 再兜 `PYTHONIOENCODING: utf-8`。
+- **hook 配置的"是否已接入"判定必须按词干**：`marker_of` 取 `req-guard-check` / `req-guard-deny`
+  （不带 .sh/.ps1），否则 Windows↔Linux 互装互验必假红；渲染出的命令才可平台相关。
 
 ## 已知未完成
 - **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
