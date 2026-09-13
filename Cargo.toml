@@ -13,7 +13,7 @@ default-members = ["core", "cli"]
 # tui / gui 设计为 **lib**，可被 feature 链进同一个二进制，实现"单文件 + 自动选界面"。
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [profile.release]
