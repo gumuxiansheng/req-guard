@@ -73,16 +73,20 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 
 - **L2 fail-closed**：`.gates/hooks/req-guard-check.sh` 缺失时 `git commit` 被阻止（非静默放行）
 - **L3 默认开启**：`enforce.ci: true`——流水线调 `req-guard check` 并设为必需状态检查 + 分支保护
-- **审批锁（方案 A）**：AI 会话注入 `REQ_GUARD_AI_CTX=1`（Claude Code 配置 `env` 段），
+- **工具原生 schema**：为 claude / codebuddy / codex / cursor 各自注入原生 hook 配置；
+  Codex/Cursor 走 deny 包装（exit 2）适配其拦截语义，CodeBuddy 已修正为 `.codebuddy/settings.json`
+- **审批锁（方案 A）**：Claude Code / CodeBuddy 会话注入 `REQ_GUARD_AI_CTX=1`（配置 `env` 段），
   `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批
+- **审批令牌（方案 B）**：`req-guard token issue` 签发短期令牌（原文仅打印一次，人类带外持有），
+  启用后审批必须携带有效令牌，AI 拿不到 → 无法自批；`token status/revoke` 查询与撤销
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见《AI工具合规保证规范.md》。
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `ui`
-（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`）
+`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `ui`
+（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`）
 
 ## 门禁管理台（TUI / GUI）
 
@@ -118,7 +122,8 @@ GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段�
 .gates/
 ├── req-guard.yaml               # 门禁声明
 ├── requirements/                # REQ-00N-*.md 清单 + *.comments.md 评论
-├── hooks/req-guard-check.{sh,ps1}
+├── hooks/req-guard-check.{sh,ps1}   # 拦截脚本（Claude/CodeBuddy 直连）
+├── hooks/req-guard-deny.{sh,ps1}    # deny 包装：Codex/Cursor 拦截编码转 exit 2
 └── audit/gate-audit.log         # 审计（不入库）
 ```
 
@@ -134,8 +139,8 @@ bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目�
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test --workspace                 # 单元测试（55 用例）
-python scripts/verify_gate.py          # 拦截脚本真机场景（11 场景）
+cargo test --workspace                 # 单元测试（61 用例）
+python scripts/verify_gate.py          # 拦截脚本真机场景（13 场景）
 ```
 
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，

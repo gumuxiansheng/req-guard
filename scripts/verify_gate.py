@@ -28,15 +28,6 @@ STDIN_AI_WRITE_COMMENTS = (
 )
 
 
-def extract_hook() -> str:
-    """从 gate.rs 抽出 HOOK_SH 常量内容（唯一判定逻辑）。"""
-    text = SRC.read_text(encoding="utf-8")
-    m = re.search(r'pub const HOOK_SH: &str = r#"(.*?)"#;', text, re.S)
-    if not m:
-        sys.exit("未能从 src/gate.rs 抽取 HOOK_SH")
-    return m.group(1)
-
-
 def make_req(status: str) -> str:
     """造一份三段同状态的清单。"""
     lines = [
@@ -66,7 +57,17 @@ def make_comments(blocking: bool) -> str:
     )
 
 
-HOOK = extract_hook()
+def extract_const(name: str) -> str:
+    """从 gate.rs 抽取任意 `pub const NAME: &str = r#"..."#;` 常量。"""
+    text = SRC.read_text(encoding="utf-8")
+    m = re.search(rf'pub const {name}: &str = r#"(.*?)"#;', text, re.S)
+    if not m:
+        sys.exit(f"未能从 src/gate.rs 抽取 {name}")
+    return m.group(1)
+
+
+HOOK = extract_const("HOOK_SH")
+DENY_HOOK = extract_const("DENY_SH")
 SH = shutil.which("sh") or "sh"
 
 
@@ -187,6 +188,41 @@ def verify_pre_commit_fail_closed() -> bool:
 
 
 ok = ok and verify_pre_commit_fail_closed()
+
+
+def verify_deny_wrapper() -> bool:
+    """12/13_deny 包装拦截编码（Codex/Cursor 路径）。
+
+    未过审时 check.sh 返回 1，deny 包装必须转成工具能识别的拒绝 exit 2；
+    已过审时 check.sh 返回 0，deny 包装必须原样放行 exit 0。
+    """
+    results = []
+    for name, status, expect in (
+        ("12_deny包装拦截转exit2", "pending", 2),
+        ("13_deny包装放行转exit0", "approved", 0),
+    ):
+        work = Path(tempfile.mkdtemp(prefix="reqguard-deny-"))
+        (work / Path(HOOK_REL).parent).mkdir(parents=True)
+        (work / REQ_DIR).mkdir(parents=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        deny_rel = ".gates/hooks/req-guard-deny.sh"
+        (work / deny_rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / deny_rel).write_text(DENY_HOOK, encoding="utf-8")
+        (work / REQ_DIR / "REQ-001.md").write_text(make_req(status), encoding="utf-8")
+        r = subprocess.run(
+            [SH, str(work / deny_rel)], cwd=work, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        shutil.rmtree(work, ignore_errors=True)
+        good = r.returncode == expect
+        results.append(good)
+        print(
+            f"{'PASS' if good else 'FAIL'}  {name}: exit={r.returncode} (期望 {expect})"
+        )
+    return all(results)
+
+
+ok = ok and verify_deny_wrapper()
 
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)

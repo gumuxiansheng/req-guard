@@ -30,6 +30,13 @@ fn main() {
 
 fn run(a: &cli::Args) -> Result<()> {
     let root = &a.root;
+    // 方案 B：审批命令显式给 --token 时注入环境，供 core 的 ensure_human 校验。
+    // （无 --token 则走 REQ_GUARD_TOKEN 环境变量；未启用令牌则回退方案 A）
+    if let Some(t) = a.token.as_deref() {
+        if !t.trim().is_empty() {
+            std::env::set_var(req_guard_core::token::TOKEN_ENV, t);
+        }
+    }
     match a.action {
         Action::Init | Action::Install => {
             // --verify：只校验不写入（CI 步骤；§4.5 消除 L1 静默缺口）
@@ -240,7 +247,47 @@ fn run(a: &cli::Args) -> Result<()> {
                 path.display()
             );
         }
+        Action::Token { ref sub } => run_token(root, a, sub)?,
         Action::Ui => run_ui(root, a)?,
+    }
+    Ok(())
+}
+
+/// 审批令牌管理（方案 B）。
+fn run_token(_root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
+    use req_guard_core::token;
+    match sub {
+        "issue" => {
+            let (raw, expires, ttl, path) = token::issue(a.ttl)?;
+            println!("✅ 已签发审批令牌（方案 B，有效期 {} 分钟）", ttl);
+            println!("   配置  : {}", path.display());
+            println!("   ⚠️ 请立即复制下面这串令牌原文——仅显示一次，不落盘：");
+            println!("   ┌─ 令牌 ────────────────────────────────────");
+            println!("   {}", raw);
+            println!("   └──────────────────────────────────────────");
+            println!("   到期 epoch : {}", expires);
+            println!("   用法 : req-guard approve REQ-001 --step decomposition --reviewer 张三 --token <令牌>");
+            println!("         或先 export REQ_GUARD_TOKEN=<令牌> 后省略 --token");
+            println!("   请把令牌存入密码管理器/自身会话，勿提交版本库、勿发给 AI。");
+        }
+        "status" => match token::load() {
+            Some(cfg) => {
+                println!("✅ 审批令牌已启用（方案 B）");
+                println!("   到期 epoch : {}", cfg.expires_epoch);
+                println!("   哈希(前12) : {}", &cfg.hash[..cfg.hash.len().min(12)]);
+            }
+            None => {
+                println!(
+                    "ℹ️  审批令牌（方案 B）未启用，当前鉴权为方案 A（REQ_GUARD_AI_CTX 软标记）"
+                );
+            }
+        },
+        "revoke" => {
+            let path = token::revoke()?;
+            println!("✅ 已撤销并禁用审批令牌：{}", path.display());
+            println!("   审批鉴权已回退到方案 A。");
+        }
+        _ => unreachable!("token 子命令已在校验层限制为 issue/status/revoke"),
     }
     Ok(())
 }

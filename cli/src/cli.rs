@@ -35,6 +35,10 @@ pub enum Action {
     Bypass,
     /// 生成审计摘要：本机 gate-audit.log 的 SHA-256 → 入库 DIGEST（PR 可比对）。
     AuditDigest,
+    /// 审批令牌管理（方案 B）：`token <issue|status|revoke>`。
+    Token {
+        sub: String,
+    },
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
 }
@@ -56,6 +60,8 @@ pub struct Args {
     pub tools: Vec<String>,
     pub ttl: u64,
     pub refresh_anchors: bool,
+    /// 审批令牌（方案 B）：approve/reject/resolve/bypass 提供以通过鉴权。
+    pub token: Option<String>,
     /// `install --verify`：只校验门禁就位情况（CI 用），不写入任何文件。
     pub verify: bool,
     /// `ui --gui`：强制图形界面。
@@ -100,6 +106,22 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "install" => Action::Install,
         "bypass" => Action::Bypass,
         "audit-digest" => Action::AuditDigest,
+        "token" => {
+            // subcommand：token <issue|status|revoke>
+            let sub = match it.peek() {
+                Some(s) if !s.starts_with('-') => it.next().unwrap().clone(),
+                _ => return Err("token 需要子命令: issue | status | revoke".into()),
+            };
+            match sub.as_str() {
+                "issue" | "status" | "revoke" => Action::Token { sub },
+                other => {
+                    return Err(format!(
+                        "未知 token 子命令: {}（可选 issue | status | revoke）",
+                        other
+                    ))
+                }
+            }
+        }
         "ui" => Action::Ui,
         "-h" | "--help" => return Err(help()),
         other => return Err(format!("未知命令: {}\n\n{}", other, help())),
@@ -122,6 +144,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         tools: Vec::new(),
         ttl: 60,
         refresh_anchors: false,
+        token: None,
         verify: false,
         gui: false,
         tui: false,
@@ -158,6 +181,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
                     .parse()
                     .map_err(|_| format!("--ttl 需为整数分钟，当前: {}", v))?;
             }
+            "--token" => a.token = Some(next(&mut it, "--token")?),
             "-p" | "--path" => a.root = PathBuf::from(next(&mut it, "--path")?),
             "-h" | "--help" => return Err(help()),
             other => {
@@ -248,6 +272,9 @@ fn help() -> String {
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
   audit-digest               审计日志 SHA-256 摘要写入入库 DIGEST（PR 可比对）\n\
+  token issue  [--ttl 60]   签发审批令牌（方案 B，原文仅打印一次，请带外保存）\n\
+  token status               查看令牌启用状态与到期\n\
+  token revoke               撤销并禁用审批令牌\n\
   ui       [--gui | --tui]   打开门禁管理台（需以 --features tui 构建）\n\
 \n\
 通用选项:\n\

@@ -47,8 +47,10 @@ req-guard 是 gates-toolkit 的流程门禁，管"AI **该不该写**"。本规�
 3. **L1 仅作 UX 快失败**，其缺位不得削弱 L2/L3。
 
 > **落地进展（2026-09）**：§4.2 L2 fail-closed、§4.3 `enforce.ci` 默认 true、
-> §4.4 方案 A（`REQ_GUARD_AI_CTX` 审批锁）、§4.5 `install --verify`、
-> §4.6 入库台账 + `audit-digest` 已实现；方案 B/C 与各工具原生 hook schema（P2）待做。
+> §4.4 **方案 A + 方案 B**（`REQ_GUARD_AI_CTX` 软标记 + `token issue/status/revoke` 审批令牌）、
+> §4.5 `install --verify`、§4.6 入库台账 + `audit-digest` 已实现；Claude/CodeBuddy/Codex/Cursor
+> 已各自注入**原生 hook schema**（Codex/Cursor 走 deny 包装适配其 exit 2 拦截语义）——见第 8 章附录。
+> 方案 C（带外审批）为并发多机的最终保证，待做。
 
 ---
 
@@ -91,13 +93,14 @@ AI 工具 A / B / C / ...（未知工具也算）
 | 项 | 规范 | 代码/配置锚点 |
 |---|---|---|
 | 支持工具 | 至少覆盖 `claude` / `codebuddy` / `codex` / `cursor` | `core/src/gate.rs` `TOOL_PROFILES` |
-| matcher | `Write\|Edit\|MultiEdit\|NotebookEdit` | `gate.rs::hook_json()` |
-| 幂等 | 已含 `req-guard-check` 则跳过 | `inject_tool()` |
+| matcher | 各工具原生工具名：Claude/CodeBuddy/Cursor `Write\|Edit\|MultiEdit\|NotebookEdit`；Codex `apply_patch` | `gate.rs::hook_json()` 按工具渲染 |
+| 拦截编码 | Claude/CodeBuddy 直连 `check`（exit 0/1）；Codex/Cursor 走 `deny` 包装（exit 2，因这二者把非 exit 0 视为 fail-open） | `gate.rs::DENY_SH/DENY_PS1` |
+| 幂等 | 已含该工具 marker（`req-guard-check` 或 `req-guard-deny`）则跳过 | `inject_tool()` + `marker_of()` |
 | 冲突 | 已存在配置**不含** hook 时，**不得静默跳过** | 提示手工合并 + `install --verify` 在 CI 检出（见 4.5） |
 
 **校验清单（L1）**：
-- [ ] 每个在用 AI 工具的配置文件含 `req-guard-check` 调用
-- [ ] 配置 schema 与该工具原生格式一致（非仅 Claude 风格）
+- [ ] 每个在用 AI 工具的配置文件含对应 hook marker（`check` 或 `deny`），且路径为该工具原生位置
+- [ ] 配置 schema 与该工具原生格式一致（非仅 Claude 风格）——见第 8 章附录
 - [ ] 未知/新工具出现时，CI 能检出"缺 hook"并红（见 4.5）
 - [ ] 明确记录：L1 **不覆盖** AI 经 Shell 写文件 / 自调 `req-guard approve` 的路径
 
@@ -143,12 +146,20 @@ sh .gates/hooks/req-guard-check.sh || exit 1
 
 ### 4.4 锁 —— 审批动作鉴权（最关键，堵自批）
 
-**现状（方案 A 已实现）**：`core/src/auth.rs` 提供 `ensure_human()`，在
+**现状（方案 A + 方案 B 已实现）**：`core/src/auth.rs` 提供 `ensure_human()`，在
 `requirement::review`（approve/reject）、`comment::resolve`、`gate::bypass` 入口
-统一检测 `REQ_GUARD_AI_CTX`，非空即拒（core 层生效，CLI/TUI/GUI 同约束）；
-`install` 给 claude 的 `settings.json` 注入 `"env": {"REQ_GUARD_AI_CTX": "1"}`
-使该工具会话（含 Shell 工具）自带标记。残留边界：标记可被 `env -u` 剥离；
-codex/cursor/codebuddy 的 env 注入待 P2 原生 schema 时补齐。
+统一判定（core 层生效，CLI/TUI/GUI 同约束）：
+- **方案 A**：`install` 给支持会话 env 的工具（claude 与 codebuddy）注入
+  `"env": {"REQ_GUARD_AI_CTX": "1"}`；检测到该标记即拒；
+- **方案 B**：`core/src/token.rs` 签发短期令牌，原文仅打印一次、由人类带外持有
+  （存密码管理器/自身会话）；库文件只存 **SHA-256 哈希**于 `~/.config/req-guard/guard.cfg`（0600）。
+  **一旦启用令牌，`approve/reject/resolve/bypass` 必须携带有效令牌**（`--token <值>` 或
+  环境 `REQ_GUARD_TOKEN`），否则 fail-closed 拒绝——AI 不知道令牌值，无法自批。
+- 未启用令牌时自动回退方案 A；`token status/revoke` 查询与撤销。
+
+方案 A 可被 `env -u` 剥离；方案 B 强度来自"令牌值只由人类知道"。残留边界：
+codex/cursor 原生配置**无 env 段**，方案 A 无法覆盖其 Shell 路径；且无 OS keychain
+（受"零外部依赖"约束），令牌文件与 AI 同用户可读——并发多机 / 强隔离仍建议方案 C。
 
 **规范（任选其一，强度递增）**：
 
@@ -244,22 +255,22 @@ L1 体验层（做厚，但不计入保证）：
 
 ## 8. 附录：各 AI 工具 hook 配置形态（参考）
 
-注入点（`core/src/gate.rs::TOOL_PROFILES`）：
+注入点（`core/src/gate.rs::TOOL_PROFILES`），每工具注入**原生** schema：
 
-| 工具 | 配置文件 |
-|---|---|
-| claude | `.claude/settings.json` |
-| codebuddy | `.codebuddy/hooks.json` |
-| codex | `.codex/hooks.json` |
-| cursor | `.cursor/hooks.json` |
+| 工具 | 配置文件 | 事件 | matcher | 拦截命令 | 审批锁 env |
+|---|---|---|---|---|---|
+| claude | `.claude/settings.json` | `PreToolUse` | `Write\|Edit\|MultiEdit\|NotebookEdit` | `check`（exit 0/1） | ✅（`env` 段） |
+| codebuddy | `.codebuddy/settings.json` | `PreToolUse` | `Write\|Edit\|MultiEdit\|NotebookEdit` | `check`（exit 0/1） | ✅（顶层 `env`） |
+| codex | `.codex/hooks.json` | `PreToolUse` | `apply_patch` | `deny` 包装（exit 2） | ✗ |
+| cursor | `.cursor/hooks.json` | `preToolUse` | `Write\|Edit\|MultiEdit\|NotebookEdit` | `deny` 包装（exit 2） | ✗ |
 
 命令形态（Windows 用 ps1）：
-```sh
-sh .gates/hooks/req-guard-check.sh
-```
-matcher：`Write|Edit|MultiEdit|NotebookEdit`；返回非零即阻断写操作。
+- 直连：`sh .gates/hooks/req-guard-check.sh`（Claude/CodeBuddy）
+- deny 包装：`sh .gates/hooks/req-guard-deny.sh`（Codex/Cursor，内部调 check 并把 exit 1 转成工具可识别的 exit 2；因这二者把非 exit 0 视为 fail-open）
 
-> 新工具接入：在 `TOOL_PROFILES` 增加条目 + 提供该工具原生 schema 的注入片段 + 登记到 4.5 的 CI 校验白名单。
+matcher 区分大小写、匹配**工具名**；返回非零即阻断对应写路径。
+
+> 新工具接入：在 `TOOL_PROFILES` 增加条目（含其原生事件名/matcher/拦截编码/是否支持 env）+ 提供该工具原生 schema 的注入片段 + 登记到 4.5 的 CI 校验白名单（`marker_of()` 决定该校验的 marker 子串）。
 
 ---
 

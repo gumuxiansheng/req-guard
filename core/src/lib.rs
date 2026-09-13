@@ -11,6 +11,7 @@ pub mod error;
 pub mod gate;
 pub mod requirement;
 pub mod status;
+pub mod token;
 pub mod ui_mode;
 
 #[cfg(test)]

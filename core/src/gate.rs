@@ -26,6 +26,23 @@ pub const HOOK_SH_REL: &str = ".gates/hooks/req-guard-check.sh";
 /// Windows 等价脚本相对路径。
 pub const HOOK_PS1_REL: &str = ".gates/hooks/req-guard-check.ps1";
 
+/// deny 包装脚本（POSIX）相对路径：供 Codex/Cursor 等把 `exit 1` 转成其能识别的
+/// 拒绝（`exit 2`）——这些工具把非 `exit 0` 一律视为 fail-open（继续执行），
+/// 直接复用 `check.sh` 会在拦截时静默放行。
+pub const DENY_SH_REL: &str = ".gates/hooks/req-guard-deny.sh";
+/// deny 包装脚本（Windows）相对路径。
+pub const DENY_PS1_REL: &str = ".gates/hooks/req-guard-deny.ps1";
+
+/// 某工具注入时，判断"配置已含门禁"的 marker 子串：deny 型工具注入的 command
+/// 指向 deny 包装（不含 `req-guard-check` 字样），须按 derive 判定。
+fn marker_of(prof: &ToolProfile) -> &'static str {
+    if prof.use_deny {
+        DENY_SH_REL.rsplit('/').next().unwrap_or("req-guard-deny")
+    } else {
+        HOOK_SH_REL.rsplit('/').next().unwrap_or("req-guard-check")
+    }
+}
+
 /// 创建父目录并写入文件，返回完整路径。
 pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<PathBuf> {
     let full = root.join(rel);
@@ -78,35 +95,63 @@ pub fn strict_order(root: &Path) -> bool {
     true
 }
 
-/// 内置 AI 工具配置映射（借鉴 teamai：声明式注入各工具原生配置）。
+/// 内置 AI 工具配置映射（借鉴 teamai：声明式注入各工具**原生**配置）。
+///
+/// 各工具 hook schema 存在差异（尤其事件名、matcher、拦截语义）——必须注入
+/// 工具原生格式，否则工具不识别、hook 静默不加载（见《AI工具合规保证规范.md》§4.1）。
 struct ToolProfile {
     name: &'static str,
+    /// 该工具的原生 hook 配置文件（相对项目根）。
     config: &'static str,
-    /// 该工具配置支持**会话级环境变量注入**（如 Claude Code `settings.json` 的
-    /// `env` 段）——注入 [`crate::auth::AI_CTX_ENV`] 后，审批锁（方案 A）才能
-    /// 覆盖该工具会话内的 Shell 路径。未确认支持的暂为 false（P2 接原生 schema 时补）。
+    /// hook 事件名：Cursor 用小驼峰 `preToolUse`；其余（Claude/CodeBuddy/Codex）用 `PreToolUse`。
+    event: &'static str,
+    /// PreToolUse matcher（匹配**工具名**）：Claude/CodeBuddy/Cursor 是文件写工具
+    /// `Write|Edit|MultiEdit|NotebookEdit`；Codex 的文件写入走 `apply_patch`。
+    matcher: &'static str,
+    /// 拦截编码是否需走 deny 包装：Claude/CodeBuddy 原生以 `exit 0/1` 拦截，
+    /// 而 Codex/Cursor 把非 `exit 0` 视为 fail-open（继续执行），须把 `exit 1`
+    /// 转成它们能识别的拒绝（`exit 2`）——见 [`DENY_SH_REL`]。
+    use_deny: bool,
+    /// 该工具原生配置支持**会话级环境变量注入**（`settings.json` 的顶层 `env` 段）
+    /// ——注入 [`crate::auth::AI_CTX_ENV`] 后审批锁才能覆盖其会话内 Shell 路径。
     env_capable: bool,
 }
 
 const TOOL_PROFILES: [ToolProfile; 4] = [
+    // Claude Code：settings.json，事件大驼峰，文件写工具名，原生 exit 0/1，支持 env 注入
     ToolProfile {
         name: "claude",
         config: ".claude/settings.json",
+        event: "PreToolUse",
+        matcher: "Write|Edit|MultiEdit|NotebookEdit",
+        use_deny: false,
         env_capable: true,
     },
+    // CodeBuddy：settings.json（非 hooks.json！与 Claude Code 同构 + 顶层 env 段）
+    ToolProfile {
+        name: "codebuddy",
+        config: ".codebuddy/settings.json",
+        event: "PreToolUse",
+        matcher: "Write|Edit|MultiEdit|NotebookEdit",
+        use_deny: false,
+        env_capable: true,
+    },
+    // Codex：hooks.json，事件大驼峰，文件写入走 apply_patch，非 machine exit 需 deny 包装
     ToolProfile {
         name: "codex",
         config: ".codex/hooks.json",
+        event: "PreToolUse",
+        matcher: "apply_patch",
+        use_deny: true,
         env_capable: false,
     },
-    ToolProfile {
-        name: "codebuddy",
-        config: ".codebuddy/hooks.json",
-        env_capable: false,
-    },
+    // Cursor：hooks.json，事件小驼峰 preToolUse，文件写工具名，需 deny 包装
     ToolProfile {
         name: "cursor",
         config: ".cursor/hooks.json",
+        event: "preToolUse",
+        matcher: "Write|Edit|MultiEdit|NotebookEdit",
+        use_deny: true,
         env_capable: false,
     },
 ];
@@ -162,6 +207,9 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
     )?);
     created.push(write_file(root, HOOK_SH_REL, HOOK_SH)?);
     created.push(write_file(root, HOOK_PS1_REL, &ps1_with_bom())?);
+    // deny 包装（Codex/Cursor 专用）随安装一并落盘
+    created.push(write_file(root, DENY_SH_REL, DENY_SH)?);
+    created.push(write_file(root, DENY_PS1_REL, &deny_ps1_with_bom())?);
     created.push(write_file(root, ".gates/requirements/.gitkeep", "")?);
     created.push(write_file(root, ".gates/audit/.gitkeep", "")?);
 
@@ -191,6 +239,11 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
 /// 即使三段已全部批准也一律拦截（假拦截）。BOM 明确宣告编码后即恢复正常。
 pub fn ps1_with_bom() -> String {
     format!("\u{feff}{}", HOOK_PS1)
+}
+
+/// deny 包装（PowerShell）落盘内容：同样必须带 UTF-8 BOM（见 [`ps1_with_bom`]）。
+pub fn deny_ps1_with_bom() -> String {
+    format!("\u{feff}{}", DENY_PS1)
 }
 
 /// 文件是否以 UTF-8 BOM 开头。
@@ -462,10 +515,11 @@ fn inject_tool(
         .find(|p| p.name == tool)
         .ok_or_else(|| GateError::Validation(format!("未知 AI 工具: {}", tool)))?;
     let path = root.join(prof.config);
+    let marker = marker_of(prof);
 
     if path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("req-guard-check") {
+        if existing.contains(marker) {
             // 幂等：hook 已在。但 env 注入型工具若缺审批锁标记，仍需提示补齐
             // （旧版 install 写入的配置没有 env 段）。
             if prof.env_capable && !existing.contains(crate::auth::AI_CTX_ENV) {
@@ -481,7 +535,7 @@ fn inject_tool(
         notes.push(format!(
             "{} 已存在且不含 req-guard 门禁配置，为避免破坏既有配置未覆盖，请手工合并以下片段：\n{}",
             prof.config,
-            hook_json(prof.env_capable)
+            hook_json(&prof)
         ));
         return Ok(());
     }
@@ -491,7 +545,7 @@ fn inject_tool(
             source: e,
         })?;
     }
-    fs::write(&path, hook_json(prof.env_capable)).map_err(|e| GateError::Io {
+    fs::write(&path, hook_json(&prof)).map_err(|e| GateError::Io {
         path: Some(path.clone()),
         source: e,
     })?;
@@ -499,17 +553,33 @@ fn inject_tool(
     Ok(())
 }
 
-/// 生成 AI 工具 hook 配置（Claude Code 风格 schema，其余工具形态相近）。
+/// 生成 AI 工具 hook 配置：按各工具**原生 schema** 渲染。
 ///
-/// `env_capable=true` 时同时注入会话级 `env` 段，把 [`crate::auth::AI_CTX_ENV`]
-/// 打进 AI 会话——`approve/reject/resolve/bypass` 检测到即自拒（审批锁，方案 A）。
-fn hook_json(env_capable: bool) -> String {
+/// - 事件名 / matcher 取自 [`ToolProfile`]（如 Cursor 用小驼峰 `preToolUse`、matcher 匹配工具名）；
+/// - `env_capable=true` 时注入会话级 `env` 段，把 [`crate::auth::AI_CTX_ENV`] 打进 AI 会话，
+///   `approve/reject/resolve/bypass` 检测到即自拒（审批锁，方案 A）；
+/// - 拦截命令：Claude/CodeBuddy 直连 `req-guard-check`（原生 exit 0/1）；
+///   Codex/Cursor 改连 `req-guard-deny` 包装（把 exit 1 转成其能识别的 exit 2）。
+fn hook_json(prof: &ToolProfile) -> String {
     let cmd = if cfg!(windows) {
-        "powershell -NoProfile -ExecutionPolicy Bypass -File .gates/hooks/req-guard-check.ps1"
+        let script = if prof.use_deny {
+            DENY_PS1_REL
+        } else {
+            HOOK_PS1_REL
+        };
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+            script
+        )
     } else {
-        "sh .gates/hooks/req-guard-check.sh"
+        let script = if prof.use_deny {
+            DENY_SH_REL
+        } else {
+            HOOK_SH_REL
+        };
+        format!("sh {}", script)
     };
-    let env = if env_capable {
+    let env = if prof.env_capable {
         format!(
             "  \"env\": {{\n    \"{}\": \"1\"\n  }},\n",
             crate::auth::AI_CTX_ENV
@@ -518,11 +588,11 @@ fn hook_json(env_capable: bool) -> String {
         String::new()
     };
     format!(
-        "{{\n{}  \"hooks\": {{\n    \"PreToolUse\": [\n      {{\n        \
-         \"matcher\": \"Write|Edit|MultiEdit|NotebookEdit\",\n        \
+        "{{\n{}  \"hooks\": {{\n    \"{}\": [\n      {{\n        \
+         \"matcher\": \"{}\",\n        \
          \"hooks\": [\n          {{\n            \"type\": \"command\",\n            \
          \"command\": \"{}\"\n          }}\n        ]\n      }}\n    ]\n  }}\n}}\n",
-        env, cmd
+        env, prof.event, prof.matcher, cmd
     )
 }
 
@@ -558,7 +628,13 @@ pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
 pub fn verify_install(root: &Path) -> Vec<String> {
     let mut problems = Vec::new();
 
-    for rel in [HOOK_SH_REL, HOOK_PS1_REL, ".gates/req-guard.yaml"] {
+    for rel in [
+        HOOK_SH_REL,
+        HOOK_PS1_REL,
+        DENY_SH_REL,
+        DENY_PS1_REL,
+        ".gates/req-guard.yaml",
+    ] {
         if !root.join(rel).exists() {
             problems.push(format!("缺少门禁资产 {}（执行 req-guard install）", rel));
         }
@@ -570,11 +646,12 @@ pub fn verify_install(root: &Path) -> Vec<String> {
             continue; // 未在用的工具不要求
         }
         let content = fs::read_to_string(&p).unwrap_or_default();
-        if !content.contains("req-guard-check") {
+        let marker = marker_of(prof);
+        if !content.contains(marker) {
             problems.push(format!(
-                "{} 已存在（在用）但未接入 req-guard hook——L1 静默缺口；\
+                "{} 已存在（在用）但未接入 req-guard hook（缺 `{}`）——L1 静默缺口；\
                  按 req-guard install 输出的片段手工合并",
-                prof.config
+                prof.config, marker
             ));
         }
         if prof.env_capable && !content.contains(crate::auth::AI_CTX_ENV) {
@@ -1065,6 +1142,35 @@ Write-GateAudit "PASS $($active.Name)"
 exit 0
 "#;
 
+/// deny 包装（POSIX）：把 [`HOOK_SH`] 的 `exit 1`（拦截）转成 Codex/Cursor 能识别的
+/// `exit 2`。Claude/CodeBuddy 把非 `exit 0` 一律拦截；而 Codex/Cursor 则把非
+/// `exit 0` 视为 fail-open（继续执行）、只认 `exit 2` 为拒绝——不包装会静默放行。
+pub const DENY_SH: &str = r#"#!/usr/bin/env sh
+# req-guard deny 包装：把 check.sh 的 exit 1（拦截）转成工具能识别的拒绝（exit 2）。
+# 仅 Codex/Cursor 需要：它们把非 exit 0 视为 fail-open（继续执行）。
+# 用法（作为 AI 工具 PreToolUse hook 的 command）：sh .gates/hooks/req-guard-deny.sh
+set -u
+
+sh .gates/hooks/req-guard-check.sh
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "[req-guard] ⛔ 门禁拦截（原因见上方；以 exit 2 交付，编码为工具可识别的拒绝）" >&2
+  exit 2
+fi
+exit 0
+"#;
+
+/// deny 包装（PowerShell，逻辑与 [`DENY_SH`] 等价，带 BOM 落盘）。
+pub const DENY_PS1: &str = r#"# req-guard deny 包装（Windows PowerShell）
+# 把 check.ps1 的 exit 1（拦截）转成 Codex/Cursor 能识别的拒绝（exit 2）
+& (Join-Path $PSScriptRoot 'req-guard-check.ps1')
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "[req-guard] 门禁拦截（原因见上方；以 exit 2 交付，编码为工具可识别的拒绝）"
+  exit 2
+}
+exit 0
+"#;
+
 // ===================== 单元测试 =====================
 
 #[cfg(test)]
@@ -1166,6 +1272,9 @@ mod tests {
         assert!(root.join(".gates/req-guard.yaml").exists());
         assert!(root.join(".gates/README.md").exists());
         assert!(has_utf8_bom(&root.join(".gates/hooks/req-guard-check.ps1")));
+        // deny 包装随安装落盘（Codex/Cursor 用）
+        assert!(root.join(DENY_SH_REL).exists());
+        assert!(has_utf8_bom(&root.join(DENY_PS1_REL)));
 
         // L3 默认开启（§4.3）：ci 必须 true，避免"只装不接"
         let y = fs::read_to_string(root.join(".gates/req-guard.yaml")).unwrap();
@@ -1202,22 +1311,124 @@ mod tests {
         cleanup(&root);
     }
 
+    /// 按名取工具配置（测试辅助）。
+    fn tp(name: &str) -> &'static ToolProfile {
+        TOOL_PROFILES.iter().find(|p| p.name == name).unwrap()
+    }
+
     #[test]
-    fn hook注入含审批锁标记() {
-        // env 注入型工具（claude）：hook 与 AI_CTX 标记同步写入
-        let j = hook_json(true);
-        assert!(j.contains("req-guard-check"), "{}", j);
+    fn hook_json按工具渲染原生schema() {
+        // Claude：settings.json 事件大驼峰 + Write 系 matcher + 支持 env 注入
+        let j = hook_json(tp("claude"));
+        assert!(j.contains("\"env\""), "{}", j);
+        assert!(j.contains("REQ_GUARD_AI_CTX"), "{}", j);
+        assert!(j.contains("\"PreToolUse\""), "{}", j);
+        assert!(j.contains("Write|Edit|MultiEdit|NotebookEdit"), "{}", j);
         assert!(
-            j.contains(crate::auth::AI_CTX_ENV),
-            "审批锁标记必须随 env 段注入：{}",
+            j.contains("req-guard-check.sh"),
+            "claude 直连 check.sh：{}",
             j
         );
-        assert!(j.contains("PreToolUse"));
+        assert!(
+            !j.contains("req-guard-deny"),
+            "claude 不需 deny 包装：{}",
+            j
+        );
 
-        // 非 env 型工具：只写 hook，不猜 env 段（避免破坏未确认的 schema）
-        let j = hook_json(false);
-        assert!(j.contains("req-guard-check"));
-        assert!(!j.contains(crate::auth::AI_CTX_ENV));
+        // CodeBuddy：settings.json（路径已修正）+ env 段 + 直连 check.sh
+        let j = hook_json(tp("codebuddy"));
+        assert!(j.contains("REQ_GUARD_AI_CTX"), "codebuddy 支持 env：{}", j);
+        assert!(
+            j.contains("req-guard-check.sh"),
+            "codebuddy 直连 check.sh：{}",
+            j
+        );
+        assert_eq!(tp("codebuddy").config, ".codebuddy/settings.json");
+
+        // Codex：无 env、matcher=apply_patch、走 deny 包装
+        let j = hook_json(tp("codex"));
+        assert!(!j.contains("REQ_GUARD_AI_CTX"), "codex 无 env：{}", j);
+        assert!(
+            j.contains("\"apply_patch\""),
+            "codex matcher 应为 apply_patch：{}",
+            j
+        );
+        assert!(j.contains("req-guard-deny.sh"), "codex 走 deny 包装：{}", j);
+        assert!(
+            !j.contains("req-guard-check.sh"),
+            "codex 不得直连 check.sh：{}",
+            j
+        );
+
+        // Cursor：事件小驼峰 preToolUse、走 deny 包装、无 env
+        let j = hook_json(tp("cursor"));
+        assert!(!j.contains("REQ_GUARD_AI_CTX"), "cursor 无 env：{}", j);
+        assert!(
+            j.contains("\"preToolUse\""),
+            "cursor 用原生小驼峰事件名：{}",
+            j
+        );
+        assert!(
+            j.contains("req-guard-deny.sh"),
+            "cursor 走 deny 包装：{}",
+            j
+        );
+    }
+
+    #[test]
+    fn install每工具写入各自原生位置() {
+        let root = temp_dir("install-tools");
+        install(
+            &root,
+            &[
+                "claude".to_string(),
+                "codebuddy".to_string(),
+                "codex".to_string(),
+                "cursor".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+        // 各自原生配置文件均生成，且 schema 与路径正确
+        assert!(root.join(".claude/settings.json").exists());
+        assert!(
+            root.join(".codebuddy/settings.json").exists(),
+            "codebuddy 配置应为 settings.json"
+        );
+        assert!(root.join(".codex/hooks.json").exists());
+        assert!(root.join(".cursor/hooks.json").exists());
+        // deny 包装脚本随安装落盘
+        assert!(root.join(DENY_SH_REL).exists());
+        assert!(root.join(DENY_PS1_REL).exists());
+        assert!(
+            has_utf8_bom(&root.join(DENY_PS1_REL)),
+            "deny.ps1 必须带 BOM"
+        );
+
+        // 各工具注入内容与原生 schema 一致
+        let cb = fs::read_to_string(root.join(".codebuddy/settings.json")).unwrap();
+        assert!(
+            cb.contains("REQ_GUARD_AI_CTX"),
+            "codebuddy env 注入：{}",
+            cb
+        );
+        let cx = fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
+        assert!(cx.contains("req-guard-deny.sh"), "codex deny：{}", cx);
+        assert!(cx.contains("apply_patch"), "codex matcher：{}", cx);
+        let cur = fs::read_to_string(root.join(".cursor/hooks.json")).unwrap();
+        assert!(cur.contains("\"preToolUse\""), "cursor 事件名：{}", cur);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn deny包装脚本语义() {
+        // 拒接信号编码：内部调 check.sh，拦截时转发为 exit 2（工具可识别）
+        assert!(DENY_SH.contains("req-guard-check.sh"), "{}", DENY_SH);
+        assert!(DENY_SH.contains("exit 2"), "必须 exit 2：{}", DENY_SH);
+        assert!(DENY_PS1.contains("req-guard-check.ps1"), "{}", DENY_PS1);
+        assert!(DENY_PS1.contains("exit 2"), "ps1 同样 exit 2：{}", DENY_PS1);
+        // 放行路径不误转：check 为 0 时须原样放行
+        assert!(DENY_PS1.contains("exit 0"), "放行须 exit 0：{}", DENY_PS1);
     }
 
     #[test]
