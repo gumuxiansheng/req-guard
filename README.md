@@ -126,6 +126,7 @@ GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段�
 ├── requirements/                # REQ-00N-*.md 清单 + *.comments.md 评论
 ├── hooks/req-guard-check.{sh,ps1}   # 拦截脚本（Claude/CodeBuddy 直连）
 ├── hooks/req-guard-deny.{sh,ps1}    # deny 包装：Codex/Cursor 拦截编码转 exit 2
+├── ci/req-guard-ci.yml          # L3 接入样例（GitHub Actions），复制进 .github/workflows/
 └── audit/gate-audit.log         # 审计（不入库）
 ```
 
@@ -141,7 +142,7 @@ bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目�
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test --workspace                 # 单元测试（62 用例）
+cargo test --workspace                 # 单元测试（63 用例）
 python scripts/verify_gate.py          # 拦截脚本真机场景（13 场景）
 ```
 

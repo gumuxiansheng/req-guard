@@ -1,0 +1,51 @@
+# req-guard 门禁 CI 样例（L3 强制门禁，§4.3）
+# ---------------------------------------------------------------------------
+# 使用方法：
+#   1) 已在本仓库执行过 `req-guard init`（生成 .gates/ 需求清单与拦截脚本）；
+#   2) 把本文件复制到你的 .github/workflows/req-guard-ci.yml（本项目已生成在此）；
+#   3) 在仓库 Branch protection 中把本 job 设为「必需（required）」状态检查，
+#      禁止直推 main：不通过即无法合并。这样任何本机绕过（含 --no-verify）都会被服务端抵消。
+#
+# 三层定位：L1 是提醒、L2/L3 是墙。本流水线即「墙②」——工具无关、本机环境无关。
+# ---------------------------------------------------------------------------
+name: req-guard 门禁
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  req-guard-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 取得 req-guard 二进制（三选一）：
+      #   A. 从官方 Release 拉取（推荐）：版本号与仓库 .gates 所需版本对齐
+      - name: 下载 req-guard（Release）
+        run: |
+          VER=0.1.0   # TODO: 改为你要使用的版本（见 Cargo.toml version / Release tag）
+          curl -fsSL -o req-guard \
+            "https://github.com/<owner>/<repo>/releases/download/v${VER}/req-guard-x86_64-unknown-linux-musl"
+          chmod +x req-guard
+
+      #   B. 或用 cargo 从源码构建：
+      #   - name: 构建 req-guard
+      #     run: cargo install --path . --locked
+      #
+      #   C. 或缓存二进制：git clone 后 cargo build --release
+
+      # L3：硬拦截判定（§4.3）。三段未全批 / 有未解决阻塞评论 / 无清单 → 退出码 1，CI 红。
+      - name: req-guard check（未过审即失败）
+        run: ./req-guard check
+
+      # L1 静默缺口检出（§4.5）：任一「在用」AI 工具配置缺 hook、缺审批锁标记、
+      # 缺核心资产 → 退出码 1，CI 红。新增未知 AI 工具也会在此被要求显式登记。
+      - name: req-guard install --verify（工具 hook 就位）
+        run: ./req-guard install --verify
+
+      # 建议：审计台账/摘要入库后，在 PR 中人工复核「谁何时批了什么」。

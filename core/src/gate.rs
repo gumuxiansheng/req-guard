@@ -212,6 +212,12 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
     created.push(write_file(root, DENY_PS1_REL, &deny_ps1_with_bom())?);
     created.push(write_file(root, ".gates/requirements/.gitkeep", "")?);
     created.push(write_file(root, ".gates/audit/.gitkeep", "")?);
+    // L3 接入样例（§4.3）：随安装生成到 .gates/ci/，使用方复制进 .github/workflows/
+    created.push(write_file(
+        root,
+        ".gates/ci/req-guard-ci.yml",
+        include_str!("../../templates/ci/req-guard-ci.yml"),
+    )?);
 
     for t in tools {
         if t == "none" {
@@ -377,9 +383,20 @@ fn run_hook(root: &Path) -> Result<(bool, String, String)> {
     let sh = root.join(HOOK_SH_REL);
     let ps1 = root.join(HOOK_PS1_REL);
 
-    // 旧版 install 写的 ps1 没有 BOM，会让 PowerShell 直接解析失败（恒拦截）。
-    // 这里给出可操作提示，避免把"脚本崩了"误读成"门禁在正常工作"。
-    if ps1.exists() && !has_utf8_bom(&ps1) {
+    // 解释器按**编译目标平台**决定，而非按"哪个脚本文件存在"：`install` 在任意平台都会
+    // 同时落盘 .sh/.ps1（跨平台资产）。若按"ps1 存在即调 powershell"，Linux/macOS 上
+    // `req-guard check` 会误调不存在的 powershell 而恒败——这是"脚本崩了 / 真在拦"
+    // 之外的第三种危险失效（命令错配）。故本机一律只执行本平台解释器对应的脚本。
+    let is_windows = cfg!(windows);
+    let (prog, script): (&str, std::path::PathBuf) = if is_windows {
+        ("powershell", ps1.clone())
+    } else {
+        ("sh", sh.clone())
+    };
+
+    // 仅 Windows 关注 ps1 的 UTF-8 BOM（缺失会让 PowerShell 解析失败 → 恒拦截）；
+    // 类 Unix 平台上该文件仅为跨平台占位，不参与本机执行。
+    if is_windows && ps1.exists() && !has_utf8_bom(&ps1) {
         eprintln!(
             "⚠️ 拦截脚本 {} 缺少 UTF-8 BOM，Windows PowerShell 会解析失败（表现为恒拦截）。\
              请重新执行 req-guard install 修复。",
@@ -387,24 +404,27 @@ fn run_hook(root: &Path) -> Result<(bool, String, String)> {
         );
     }
 
-    let (prog, args): (&str, Vec<String>) = if ps1.exists() {
-        (
-            "powershell",
-            vec![
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-File".to_string(),
-                ps1.to_string_lossy().to_string(),
-            ],
-        )
-    } else if sh.exists() {
-        ("sh", vec![sh.to_string_lossy().to_string()])
+    if !script.exists() {
+        return Err(GateError::Validation(format!(
+            "未安装 AI 需求门禁（缺少 {}），请先执行 req-guard install",
+            if is_windows {
+                HOOK_PS1_REL
+            } else {
+                HOOK_SH_REL
+            }
+        )));
+    }
+
+    let args: Vec<String> = if is_windows {
+        vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.to_string_lossy().to_string(),
+        ]
     } else {
-        return Err(GateError::Validation(
-            "未安装 AI 需求门禁（缺少 .gates/hooks/req-guard-check.*），请先执行 req-guard install"
-                .into(),
-        ));
+        vec![script.to_string_lossy().to_string()]
     };
 
     let out = Command::new(prog)
@@ -915,6 +935,10 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 3. 分支保护：禁止直推 `main` 等受保护分支；
 4. 建议追加一步 `req-guard install --verify`：任一在用 AI 工具缺 hook 即红，
    消除 L1 静默缺口。
+
+**开始接入**：`req-guard install` 已在本项目生成可直接部署的样例
+`.gates/ci/req-guard-ci.yml`（GitHub Actions）——把它复制到 `.github/workflows/`
+并设为必需状态检查即可；该样例同时跑 `req-guard check` 与 `install --verify`。
 
 ## 审计台账与摘要（随仓库提交）
 
@@ -1616,6 +1640,23 @@ mod tests {
         let root = temp_dir("gate-uninstalled");
         let e = gate_check(&root).unwrap_err();
         assert!(e.to_string().contains("未安装"), "应提示先 install：{}", e);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn gate_check_ps1占位存在时unix仍走sh() {
+        // 回归（run_hook 史缺陷）：曾按"ps1 文件存在即调 powershell"，而 install 在任意
+        // 平台都会同时落盘 .sh/.ps1（跨平台资产），导致 Linux/macOS 上 `req-guard check`
+        // 误调不存在的 powershell 而恒败。类 Unix 平台必须始终走 sh、忽略 ps1 占位。
+        let root = temp_dir("runhook-plat");
+        install(&root, &["none".to_string()], false).unwrap();
+        assert!(
+            root.join(HOOK_PS1_REL).exists(),
+            "install 总会生成 ps1 占位（跨平台资产）"
+        );
+        // 无需求 → 经 run_hook 用 sh 正常执行并返回 Block（而非 powershell 报错）
+        let v = gate_check(&root).unwrap();
+        assert!(!v.is_pass(), "缺需求应走 sh 拦截：{}", v.summary());
         cleanup(&root);
     }
 
