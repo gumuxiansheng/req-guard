@@ -33,6 +33,16 @@ pub const DENY_SH_REL: &str = ".gates/hooks/req-guard-deny.sh";
 /// deny 包装脚本（Windows）相对路径。
 pub const DENY_PS1_REL: &str = ".gates/hooks/req-guard-deny.ps1";
 
+/// 拦截脚本命中应急绕过窗口时输出的**机器可读标记**（sh / ps1 两端都必须输出）。
+///
+/// 判定"本次放行是不是靠绕过"不能去匹配人类可读文案——文案一改判定就失效，
+/// 而失效方向恰好是最坏的：绕过被伪装成"三段已批准"的正常放行。
+/// 脚本额外输出本行，`gate_check` 据此置 [`GateVerdict::Pass::bypassed`]。
+///
+/// [`HOOK_SH`] / [`HOOK_PS1`] 内该字符串是**字面量**（脚本是 raw string，无法插值），
+/// 由单测 `hook_脚本输出绕过标记` 锁定两端与本常量一致。
+pub const BYPASS_MARKER: &str = "REQ_GUARD_BYPASS=1";
+
 /// 当前平台注入工具配置时引用的拦截脚本**相对路径**（Windows→`.ps1`，其余→`.sh`）。
 ///
 /// 与 [`run_hook`] 同规则：按**编译目标平台**选，不按"哪个文件存在"（install 在任意平台
@@ -80,6 +90,43 @@ pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<PathBuf> {
         source: e,
     })?;
     Ok(full)
+}
+
+/// 类 Unix：给文件补执行位（0755）。
+///
+/// **为什么必须**：git 在 Unix 上会**静默跳过**没有执行位的钩子。`install` 若只用
+/// `fs::write` 落盘（默认 0644），pre-commit 就形同虚设——提交照常成功、没有任何提示，
+/// 而 `install --verify` 只看内容不看权限，会给出"全部就位"的假绿。这正是本项目
+/// 最危险的失效模式（"看起来在拦，实际没拦"）。
+///
+/// AI 工具配置里脚本以 `sh <script>` 调用，本不依赖执行位；一并设置是为了让人在
+/// 终端直接 `./.gates/hooks/req-guard-check.sh` 也能跑（排查门禁时很常用）。
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+}
+
+/// 非 Unix（Windows）：无 POSIX 执行位模型，跳过。
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
+
+/// 类 Unix：文件是否带任一执行位。
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// 非 Unix：Windows 由扩展名与策略决定是否可执行，此处无法判定。
+///
+/// 恒返回 true 而不是 false：Windows 侧本来就没有这个失效模式，
+/// 返回 false 会在 CI 上制造无法修复的假红。
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 /// 写入门禁**声明类**文件（`.gates/req-guard.yaml` / `.gates/README.md`）：
@@ -233,6 +280,10 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
     // deny 包装（Codex/Cursor 专用）随安装一并落盘
     created.push(write_file(root, DENY_SH_REL, DENY_SH)?);
     created.push(write_file(root, DENY_PS1_REL, &deny_ps1_with_bom())?);
+    // 落盘后补执行位：git 会静默跳过不可执行的钩子（详见 ensure_executable）。
+    for rel in [HOOK_SH_REL, HOOK_PS1_REL, DENY_SH_REL, DENY_PS1_REL] {
+        ensure_executable(&root.join(rel));
+    }
     created.push(write_file(root, ".gates/requirements/.gitkeep", "")?);
     created.push(write_file(root, ".gates/audit/.gitkeep", "")?);
     // L3 接入样例（§4.3）：随安装生成到 .gates/ci/，使用方复制进 .github/workflows/
@@ -371,7 +422,17 @@ pub fn audit_digest(root: &Path) -> Result<(PathBuf, String, usize)> {
 #[derive(Debug, Clone)]
 pub enum GateVerdict {
     /// 放行：三段已批准且无未解决的阻塞性评论（或命中应急绕过窗口）。
-    Pass { summary: String },
+    Pass {
+        summary: String,
+        /// 脚本给出的放行说明（如"命中应急绕过窗口"），放行时也**必须**可达。
+        ///
+        /// 历史上 Pass 不带明细，导致绕过窗口内 CLI 只打印"三段已批准"——
+        /// 而当时三段其实一段都没批。审核人与 CI 日志都被这句"事实性错误"误导。
+        detail: Vec<String>,
+        /// 本次放行是否**命中应急绕过窗口**。为 true 时 summary 必须显式写明，
+        /// 不得伪装成正常放行。
+        bypassed: bool,
+    },
     /// 拦截：`detail` 为脚本给出的逐行原因（原样透传，便于 AI/人排查）。
     Block {
         summary: String,
@@ -386,16 +447,23 @@ impl GateVerdict {
 
     pub fn summary(&self) -> &str {
         match self {
-            GateVerdict::Pass { summary } | GateVerdict::Block { summary, .. } => summary,
+            GateVerdict::Pass { summary, .. } | GateVerdict::Block { summary, .. } => summary,
         }
     }
 
-    /// 拦截原因明细（放行时为空）。
+    /// 脚本给出的明细（放行时为放行说明，可能为空；拦截时为逐行原因）。
     pub fn detail(&self) -> &[String] {
         match self {
-            GateVerdict::Pass { .. } => &[],
-            GateVerdict::Block { detail, .. } => detail,
+            GateVerdict::Pass { detail, .. } | GateVerdict::Block { detail, .. } => detail,
         }
+    }
+
+    /// 是否因命中**应急绕过窗口**而放行。
+    ///
+    /// 调用方（CLI / TUI / GUI / CI）必须在放行提示里显式体现这一点：
+    /// 放行原因不同，事后审计与责任归属完全不同。
+    pub fn bypassed(&self) -> bool {
+        matches!(self, GateVerdict::Pass { bypassed: true, .. })
     }
 }
 
@@ -468,17 +536,32 @@ fn run_hook(root: &Path) -> Result<(bool, String, String)> {
 }
 
 /// 执行门禁检查，返回**结构化裁决**（CLI / TUI / GUI / CI 共用）。
+///
+/// 放行时同样保留脚本明细：绕过窗口内脚本会输出 [`BYPASS_MARKER`]，据此置
+/// [`GateVerdict::bypassed`] 并把 summary 改成显式警告——绝不能让"靠绕过放行"
+/// 显示成"三段已批准"。
 pub fn gate_check(root: &Path) -> Result<GateVerdict> {
     let (ok, stdout, stderr) = run_hook(root)?;
-    let detail: Vec<String> = format!("{}\n{}", stdout, stderr)
+    let raw = format!("{}\n{}", stdout, stderr);
+    let bypassed = ok && raw.contains(BYPASS_MARKER);
+    let detail: Vec<String> = raw
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
+        // 标记行是给程序看的，混进界面明细只是噪音。
+        .filter(|l| !l.contains(BYPASS_MARKER))
         .collect();
 
     if ok {
+        let summary = if bypassed {
+            "⚠️ 门禁放行：命中应急绕过窗口（三段并非全部批准，已记审计日志）".to_string()
+        } else {
+            "✅ 门禁放行：三段已批准且无未解决的阻塞性评论".to_string()
+        };
         Ok(GateVerdict::Pass {
-            summary: "✅ 门禁放行：三段已批准且无未解决的阻塞性评论".to_string(),
+            summary,
+            detail,
+            bypassed,
         })
     } else {
         Ok(GateVerdict::Block {
@@ -489,6 +572,126 @@ pub fn gate_check(root: &Path) -> Result<GateVerdict> {
             detail,
         })
     }
+}
+
+/// `req-guard hook-check` 判定"AI 正在写清单正文"时输出的标记。
+///
+/// 与 [`BYPASS_MARKER`] 同构：脚本据此直接放行本次写操作，不再走"三段是否已批准"
+/// 的判定——否则 AI 连清单正文都写不了（文档流程第 2 步被门禁自己拦死）。
+pub const ALLOW_DOC_MARKER: &str = "REQ_GUARD_ALLOW_DOC=1";
+
+/// PreToolUse 阶段对**单次 AI 写操作**的裁决。
+#[derive(Debug)]
+pub enum PretoolVerdict {
+    /// 本次写与证据/状态无关，交给后续门禁判定（脚本第 1 段起）。
+    Continue,
+    /// 本次写被禁止（证据保护 / 防自批），携带给人看的原因。
+    Block(String),
+    /// 放行：AI 正在填写清单正文，不必等三段批准。
+    ///
+    /// 只针对 `.gates/requirements/*.md`（评论文件除外）——这是文档流程里明确
+    /// 要求 AI 完成的一步；源码仍必须过门禁。
+    AllowDoc,
+}
+
+/// AI 写操作（PreToolUse）的裁决入口，由拦截脚本第 0 段调用。
+///
+/// payload 用 [`crate::json`] 真解析，而不是脚本里的 `sed` 正则：AI 工具可以对
+/// 路径/内容做 Unicode 转义，正则匹配不到就静默放过——失效方向是最坏的
+/// "看着在拦、其实没拦"。取不到路径时返回 [`PretoolVerdict::Continue`]：
+/// 那不是一次可识别的文件写操作，硬拦只会误伤，真正的门禁判定仍在后面接管。
+pub fn pretool_verdict(root: &Path, payload: &str) -> PretoolVerdict {
+    let Some(fp) = crate::json::file_path_of(payload) else {
+        return PretoolVerdict::Continue;
+    };
+
+    // 1) 证据保护：评论文件 AI 一律不得直接改（嫌疑人不得修改证据）
+    if fp.ends_with(".comments.md") {
+        audit(root, &format!("BLOCK-AI-WRITE-COMMENTS {}", fp));
+        return PretoolVerdict::Block(format!(
+            "审核评论文件禁止 AI 直接修改（嫌疑人不得修改证据）：{}\n\
+             AI 回复请用：req-guard comment <需求ID> --author ai --reply C001 --text \"...\"",
+            fp
+        ));
+    }
+
+    // 2) 清单正文：允许 AI 写，但**状态行一个字都不许变**（防自批）
+    if is_requirement_doc(&fp) {
+        return match doc_write_guard(root, &fp, payload) {
+            Ok(()) => PretoolVerdict::AllowDoc,
+            Err(reason) => {
+                audit(root, &format!("BLOCK-AI-TAMPER-STATUS {}", fp));
+                PretoolVerdict::Block(reason)
+            }
+        };
+    }
+
+    PretoolVerdict::Continue
+}
+
+/// 是否为"需求清单正文"文件（`.gates/requirements/*.md`，评论文件已在上一步排除）。
+fn is_requirement_doc(fp: &str) -> bool {
+    let p = fp.replace('\\', "/");
+    p.contains(".gates/requirements/") && p.ends_with(".md")
+}
+
+/// 清单正文写入的**防自批**闸门：可写返回 `Ok(())`，篡改返回拦截原因。
+///
+/// 核心不变式：**磁盘上已有的 GATE 状态行，一个字都不许变**。状态行是 `approve`
+/// 命令的职权；AI 一旦能改 `status=approved` 就等于能自批，而审批锁
+/// （[`crate::auth::ensure_human`]）只管命令层，管不到文件层写入。
+fn doc_write_guard(root: &Path, fp: &str, payload: &str) -> std::result::Result<(), String> {
+    // 片段编辑（Edit/MultiEdit）只提交 old/new 片段，无法与磁盘基线逐行比对：
+    // 把 old_string 写成 "status=pending" 就能骗过"内容里有没有 GATE 标记"的粗判。
+    // 故一律要求 Write 整篇覆盖。
+    if crate::json::old_string_of(payload).is_some() {
+        return Err(format!(
+            "清单文件禁止片段编辑（无法校验状态行是否被改动）：{}\n\
+             请改用 Write 整篇覆盖，且保持 GATE:HEAD / GATE:STEP 行原样不变",
+            fp
+        ));
+    }
+
+    let new_text = crate::json::content_of(payload)
+        .or_else(|| crate::json::new_string_of(payload))
+        .ok_or_else(|| {
+            format!(
+                "无法取得待写入内容，出于安全不予放行：{}\n请改用 Write 整篇覆盖",
+                fp
+            )
+        })?;
+
+    let disk = fs::read_to_string(root.join(fp)).unwrap_or_default();
+    if disk.trim().is_empty() {
+        // 新建文件：不得自带审批状态行——那是 approve 的职权
+        if !gate_lines(&new_text).is_empty() {
+            return Err(format!(
+                "新建清单文件时不得自带 GATE:HEAD / GATE:STEP 状态行\
+                 （审批状态由 approve 命令写入）：{}",
+                fp
+            ));
+        }
+        return Ok(());
+    }
+
+    let before = gate_lines(&disk);
+    let after = gate_lines(&new_text);
+    if before != after {
+        return Err(format!(
+            "清单正文可以写，但审批状态行不得改动（AI 自批等同于绕过审核）：{}\n\
+             磁盘状态行：{:?}\n本次写入：{:?}",
+            fp, before, after
+        ));
+    }
+    Ok(())
+}
+
+/// 取出文本里的 GATE 状态行（已 trim），用于比对是否被篡改。
+fn gate_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.contains("GATE:HEAD") || l.contains("GATE:STEP"))
+        .map(|l| l.trim().to_string())
+        .collect()
 }
 
 /// 读取审计日志尾部 `n` 行（供 UI 展示）。
@@ -655,7 +858,9 @@ pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
 /// - 核心资产（拦截脚本 sh/ps1、门禁声明）缺失 → 问题；
 /// - 在用工具的配置不含 `req-guard-check` → **L1 静默缺口**（只装不生效）；
 /// - env 注入型工具（如 claude）缺 [`crate::auth::AI_CTX_ENV`] → 审批锁缺口；
-/// - 有 `.git` 但 pre-commit 未含拦截 → **L2 缺口**。
+/// - 有 `.git` 但 pre-commit 未含拦截 → **L2 缺口**；
+/// - 有 `.git` 且 pre-commit 已接入但**缺执行位** → **L2 静默失效**（类 Unix 上
+///   git 会跳过不可执行钩子，内容再对也不会拦）。
 ///
 /// 未安装（配置不存在）的工具不要求——不制造噪音；未知新工具出现时，
 /// 由团队把它登记进 `TOOL_PROFILES` 后纳入校验白名单。
@@ -698,8 +903,19 @@ pub fn verify_install(root: &Path) -> Vec<String> {
     }
 
     if root.join(".git").exists() {
-        match fs::read_to_string(root.join(".git/hooks/pre-commit")) {
-            Ok(c) if c.contains("req-guard-check") => {}
+        let hook_path = root.join(".git/hooks/pre-commit");
+        match fs::read_to_string(&hook_path) {
+            Ok(c) if c.contains("req-guard-check") => {
+                // 内容对了不代表生效：Unix 上 git 会静默跳过没有执行位的钩子，
+                // 这是"verify 全绿但 L2 完全没拦"的唯一成因，必须单独查。
+                if !is_executable(&hook_path) {
+                    problems.push(
+                        ".git/hooks/pre-commit 已接入但缺少执行位——git 会静默跳过它（L2 实际未生效）；\
+                         执行 chmod +x .git/hooks/pre-commit 或重跑 req-guard install"
+                            .into(),
+                    );
+                }
+            }
             Ok(_) => problems.push(
                 ".git/hooks/pre-commit 未含 req-guard 拦截——L2 缺口；重跑 req-guard install".into(),
             ),
@@ -731,6 +947,9 @@ fn append_pre_commit(
             source: e,
         })?;
         if c.contains("req-guard-check") {
+            // 已接入：仍要补执行位——旧版 install 落盘时未设置，git 会静默跳过。
+            // 少了这一步，老仓库重跑 install 也永远修不好 L2。
+            ensure_executable(&hook);
             return Ok(());
         }
         let mut nc = c;
@@ -750,6 +969,8 @@ fn append_pre_commit(
             source: e,
         })?;
     }
+    // git 在 Unix 上只执行带执行位的钩子，缺了就是"静默不拦"。
+    ensure_executable(&hook);
     created.push(hook);
     Ok(())
 }
@@ -990,15 +1211,31 @@ log() {
 # ---------- 0) AI 禁止直接修改评论文件（★ 必须先于应急绕过：逃逸阀不覆盖证据完整性） ----------
 if [ ! -t 0 ]; then
   STDIN_DATA=$(cat 2>/dev/null || true)
-  FP=$(printf '%s' "$STDIN_DATA" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-  case "$FP" in
-    *.comments.md)
-      log "BLOCK-AI-WRITE-COMMENTS $FP"
-      echo "[req-guard] ⛔ 拦截：审核评论文件禁止 AI 直接修改（嫌疑人不得修改证据）。" >&2
-      echo "            AI 回复请用：req-guard comment <需求ID> --author ai --reply C001 --text \"...\"" >&2
-      exit 1
-      ;;
-  esac
+  if [ -n "$STDIN_DATA" ]; then
+    # 优先交给 req-guard 用 Rust **真解析** JSON：AI 工具 payload 允许 Unicode 转义
+    # （".gates\u002f…comments.md" 与 ".gates/…comments.md" 完全等价），正则匹配不到
+    # 会静默放过——那正是本工具最坏的失效：看着在拦，其实没拦。
+    if command -v req-guard >/dev/null 2>&1; then
+      # 拦截时 req-guard 已把原因打到 stderr（AI 看得见），这里只接退出码
+      OUT=$(printf '%s' "$STDIN_DATA" | req-guard hook-check) || exit 1
+      case "$OUT" in
+        # 清单正文（状态行未改动）：放行本次写，不再要求三段已批准
+        *REQ_GUARD_ALLOW_DOC=1*) exit 0 ;;
+      esac
+    else
+      # 兜底：二进制不在 PATH（受限环境）时退回正则粗判。
+      # 只保留证据保护，**不**放行清单正文（无法校验状态行 → 宁可维持 fail-closed）
+      FP=$(printf '%s' "$STDIN_DATA" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+      case "$FP" in
+        *.comments.md)
+          log "BLOCK-AI-WRITE-COMMENTS $FP"
+          echo "[req-guard] ⛔ 拦截：审核评论文件禁止 AI 直接修改（嫌疑人不得修改证据）。" >&2
+          echo "            AI 回复请用：req-guard comment <需求ID> --author ai --reply C001 --text \"...\"" >&2
+          exit 1
+          ;;
+      esac
+    fi
+  fi
 fi
 
 # ---------- 1) 应急绕过窗口（有痕、有时效） ----------
@@ -1010,6 +1247,8 @@ if [ -f "$BYPASS_FILE" ]; then
   if [ -n "$EXP" ] && [ "$NOW" -lt "$EXP" ]; then
     log "BYPASS-HIT expires_epoch=$EXP"
     echo "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）" >&2
+    # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
+    echo "REQ_GUARD_BYPASS=1"
     exit 0
   fi
 fi
@@ -1100,11 +1339,22 @@ if (-not [Console]::IsInputRedirected) {
 } else {
   $stdinData = [Console]::In.ReadToEnd()
 }
-$m0 = [regex]::Match($stdinData, '"file_path"\s*:\s*"([^"]+)"')
-if ($m0.Success -and $m0.Groups[1].Value -like '*.comments.md') {
-  Write-GateAudit "BLOCK-AI-WRITE-COMMENTS $($m0.Groups[1].Value)"
-  Write-Error "[req-guard] 拦截：审核评论文件禁止 AI 直接修改（嫌疑人不得修改证据）。AI 回复请用：req-guard comment <需求ID> --author ai --reply C001 --text ""..."""
-  exit 1
+if ($stdinData.Trim()) {
+  # 优先交给 req-guard 用 Rust **真解析**（正则会被 Unicode 转义绕过，详见 HOOK_SH 第 0 段）
+  if (Get-Command req-guard -ErrorAction SilentlyContinue) {
+    $out = $stdinData | req-guard hook-check
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+    # 清单正文（状态行未改动）：放行本次写，不再要求三段已批准
+    if ($out -match 'REQ_GUARD_ALLOW_DOC=1') { exit 0 }
+  } else {
+    # 兜底：只保留证据保护，**不**放行清单正文（无法校验状态行 → fail-closed）
+    $m0 = [regex]::Match($stdinData, '"file_path"\s*:\s*"([^"]+)"')
+    if ($m0.Success -and $m0.Groups[1].Value -like '*.comments.md') {
+      Write-GateAudit "BLOCK-AI-WRITE-COMMENTS $($m0.Groups[1].Value)"
+      Write-Error "[req-guard] 拦截：审核评论文件禁止 AI 直接修改（嫌疑人不得修改证据）。AI 回复请用：req-guard comment <需求ID> --author ai --reply C001 --text ""..."""
+      exit 1
+    }
+  }
 }
 
 # ---------- 1) 应急绕过窗口 ----------
@@ -1116,6 +1366,8 @@ if (Test-Path $BYPASS_FILE) {
     if ($now -lt [int64]$m.Groups[1].Value) {
       Write-GateAudit "BYPASS-HIT expires_epoch=$($m.Groups[1].Value)"
       Write-Output "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）"
+      # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
+      Write-Output "REQ_GUARD_BYPASS=1"
       exit 0
     }
   }
@@ -1606,6 +1858,17 @@ mod tests {
         let mut pc = "#!/bin/sh\n".to_string();
         pc.push_str(PRE_COMMIT_BLOCK);
         fs::write(root.join(".git/hooks/pre-commit"), pc).unwrap();
+        // 真实 install 落盘后会补执行位（否则 Unix 上 git 会静默跳过它），
+        // 这里同步模拟，才能只留下"审批锁缺口"这一项。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                root.join(".git/hooks/pre-commit"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         let p = verify_install(&root);
         assert_eq!(p.len(), 1, "仅剩审批锁缺口：{:?}", p);
 
@@ -1753,6 +2016,247 @@ mod tests {
             all[0].starts_with("2026-09-11"),
             "首行 BOM 应被清洗：{:?}",
             all[0]
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn hook_脚本输出绕过标记() {
+        // 脚本是 raw string，无法插值 BYPASS_MARKER，只能靠本用例锁定两端一致：
+        // 一旦有人改了文案却忘了脚本，绕过放行就会被谎报成"三段已批准"。
+        assert!(
+            HOOK_SH.contains(BYPASS_MARKER),
+            "sh 脚本必须输出绕过标记 {}",
+            BYPASS_MARKER
+        );
+        assert!(
+            HOOK_PS1.contains(BYPASS_MARKER),
+            "ps1 脚本必须输出绕过标记 {}",
+            BYPASS_MARKER
+        );
+    }
+
+    #[test]
+    fn pretool_证据保护_拦截改写评论文件() {
+        let root = temp_dir("pretool");
+        // 关键回归：路径含 Unicode 转义（\u002f == '/'）。脚本用 sed 抠字段时匹配不到，
+        // 会静默放过——Rust 侧真解析必须拦下，这是本次改造要解决的核心漏洞。
+        let escaped = r#"{"tool_name":"Write","tool_input":{"file_path":".gates\u002frequirements\u002fREQ-001.comments.md"}}"#;
+        match pretool_verdict(&root, escaped) {
+            PretoolVerdict::Block(reason) => {
+                assert!(reason.contains("REQ-001.comments.md"), "{}", reason)
+            }
+            other => panic!("转义过的评论文件路径必须被拦截，实际：{:?}", other),
+        }
+
+        // 明文路径同样拦截
+        let plain = r#"{"tool_input":{"file_path":"a/b.comments.md"}}"#;
+        assert!(matches!(
+            pretool_verdict(&root, plain),
+            PretoolVerdict::Block(_)
+        ));
+        // 普通源码文件 → 交给后续门禁（本层不拦）
+        assert!(matches!(
+            pretool_verdict(
+                &root,
+                r#"{"tool_input":{"file_path":"src/main.rs","content":"x"}}"#
+            ),
+            PretoolVerdict::Continue
+        ));
+        // 取不到路径信息：不硬拦（会误伤），交给门禁后续接管
+        assert!(matches!(
+            pretool_verdict(&root, "not json"),
+            PretoolVerdict::Continue
+        ));
+
+        // 拦截必须留痕
+        let log = fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap();
+        assert!(
+            log.contains("BLOCK-AI-WRITE-COMMENTS"),
+            "证据保护事件须入审计：{}",
+            log
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn pretool_清单正文可写但状态行不可改() {
+        let root = temp_dir("pretool-doc");
+        let rel = ".gates/requirements/REQ-001.md";
+        let g1 = "<!-- GATE:HEAD id=REQ-001 status=draft -->";
+        let g2 = "<!-- GATE:STEP name=decomposition status=pending -->";
+        fs::create_dir_all(root.join(".gates/requirements")).unwrap();
+        fs::write(root.join(rel), format!("{}\n{}\n正文", g1, g2)).unwrap();
+
+        // 1) 整篇覆盖且状态行原样 → 放行（AI 才写得成三段正文）
+        let keep = format!(
+            r#"{{"tool_input":{{"file_path":"{}","content":"{}\n{}\n正文"}}}}"#,
+            rel, g1, g2
+        );
+        assert!(
+            matches!(pretool_verdict(&root, &keep), PretoolVerdict::AllowDoc),
+            "状态行未变时应放行正文：{}",
+            keep
+        );
+
+        // 2) 把 status=pending 改成 approved → 拦（这就是自批）
+        let tampered = format!(
+            r#"{{"tool_input":{{"file_path":"{}","content":"{}\n{}\n正文"}}}}"#,
+            rel,
+            g1,
+            g2.replace("status=pending", "status=approved")
+        );
+        match pretool_verdict(&root, &tampered) {
+            PretoolVerdict::Block(reason) => {
+                assert!(reason.contains("自批"), "原因应点明是自批：{}", reason)
+            }
+            other => panic!("篡改状态行必须被拦截，实际：{:?}", other),
+        }
+
+        // 3) 片段编辑（Edit）→ 拦：只提交 old/new 片段，无法与磁盘基线比对
+        let edit = format!(
+            r#"{{"tool_input":{{"file_path":"{}","old_string":"status=pending","new_string":"status=approved"}}}}"#,
+            rel
+        );
+        assert!(
+            matches!(pretool_verdict(&root, &edit), PretoolVerdict::Block(_)),
+            "片段编辑无法校验状态行，必须拦"
+        );
+
+        // 4) 新建清单却自带状态行 → 拦；纯正文 → 放行
+        let new_bad = r#"{"tool_input":{"file_path":".gates/requirements/REQ-002.md","content":"<!-- GATE:STEP name=decomposition status=approved -->"}}"#;
+        assert!(matches!(
+            pretool_verdict(&root, new_bad),
+            PretoolVerdict::Block(_)
+        ));
+        let new_ok =
+            r#"{"tool_input":{"file_path":".gates/requirements/REQ-002.md","content":"需求正文"}}"#;
+        assert!(matches!(
+            pretool_verdict(&root, new_ok),
+            PretoolVerdict::AllowDoc
+        ));
+
+        // 篡改尝试必须留痕
+        let log = fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap();
+        assert!(
+            log.contains("BLOCK-AI-TAMPER-STATUS"),
+            "自批尝试须入审计：{}",
+            log
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn hook_脚本优先调用rust解析且保留兜底() {
+        assert!(
+            HOOK_SH.contains("req-guard hook-check"),
+            "sh 脚本应优先走 Rust 真解析"
+        );
+        assert!(HOOK_PS1.contains("hook-check"), "ps1 脚本同理");
+        // 放行清单正文的标记两端都要认，否则 AI 写不了正文（文档流程第 2 步被自己拦死）
+        assert!(
+            HOOK_SH.contains(ALLOW_DOC_MARKER) && HOOK_PS1.contains(ALLOW_DOC_MARKER),
+            "脚本须识别清单正文放行标记 {}",
+            ALLOW_DOC_MARKER
+        );
+        // 二进制不在 PATH（受限环境）时仍需正则兜底，否则保护直接消失
+        assert!(HOOK_SH.contains("file_path"), "sh 兜底分支仍需正则粗判");
+        assert!(HOOK_PS1.contains("file_path"), "ps1 兜底分支仍需正则粗判");
+    }
+
+    #[test]
+    fn gate_check_绕过窗口放行时标记bypassed() {
+        let root = temp_dir("check-bypass");
+        install(&root, &["none".to_string()], false).unwrap();
+        assert!(
+            !gate_check(&root).unwrap().is_pass(),
+            "前置条件：无需求时本应拦截，以确保放行确实由绕过窗口导致"
+        );
+
+        bypass(&root, "联调临时放行", "tester", 60).unwrap();
+        let v = gate_check(&root).unwrap();
+        assert!(v.is_pass(), "绕过窗口内应放行");
+        assert!(
+            v.bypassed(),
+            "靠绕过放行必须被标记，否则界面会谎报三段已批准：{}",
+            v.summary()
+        );
+        assert!(
+            v.summary().contains("绕过"),
+            "放行 summary 必须点明是绕过：{}",
+            v.summary()
+        );
+        assert!(
+            !v.detail().iter().any(|l| l.contains(BYPASS_MARKER)),
+            "机器标记不应混进界面明细：{:?}",
+            v.detail()
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_落盘的钩子带执行位() {
+        // 回归（P0）：install 曾只用 fs::write 落盘（0644），而 git 在 Unix 上
+        // **静默跳过**不可执行钩子——提交照常成功、无任何提示，--verify 还报全绿。
+        let root = temp_dir("hook-mode");
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        install(&root, &["none".to_string()], false).unwrap();
+
+        assert!(
+            verify_install(&root).is_empty(),
+            "刚装完不应有缺口：{:?}",
+            verify_install(&root)
+        );
+        assert!(
+            is_executable(&root.join(".git/hooks/pre-commit")),
+            "pre-commit 必须可执行，否则 git 静默跳过、L2 形同虚设"
+        );
+        assert!(
+            is_executable(&root.join(HOOK_SH_REL)),
+            "拦截脚本应可在终端直接执行"
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_修复旧版遗留的不可执行pre_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        // 老仓库由旧版 install 装过（无执行位），重跑 install 会命中"已接入"并提前返回。
+        // 若不在此补 chmod，这些仓库的 L2 永远修不好——升级也需要自愈。
+        let root = temp_dir("hook-mode-fix");
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nsh .gates/hooks/req-guard-check.sh\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !is_executable(&hook),
+            "前置条件：模拟旧版遗留的不可执行钩子"
+        );
+
+        install(&root, &["none".to_string()], false).unwrap();
+        assert!(is_executable(&hook), "重跑 install 必须补上执行位");
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_install_检出pre_commit缺执行位() {
+        use std::os::unix::fs::PermissionsExt;
+        // 内容对 ≠ 生效：只查内容会让 CI 拿着失效门禁报绿，必须单独查执行位。
+        let root = temp_dir("verify-mode");
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        install(&root, &["none".to_string()], false).unwrap();
+        assert!(verify_install(&root).is_empty(), "刚装完应全绿");
+
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o644)).unwrap();
+        let problems = verify_install(&root);
+        assert!(
+            problems.iter().any(|p| p.contains("执行位")),
+            "缺执行位必须被 verify 检出：{:?}",
+            problems
         );
         cleanup(&root);
     }

@@ -254,7 +254,14 @@ impl App {
         match gate::gate_check(&self.root) {
             Ok(v) => {
                 self.message = Some(match v {
-                    gate::GateVerdict::Pass { .. } => "门禁检查：放行 ✅".to_string(),
+                    // 绕过放行与正常放行必须一眼分得开：两者的事后责任完全不同。
+                    gate::GateVerdict::Pass { bypassed, .. } => {
+                        if bypassed {
+                            "门禁检查：放行 ⚠️（命中应急绕过窗口，非三段批准）".to_string()
+                        } else {
+                            "门禁检查：放行 ✅".to_string()
+                        }
+                    }
                     gate::GateVerdict::Block { detail, .. } => format!(
                         "门禁检查：拦截 ⛔（{}）",
                         detail.first().cloned().unwrap_or_default()

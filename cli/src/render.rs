@@ -69,9 +69,23 @@ pub fn print_comment_summary(r: &ReqStatus) {
 /// 渲染门禁裁决（`check` 命令）。
 ///
 /// 拦截原因原样透传到 stderr，保证与脚本输出一致（AI 与人都要看得见）。
+///
+/// 放行时**仅**在命中绕过窗口才打印脚本明细：正常放行保持既有输出不变，
+/// 而"靠绕过放行"必须让审核人与 CI 日志看见，不能只剩一句"三段已批准"。
 pub fn print_verdict(v: &req_guard_core::gate::GateVerdict) {
     match v {
-        req_guard_core::gate::GateVerdict::Pass { summary } => println!("{}", summary),
+        req_guard_core::gate::GateVerdict::Pass {
+            summary,
+            detail,
+            bypassed,
+        } => {
+            println!("{}", summary);
+            if *bypassed {
+                for line in detail {
+                    eprintln!("{}", line);
+                }
+            }
+        }
         req_guard_core::gate::GateVerdict::Block { detail, .. } => {
             for line in detail {
                 eprintln!("{}", line);

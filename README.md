@@ -81,6 +81,12 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
   启用后审批必须携带有效令牌，AI 拿不到 → 无法自批；`token status/revoke` 查询与撤销
 - **带外审批（方案 C）**：审批显式声明带外渠道 `--oob` 或 `req-guard oob <命令>`；
   设 `REQ_GUARD_OOB_ONLY=1` 可强制"仅接受带外审批"；台账按 `channel=oob|interactive` 留痕
+- **payload 真解析**：拦截脚本第 0 段优先调 `req-guard hook-check`，由 Rust 解析 AI 工具的
+  PreToolUse JSON——路径可写成 `.gates\u002f…comments.md` 这类 Unicode 转义，与明文**完全等价**，
+  脚本用正则抠字段会漏判并静默放过；`req-guard` 不在 PATH 时退回正则粗判（保底，不完备）
+- **清单正文可写、状态行不可改**：AI 可用 Write 整篇填写 `.gates/requirements/*.md`
+  （不等三段批准——否则"AI 填三段正文"这步会被门禁自己拦死）；但 GATE 状态行必须与磁盘
+  **逐行一致**，改动即拦截（防 AI 自批）；片段编辑（Edit）无法与基线比对，一律禁止
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见《AI工具合规保证规范.md》。
@@ -88,6 +94,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 ## 命令一览
 
 `init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+（内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
 
 ## 门禁管理台（TUI / GUI）

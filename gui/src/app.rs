@@ -217,10 +217,13 @@ impl App {
         match gate::gate_check(&self.root) {
             Ok(v) => {
                 self.check_pass = v.is_pass();
-                self.check_detail = v.detail().to_vec();
-                if self.check_detail.is_empty() {
-                    self.check_detail.push(v.summary().to_string());
+                // 放行也可能是"靠绕过"：此时 summary 是警告文案，必须一起显示，
+                // 否则弹窗里只剩脚本明细、看不出这是非常规放行。
+                let mut lines = v.detail().to_vec();
+                if lines.is_empty() || v.bypassed() {
+                    lines.insert(0, v.summary().to_string());
                 }
+                self.check_detail = lines;
                 self.dialog = Dialog::CheckResult;
             }
             Err(e) => self.message = Some(format!("检查失败：{}", e)),

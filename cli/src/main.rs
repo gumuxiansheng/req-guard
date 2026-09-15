@@ -227,6 +227,24 @@ fn run(a: &cli::Args) -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Action::HookCheck => {
+            // 供拦截脚本第 0 段调用：Rust 侧真解析 AI 工具 payload（脚本的 sed 正则
+            // 会被 Unicode 转义绕过）。拦截时打印原因并 exit 1，脚本据此阻断。
+            use std::io::Read as _;
+            let mut payload = String::new();
+            std::io::stdin()
+                .read_to_string(&mut payload)
+                .map_err(|e| GateError::Validation(format!("读取 stdin 失败：{}", e)))?;
+            match gate::pretool_verdict(root, &payload) {
+                gate::PretoolVerdict::Block(reason) => {
+                    eprintln!("[req-guard] ⛔ 拦截：{}", reason);
+                    std::process::exit(1);
+                }
+                // 清单正文：脚本见标记即放行本次写（否则 AI 连正文都写不了）
+                gate::PretoolVerdict::AllowDoc => println!("{}", gate::ALLOW_DOC_MARKER),
+                gate::PretoolVerdict::Continue => {}
+            }
+        }
         Action::Bypass => {
             let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")
                 .unwrap_or_else(|_| "unknown".to_string());

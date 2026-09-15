@@ -15,6 +15,7 @@
 //! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
 //! req-guard bypass   --reason <原因> [--ttl 60]
 //! req-guard audit-digest                 审计日志 SHA-256 摘要写入入库 DIGEST
+//! req-guard hook-check                   PreToolUse hook 内部命令（读 stdin，由拦截脚本调用）
 //! req-guard -V | --version              输出版本号（与 Cargo.toml / Release tag 一致）
 //! ```
 
@@ -41,6 +42,9 @@ pub enum Action {
     },
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
+    /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
+    /// 退出码 0 放行（交给后续门禁）、1 拦截（脚本据此 exit 1）。
+    HookCheck,
 }
 
 pub struct Args {
@@ -131,6 +135,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             }
         }
         "ui" => Action::Ui,
+        "hook-check" => Action::HookCheck,
         "-h" | "--help" => return Err(help()),
         other => return Err(format!("未知命令: {}\n\n{}", other, help())),
     };
@@ -286,6 +291,7 @@ fn help() -> String {
   token status               查看令牌启用状态与到期\n\
   token revoke               撤销并禁用审批令牌\n\
   ui       [--gui | --tui]   打开门禁管理台（需以 --features tui 构建）\n\
+  hook-check                 PreToolUse hook 内部命令：读 stdin 校验 AI 写操作\n\
 \n\
 通用选项:\n\
   -p, --path <项目根>   默认当前目录\n\

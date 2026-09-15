@@ -7,6 +7,8 @@
 用法：
     python scripts/verify_gate.py
 """
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -38,6 +40,19 @@ STDIN_AI_WRITE_COMMENTS = (
     '{"tool_name":"Write","tool_input":'
     '{"file_path":".gates/requirements/REQ-001.comments.md"}}'
 )
+
+# 同上，但把后缀里的 '.' 写成 Unicode 转义 \u002e —— 与明文**完全等价**。
+# 脚本兜底分支用 sed 抠字段，抠到的是原始串（不以 .comments.md 结尾）→ 静默放过；
+# Rust 侧真解析会解出真实路径并拦截。场景 14 锁的就是这个差距。
+STDIN_AI_WRITE_COMMENTS_ESCAPED = (
+    '{"tool_name":"Write","tool_input":'
+    '{"file_path":".gates/requirements/REQ-001.comments\\u002emd"}}'
+)
+
+# 场景 14 需要 req-guard 本体在 PATH 上（脚本第 0 段优先调 `req-guard hook-check`）。
+# 未构建二进制时跳过该场景——不给"只跑脚本"的用法增加新前置条件。
+BIN_DIR = ROOT / "target" / "debug"
+BIN = BIN_DIR / ("req-guard.exe" if sys.platform == "win32" else "req-guard")
 
 
 def make_req(status: str) -> str:
@@ -90,7 +105,7 @@ if not SH:
     )
 
 
-def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=None):
+def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=None, env=None):
     """在独立临时目录里跑一次拦截脚本，返回退出码。"""
     work = Path(tempfile.mkdtemp(prefix="reqguard-")) / name
     (work / Path(HOOK_REL).parent).mkdir(parents=True)
@@ -118,6 +133,7 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
             capture_output=True,
             text=True,
             input=stdin_data,
+            env=env,
             **RUN_KW,
         )
     else:
@@ -128,6 +144,7 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
+            env=env,
             **RUN_KW,
         )
     shutil.rmtree(work.parent, ignore_errors=True)
@@ -244,6 +261,50 @@ def verify_deny_wrapper() -> bool:
 
 
 ok = ok and verify_deny_wrapper()
+
+# 14) AI 用 Unicode 转义绕过"禁止改评论文件"：Rust 真解析必须拦下。
+#     三段已批准（否则会被门禁拦下，就证明不了是证据保护在起作用）。
+name14 = "14_转义路径改写评论文件"
+if BIN.exists():
+    env14 = dict(os.environ)
+    env14["PATH"] = str(BIN_DIR) + os.pathsep + env14.get("PATH", "")
+    code14 = run(
+        name14,
+        make_req("approved"),
+        stdin_data=STDIN_AI_WRITE_COMMENTS_ESCAPED,
+        env=env14,
+    )
+    good = code14 == 1
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  {name14}: exit={code14} (期望 1)")
+
+    doc_rel = ".gates/requirements/REQ-001.md"
+    body = make_req("approved")
+
+    # 15) AI 填写清单正文（状态行原样）→ 必须放行。
+    #     否则"AI 填三段正文"这步会被门禁自己拦死，文档流程走不下去。
+    payload15 = json.dumps(
+        {"tool_input": {"file_path": doc_rel, "content": body}}, ensure_ascii=False
+    )
+    name15 = "15_AI填写清单正文"
+    code15 = run(name15, body, stdin_data=payload15, env=env14)
+    good = code15 == 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  {name15}: exit={code15} (期望 0)")
+
+    # 16) AI 顺手改掉 status → 拦（自批）。磁盘已是 approved，若不是被本层拦下，
+    #     门禁本会放行（exit 0），故 exit=1 只可能来自防自批这一层。
+    tampered = body.replace("status=approved", "status=pending", 1)
+    payload16 = json.dumps(
+        {"tool_input": {"file_path": doc_rel, "content": tampered}}, ensure_ascii=False
+    )
+    name16 = "16_AI篡改状态行"
+    code16 = run(name16, body, stdin_data=payload16, env=env14)
+    good = code16 == 1
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  {name16}: exit={code16} (期望 1)")
+else:
+    print(f"SKIP  {name14}: 未构建 {BIN}（先执行 cargo build）")
 
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)
