@@ -51,6 +51,15 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   （`reconfigure(encoding="utf-8", errors="replace")` + `subprocess(encoding="utf-8")`），CI 再兜 `PYTHONIOENCODING: utf-8`。
 - **hook 配置的"是否已接入"判定必须按词干**：`marker_of` 取 `req-guard-check` / `req-guard-deny`
   （不带 .sh/.ps1），否则 Windows↔Linux 互装互验必假红；渲染出的命令才可平台相关。
+- **任何"由工具自动执行"的落盘脚本都必须补执行位**（`ensure_executable`，0o755）：
+  git 在 Unix 上**静默跳过**不可执行钩子，`fs::write` 默认 0644 → L2 完全失效且 `--verify`
+  只查内容会假绿。同理：`install` 的"已接入"提前返回分支也要补 chmod，否则旧仓库无法自愈；
+  `verify_install` 必须单独查执行位（内容对 ≠ 生效）。Windows 侧 `is_executable` 恒 true 防假红。
+- **脚本→Rust 的状态/字段传递一律用机器可读标记或真解析**，不要匹配人类可读文案、也不要用
+  `sed` 抠 JSON 字段：JSON 允许 Unicode 转义（`.gates\u002f…comments.md` 与明文等价），
+  正则漏判的方向恰好是"看着在拦、其实没拦"。解析下沉到 `core::json`（零依赖递归下降解析器）；
+  脚本侧保留正则**兜底**（二进制不在 PATH 时），但兜底不完备属已知降级路径。
+- `cargo clippy -D warnings` 不被识别，正确写法是 `cargo clippy --workspace --all-targets -- -D warnings`。
 
 ## 已知未完成
 - **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
