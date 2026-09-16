@@ -3085,7 +3085,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "req-guard"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "req-guard-core",
  "req-guard-gui",
@@ -3094,11 +3094,11 @@ dependencies = [
 
 [[package]]
 name = "req-guard-core"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "req-guard-gui"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "req-guard-core",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "req-guard-tui"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "crossterm",
  "ratatui",
