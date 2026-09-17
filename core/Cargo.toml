@@ -1,6 +1,6 @@
 [package]
 name = "req-guard-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "req-guard 核心库：AI 需求门禁业务逻辑（零外部依赖）"
 
