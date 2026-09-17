@@ -298,7 +298,8 @@ fn color_of_req(r: &ReqStatus) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, Focus};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -423,6 +424,58 @@ mod tests {
         let text = screen(&draw(&app, 110, 30));
         assert!(text.contains("新建需求"), "弹窗标题应说明在收集什么");
         assert!(text.contains("用户登录改造"), "输入内容应回显");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 切换步骤后正文定位到对应段落() {
+        let root = temp_dir("section-jump");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        assert!(
+            app.body.iter().any(|l| l.contains("需求分解")),
+            "初始应显示第一段"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(
+            app.body.iter().any(|l| l.contains("技术方案")),
+            "→ 应切到第二段并定位正文"
+        );
+        assert!(
+            !app.body.iter().any(|l| l.contains("测试计划")),
+            "第二段不应混入第三段内容"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(
+            app.body.iter().any(|l| l.contains("需求分解")),
+            "← 应回到第一段"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 刷新保留选区与滚动位置() {
+        let root = temp_dir("refresh-keep");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.body_scroll = 2;
+        app.reload();
+        assert_eq!(app.step, 1, "自动刷新不应重置当前段");
+        assert_eq!(app.body_scroll, 2, "自动刷新不应重置滚动位置");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 上下键在正文聚焦时滚动() {
+        let root = temp_dir("body-scroll");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        app.focus = Focus::Body;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.body_scroll, 1, "正文聚焦时 ↓ 应滚动正文");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.body_scroll, 0, "↑ 应回滚");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

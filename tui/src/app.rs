@@ -61,8 +61,17 @@ pub enum Overlay {
     Audit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Requirements,
+    Steps,
+    Body,
+}
+
 /// TUI 全局状态。
 pub struct App {
+    pub focus: Focus,
+    document: Vec<String>,
     pub root: PathBuf,
     pub reqs: Vec<ReqStatus>,
     /// 选中的需求下标。
@@ -89,6 +98,8 @@ pub struct App {
 impl App {
     pub fn new(root: &Path) -> App {
         let mut app = App {
+            focus: Focus::Requirements,
+            document: Vec::new(),
             root: root.to_path_buf(),
             reqs: Vec::new(),
             selected: 0,
@@ -121,28 +132,55 @@ impl App {
 
     /// 重新读取需求列表与正文。
     pub fn reload(&mut self) {
+        let previous = self.current().map(|r| r.path.clone());
+        let scroll = self.body_scroll;
         match status::req_list(&self.root) {
             Ok(list) => {
                 self.reqs = list;
+                if let Some(index) = self
+                    .reqs
+                    .iter()
+                    .position(|r| Some(&r.path) == previous.as_ref())
+                {
+                    self.selected = index;
+                }
                 if self.selected >= self.reqs.len() {
                     self.selected = self.reqs.len().saturating_sub(1);
                 }
             }
             Err(e) => self.message = Some(format!("读取需求失败：{}", e)),
         }
+        let unchanged = self.current().map(|r| &r.path) == previous.as_ref();
+        if !unchanged {
+            self.step = 0;
+        }
         self.load_body();
+        if unchanged {
+            self.body_scroll = scroll;
+        }
         self.last_refresh = Instant::now();
     }
 
-    /// 加载当前需求正文（只读）。
+    /// 加载当前需求正文（只读）。切段时直接在本段起始处打开正文。
     pub fn load_body(&mut self) {
         self.body.clear();
         self.body_scroll = 0;
         let Some(r) = self.current() else { return };
         match std::fs::read_to_string(&r.path) {
-            Ok(text) => self.body = text.lines().map(|l| l.to_string()).collect(),
-            Err(e) => self.body = vec![format!("读取正文失败：{}", e)],
+            Ok(text) => {
+                self.document = text.lines().map(|l| l.to_string()).collect();
+                self.body = section_lines(&self.document, self.step);
+            }
+            Err(e) => {
+                self.document = vec![format!("读取正文失败：{}", e)];
+                self.body = self.document.clone();
+            }
         }
+        self.body_scroll = self
+            .body
+            .iter()
+            .position(|l| !l.trim().is_empty() && !l.starts_with("<!--"))
+            .map_or(0, |i| u16::try_from(i).unwrap_or(0));
     }
 
     /// 时间到了就自动刷新（3s 轻量轮询）。
@@ -181,14 +219,24 @@ impl App {
                 self.reload();
                 self.message = Some("已刷新".into());
             }
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Left | KeyCode::Char('h') => self.step = self.step.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                if self.step + 1 < requirement::STEPS.len() {
-                    self.step += 1;
+            KeyCode::Up | KeyCode::Char('k') => match self.focus {
+                Focus::Requirements => self.move_selection(-1),
+                Focus::Body => {
+                    self.body_scroll = self.body_scroll.saturating_sub(1);
+                    self.clamp_scroll();
                 }
-            }
+                Focus::Steps => {}
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.focus {
+                Focus::Requirements => self.move_selection(1),
+                Focus::Body => {
+                    self.body_scroll = self.body_scroll.saturating_add(1);
+                    self.clamp_scroll();
+                }
+                Focus::Steps => {}
+            },
+            KeyCode::Left | KeyCode::Char('h') => self.move_step(-1),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => self.move_step(1),
             KeyCode::PageDown | KeyCode::Char('J') => {
                 self.body_scroll = self.body_scroll.saturating_add(10)
             }
@@ -215,6 +263,23 @@ impl App {
             self.step = 0;
             self.load_body();
         }
+    }
+
+    fn move_step(&mut self, delta: isize) {
+        if self.current().is_none() {
+            return;
+        }
+        let len = requirement::STEPS.len() as isize;
+        let next = (self.step as isize + delta).clamp(0, len - 1);
+        if next as usize != self.step {
+            self.step = next as usize;
+            self.load_body();
+        }
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max = self.body.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+        self.body_scroll = self.body_scroll.min(max);
     }
 
     fn open_prompt(&mut self, p: Prompt) {
@@ -399,6 +464,22 @@ impl App {
             Err(e) => self.message = Some(format!("操作失败：{}", e)),
         }
     }
+}
+
+/// 按步骤下标截取对应段落（`## 1. 需求分解` / `## 2. 技术方案` / `## 3. 测试计划`）。
+/// 找不到标题时回退到整篇文档，保证老格式清单也能显示。
+fn section_lines(document: &[String], step: usize) -> Vec<String> {
+    let Some(start) = document
+        .iter()
+        .position(|l| l.trim_start().starts_with(&format!("## {}", step + 1)))
+    else {
+        return document.to_vec();
+    };
+    let end = document[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with("## "))
+        .map_or(document.len(), |i| start + 1 + i);
+    document[start..end].to_vec()
 }
 
 /// 初始化终端并进入事件循环。
