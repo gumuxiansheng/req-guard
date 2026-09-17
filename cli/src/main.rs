@@ -12,7 +12,7 @@ use req_guard_core::error::{GateError, Result};
 use req_guard_core::gate;
 use req_guard_core::requirement;
 use req_guard_core::status;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let parsed = match cli::parse() {
@@ -29,7 +29,8 @@ fn main() {
 }
 
 fn run(a: &cli::Args) -> Result<()> {
-    let root = &a.root;
+    let resolved = resolve_root(a);
+    let root = resolved.as_path();
     // 方案 B：审批命令显式给 --token 时注入环境，供 core 的 ensure_human 校验。
     // （无 --token 则走 REQ_GUARD_TOKEN 环境变量；未启用令牌则回退方案 A）
     if let Some(t) = a.token.as_deref() {
@@ -273,6 +274,33 @@ fn run(a: &cli::Args) -> Result<()> {
         Action::Ui => run_ui(root, a)?,
     }
     Ok(())
+}
+
+/// 决定项目根：显式 `-p/--path` 原样采用；否则向上探测含 `.gates/` 的目录。
+///
+/// 为什么需要探测：双击 `req-guard-ui.exe` 时 CWD 是 exe 所在目录，
+/// 在子目录里跑 `req-guard status` 时 CWD 也不是项目根；两种场景下
+/// 默认的 `"."` 都会指向错误目录，表现为「找不到需求 / 门禁看着没生效」。
+///
+/// 探测顺序：CWD → 可执行文件所在目录。都找不到则**保持 CWD**——
+/// `init` 必须在"当前目录"建门禁，凭空跳到某个祖先目录是危险的。
+fn resolve_root(a: &cli::Args) -> PathBuf {
+    if a.root_explicit {
+        return a.root.clone();
+    }
+    const MAX_UP: usize = 6;
+    if let Some(p) = gate::find_project_root(&a.root, MAX_UP) {
+        return p;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // exe 通常埋在 `gates-tools/req-guard-ui/bin` 这类深层目录，多给几层。
+            if let Some(p) = gate::find_project_root(dir, MAX_UP + 4) {
+                return p;
+            }
+        }
+    }
+    a.root.clone()
 }
 
 /// 审批令牌管理（方案 B）。

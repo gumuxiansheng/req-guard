@@ -50,6 +50,11 @@ pub enum Action {
 pub struct Args {
     pub action: Action,
     pub root: PathBuf,
+    /// `-p/--path` 是否由用户显式给出。
+    ///
+    /// 为 false 时 main 会向上探测项目根（双击 exe / 在子目录里执行的场景，
+    /// CWD 往往不是项目根）；显式指定则**绝不**改动用户的意图。
+    pub root_explicit: bool,
     pub id: Option<String>,
     pub comment_id: Option<String>,
     pub title: Option<String>,
@@ -98,11 +103,52 @@ pub fn parse() -> std::result::Result<Parsed, String> {
     parse_from(&argv)
 }
 
+/// 构造某动作的默认值集合。
+///
+/// 抽出来是为了复用：无参数调用（双击 exe）时也要能造出一份 `Args`。
+fn default_args(action: Action) -> Args {
+    Args {
+        action,
+        root: PathBuf::from("."),
+        root_explicit: false,
+        id: None,
+        comment_id: None,
+        title: None,
+        step: None,
+        reviewer: None,
+        author: None,
+        text: None,
+        quote: None,
+        reply: None,
+        blocking: false,
+        reason: None,
+        tools: Vec::new(),
+        ttl: 60,
+        refresh_anchors: false,
+        token: None,
+        oob: false,
+        verify: false,
+        gui: false,
+        tui: false,
+    }
+}
+
 fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
     let mut it = args.iter().peekable();
     let tok = match it.next() {
         Some(t) => t.clone(),
-        None => return Err(help()),
+        None => {
+            // 无参数：对**带界面的变体**（req-guard-ui.exe，以 --features tui/gui 构建）
+            // 直接打开管理台——双击 exe 时不给参数才是常态，此时打印帮助并 exit 2
+            // 会表现为"控制台一闪而过、什么都没发生"。
+            // 纯 CLI 变体（无界面 feature）保持原行为：打印帮助。
+            if cfg!(any(feature = "tui", feature = "gui")) {
+                return Ok(Parsed {
+                    args: default_args(Action::Ui),
+                });
+            }
+            return Err(help());
+        }
     };
     let action = match tok.as_str() {
         "init" => Action::Init,
@@ -140,29 +186,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         other => return Err(format!("未知命令: {}\n\n{}", other, help())),
     };
 
-    let mut a = Args {
-        action,
-        root: PathBuf::from("."),
-        id: None,
-        comment_id: None,
-        title: None,
-        step: None,
-        reviewer: None,
-        author: None,
-        text: None,
-        quote: None,
-        reply: None,
-        blocking: false,
-        reason: None,
-        tools: Vec::new(),
-        ttl: 60,
-        refresh_anchors: false,
-        token: None,
-        oob: false,
-        verify: false,
-        gui: false,
-        tui: false,
-    };
+    let mut a = default_args(action);
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -197,7 +221,10 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             }
             "--token" => a.token = Some(next(&mut it, "--token")?),
             "--oob" => a.oob = true,
-            "-p" | "--path" => a.root = PathBuf::from(next(&mut it, "--path")?),
+            "-p" | "--path" => {
+                a.root = PathBuf::from(next(&mut it, "--path")?);
+                a.root_explicit = true;
+            }
             "-h" | "--help" => return Err(help()),
             other => {
                 if other.starts_with('-') {

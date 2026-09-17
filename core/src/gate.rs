@@ -144,6 +144,65 @@ fn write_decl(root: &Path, rel: &str, content: &str, notes: &mut Vec<String>) ->
     write_file(root, rel, content)
 }
 
+/// 去掉路径里的 `.`（保留语义、纯装饰）与 `..`（真的上一层级）。
+///
+/// 零依赖实现：`components()` 过滤后再重建。
+/// 前缀（Windows 盘符 `C:`、UNC）不属于普通成分，必须原样推进。
+fn normalize_path(p: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 从 `start` 向上查找**项目根**：第一个含 `.gates/` 子目录的祖先（含自身）。
+///
+/// 存在理由：真实调用场景里 CWD 往往不是项目根——
+///   - 双击 `req-guard-ui.exe`：CWD 是 exe 所在目录（如 `gates-tools/req-guard-ui/bin`）；
+///   - 在 `src/`、`web/` 等子目录里执行 `req-guard status`。
+///
+/// 参数解析里 root 默认 `"."`，这些场景会全部落到错误目录，
+/// 表现为「找不到需求 / 门禁看起来没生效」。
+///
+/// 上限 `max_up` 层，找不到返回 `None`（调用方应保持原 CWD，不能猜：
+/// `init` 必须在"当前目录"建门禁，凭空跳到某个祖先目录是危险的）。
+pub fn find_project_root(start: &Path, max_up: usize) -> Option<PathBuf> {
+    // ★ 必须先转成绝对路径：相对路径**无法向上遍历**。
+    //   `Path::new(".").parent()` 是 `Some("")`（空路径），再取其 parent 直接是 None，
+    //   于是"从 CWD 向上找"会退化成"只看 CWD 自己"——双击 exe（CWD 是 exe 目录）
+    //   时正是这个路径，表现为界面能起来但需求列表是空的。
+    let start_abs = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            // ★ normalize：`cwd.join(".")` 会留下尾随 `.`，原样返回会让
+            //   后续 `root.join(".gates/…")` 显示成 `C:\proj\.\.gates\…`。
+            Ok(cwd) => normalize_path(cwd.join(start)),
+            Err(_) => start.to_path_buf(),
+        }
+    };
+    let mut cur = Some(start_abs.as_path());
+    for n in 0..=max_up {
+        let p = cur?;
+        if p.join(".gates").is_dir() {
+            return Some(p.to_path_buf());
+        }
+        if n == max_up {
+            break;
+        }
+        cur = p.parent();
+    }
+    None
+}
+
 /// 读取 `.gates/req-guard.yaml` 的 `strict_order` 开关。
 ///
 /// 零依赖实现：逐行匹配 `strict_order:`（跳过注释行）。
@@ -1467,6 +1526,46 @@ exit 0
 mod tests {
     use super::*;
     use crate::testutil::{cleanup, temp_dir};
+
+    #[test]
+    fn find_project_root_从深层子目录向上定位() {
+        let root = temp_dir("find-root");
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        // 模拟真实布局：项目根/gates-tools/req-guard-ui/bin
+        let deep = root.join("gates-tools").join("req-guard-ui").join("bin");
+        fs::create_dir_all(&deep).unwrap();
+
+        // 绝对起点
+        assert_eq!(
+            find_project_root(&deep, 6).unwrap(),
+            root,
+            "从深层子目录应能向上找到项目根"
+        );
+
+        // 相对起点（"." —— 双击 exe 时 CWD 就是 exe 所在目录，传进来的正是 "."）
+        // 这里必须真正切 CWD：相对路径的 parent() 是空路径，无法向上遍历。
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&deep).unwrap();
+        let got = find_project_root(Path::new("."), 6);
+        std::env::set_current_dir(&cwd).unwrap();
+        let got = got.unwrap();
+        assert_eq!(got, root, "相对起点 \".\" 应先解析为 CWD 再向上找");
+        // ★ 展示给用户的路径不能带尾随 `.`：否则会出现 `C:\proj\.\.gates\…` 这种串味路径
+        let shown = got.display().to_string();
+        assert!(
+            !shown.ends_with('.') && !shown.contains("\\.\\") && !shown.contains("/./"),
+            "返回路径应已规范化，实际: {}",
+            shown
+        );
+
+        // 上限内找不到 → None（调用方须保持 CWD，不能猜）
+        let outside = temp_dir("find-root-outside");
+        fs::create_dir_all(outside.join("a/b/c/d/e/f/g/h")).unwrap();
+        assert!(find_project_root(&outside.join("a/b/c/d/e/f/g/h"), 2).is_none());
+
+        cleanup(&root);
+        cleanup(&outside);
+    }
 
     #[test]
     fn ps1_落盘必须带_bom() {

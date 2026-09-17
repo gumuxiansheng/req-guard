@@ -147,9 +147,21 @@ impl App {
                 self.dialog = Dialog::None;
                 self.input_reviewer.clear();
                 self.reload();
+                // 自动前进到第一个未通过的段：批准完阶段 1 后界面应立即可审阶段 2，
+                // 否则光标停在已通过的旧段，后续段永远无法进入审核。
+                self.jump_to_reviewable();
                 self.message = Some(format!("已批准 {} / {}", id, requirement::step_label(step)));
             }
             Err(e) => self.message = Some(format!("批准失败：{}", e)),
+        }
+    }
+
+    /// 把 `step` 光标移到第一个未通过的段（全通过时保持不动）。
+    fn jump_to_reviewable(&mut self) {
+        if let Some(r) = self.current() {
+            if let Some(i) = r.steps.iter().position(|s| !s.state.is_approved()) {
+                self.step = i;
+            }
         }
     }
 
@@ -402,40 +414,43 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                 ))
                 .color(color);
 
-                egui::CollapsingHeader::new(header)
+                // open(Some(..)) 会每帧强制开合状态：折叠交互本身展不开非选中段，
+                // 所以这里把"点击标题"接管为"选中该段"，选中段下一帧即被展开。
+                let resp = egui::CollapsingHeader::new(header)
                     .open(Some(i == app.step))
                     .show(ui, |ui| {
                         // 正文只读：清单正文由 AI/编辑器维护，界面只做审核决策。
                         let mut text = app.body.clone();
                         add_sized_text_edit(ui, &mut text);
                     });
+                if resp.header_response.clicked() {
+                    app.step = i;
+                }
 
-                // 当前段的审核按钮
-                if i == app.step {
+                // 当前段的审核按钮（已通过的段无需再审，不显示，避免误导）
+                if i == app.step && s.state != StepState::Approved {
                     let can = req.can_review(s.key);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(can, egui::Button::new("批准"))
-                            .on_hover_text(if can {
-                                "批准当前段（需要审核人姓名）"
-                            } else {
-                                "顺序不满足：请先批准更早的步骤"
-                            })
-                            .clicked()
-                        {
-                            app.dialog = Dialog::Approve;
-                            app.input_reviewer.clear();
-                        }
-                        if ui
-                            .add_enabled(can, egui::Button::new("打回"))
-                            .on_hover_text("打回当前段（审核人 + 原因必填）")
-                            .clicked()
-                        {
-                            app.dialog = Dialog::Reject;
-                            app.input_reviewer.clear();
-                            app.input_reason.clear();
-                        }
-                    });
+                    if ui
+                        .add_enabled(can, egui::Button::new("批准"))
+                        .on_hover_text(if can {
+                            "批准当前段（需要审核人姓名）"
+                        } else {
+                            "顺序不满足：请先批准更早的步骤"
+                        })
+                        .clicked()
+                    {
+                        app.dialog = Dialog::Approve;
+                        app.input_reviewer.clear();
+                    }
+                    if ui
+                        .add_enabled(can, egui::Button::new("打回"))
+                        .on_hover_text("打回当前段（审核人 + 原因必填）")
+                        .clicked()
+                    {
+                        app.dialog = Dialog::Reject;
+                        app.input_reviewer.clear();
+                        app.input_reason.clear();
+                    }
                 }
                 ui.separator();
             }

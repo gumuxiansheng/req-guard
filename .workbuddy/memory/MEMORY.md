@@ -34,6 +34,12 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   产物命名 `req-guard[-ui]-<target>[.exe]`；tag 规则 `v<Cargo.toml version>`；镜像 `rust:1.88` + `RUSTUP_TOOLCHAIN=1.88.0`。
 
 ## 关键坑（复用）
+- **egui CollapsingHeader 传 `.open(Some(..))` 后点击被完全忽略**（源码 `if let Some(open) = open {...} else if clicked {toggle}`），
+  要"选中段展开"必须自己接管 `header_response.clicked()`；批准/打回后要前进光标到下一个未通过段；已通过段不显示审核按钮。
+- **GUI 真机点击验证（Windows）**：PowerShell Add-Type 被安全策略拦 → Python venv + ctypes；
+  pyautogui.click 静默无效，必须 SendInput；GetWindowRect 含 DWM 不可见边框，egui 逻辑坐标 =
+  (物理−客户区原点)/缩放，小按钮会脱靶（用探针打印 response.rect + pointer.latest_pos() 反推校准）；
+  taskkill 输出 GBK 需 encoding='gbk'；GUI 常驻必须 run_in_background。
 - `cargo test` 在 workspace 根**只跑 default-members**，TUI 测试要用 `cargo test --workspace`。
 - TUI 测试摊平 TestBackend 缓冲必须按 `unicode-width` 跳格，否则 CJK 占位空格导致断言误判。
 - **egui 0.36 API 大改**（详见 2026-09-11.md）：`App::update` → `logic`+`ui`；

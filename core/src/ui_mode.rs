@@ -101,7 +101,15 @@ pub fn detect(forced: Option<UiMode>, avail: UiAvailability, env: &EnvFacts) -> 
                     "本次构建未包含任何界面，请用 --features tui（或 gui / full）重新构建".into(),
                 ));
             }
-            if env.is_windows || env.is_macos {
+            // 先按平台/会话得出"倾向形态"，再按编译期可用性裁剪。
+            //
+            // ★ 这里曾有一个真实缺陷：早期实现直接 `return UiMode::Gui` 而不看
+            //   `avail.gui`，于是 **只编了 tui 的二进制在 Windows/macOS 上自动探测
+            //   必然选中未编译的 GUI**，随后在 cli 侧报「本次构建未包含 GUI」而退出——
+            //   表现就是官方发布的 req-guard-ui.exe（CLI+TUI 变体，本就不含 eframe）
+            //   在 Windows 上执行 `req-guard-ui ui` 直接失败，必须手动加 `--tui`。
+            //   平台倾向只是"偏好"，最终形态仍需过一遍编译期裁剪。
+            let preferred = if env.is_windows || env.is_macos {
                 UiMode::Gui
             } else if env.ssh {
                 UiMode::Tui
@@ -109,6 +117,13 @@ pub fn detect(forced: Option<UiMode>, avail: UiAvailability, env: &EnvFacts) -> 
                 UiMode::Gui
             } else {
                 UiMode::Tui
+            };
+            match preferred {
+                UiMode::Gui if avail.gui => UiMode::Gui,
+                UiMode::Tui if avail.tui => UiMode::Tui,
+                // 倾向的形态没编进来 → 退到另一个（avail.any() 已保证它可用）
+                UiMode::Gui => UiMode::Tui,
+                UiMode::Tui => UiMode::Gui,
             }
         }
     };
@@ -186,6 +201,40 @@ mod tests {
         };
         let e = detect(None, none, &env).unwrap_err();
         assert!(e.to_string().contains("--features"), "{}", e);
+    }
+
+    #[test]
+    fn 平台倾向的形态没编进来时退到另一个() {
+        // 真实缺陷回归：官方 req-guard-ui.exe 只编了 tui，在 Windows 上自动探测
+        // 曾选中未编译的 GUI，导致 `ui`（不带 --tui）直接失败。
+        let mut win = env_linux();
+        win.is_windows = true;
+        let only_tui = UiAvailability {
+            gui: false,
+            tui: true,
+        };
+        assert_eq!(
+            detect(None, only_tui, &win).unwrap(),
+            UiMode::Tui,
+            "Windows 上 GUI 未编译时应回退 TUI"
+        );
+
+        let mut mac = env_linux();
+        mac.is_macos = true;
+        let only_gui = UiAvailability {
+            gui: true,
+            tui: false,
+        };
+        assert_eq!(
+            detect(None, only_gui, &mac).unwrap(),
+            UiMode::Gui,
+            "macOS 上优先 GUI，且 GUI 已编译"
+        );
+
+        // Linux 有 DISPLAY 但只编了 tui → 同样回退
+        let mut x11 = env_linux();
+        x11.display = true;
+        assert_eq!(detect(None, only_tui, &x11).unwrap(), UiMode::Tui);
     }
 
     #[test]
