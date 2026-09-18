@@ -89,7 +89,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
   **逐行一致**，改动即拦截（防 AI 自批）；片段编辑（Edit）无法与基线比对，一律禁止
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
-详见《AI工具合规保证规范.md》。
+详见 [`docs/规范/AI工具合规保证规范.md`](docs/规范/AI工具合规保证规范.md)。
 
 ## 命令一览
 
@@ -139,7 +139,7 @@ GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段�
 
 ## 构建与验证
 
-工程为 cargo workspace：`core`（零依赖 lib）+ `cli`（唯一 bin）+ `tui`（界面 lib）。
+工程为 cargo workspace：`core`（零依赖 lib）+ `cli`（唯一 bin）+ `tui` / `gui`（界面 lib）。
 
 ```bash
 cargo build --release                  # 默认只构建 core + cli：零 UI 依赖、秒级
@@ -149,8 +149,8 @@ bash scripts/build-release.sh          # 一键多平台 Release 构建（5 目�
 
 cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
-cargo test --workspace                 # 单元测试（63 用例）
-python scripts/verify_gate.py          # 拦截脚本真机场景（13 场景）
+cargo test --workspace                 # 单元测试（全 workspace；用例数随迭代增长，以实跑输出为准）
+python scripts/verify_gate.py          # 拦截脚本真机场景（13 固定场景 + 1 个需二进制在 PATH 的条件场景）
 ```
 
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，
@@ -222,6 +222,19 @@ od -An -tx1 -N4 target/x86_64-unknown-linux-musl/release/req-guard
 | 静态性 | `ldd req-guard-aarch64-unknown-linux-musl` | `not a dynamic executable` |
 
 
+## 文档
+
+设计与规范文档统一放在 [`docs/`](docs/README.md)：
+
+| 目录 | 内容 |
+| --- | --- |
+| [`docs/需求/`](docs/需求) | 需求分析报告（功能范围 / 命令规格 / 验收口径） |
+| [`docs/设计/`](docs/设计) | 技术方案、UI 架构细化方案、GUI 跨平台方案选型 |
+| [`docs/规范/`](docs/规范) | AI 工具合规保证规范（三层 + 审批锁 / 部署验收清单） |
+| [`docs/提案/`](docs/提案) | AI 协同审核 GUI 自动弹出（未实现，含 P0–P5 落地路径） |
+
+完整索引与文档清理记录见 [`docs/README.md`](docs/README.md)。
+
 ## 源码结构
 
 ```
@@ -236,4 +249,5 @@ gui/   req-guard-gui    桌面界面 lib：app + fonts（内嵌 Noto Sans SC 子
 中文字体：`gui/assets/NotoSansSC-Regular.otf`（Noto Sans SC 子集，SIL OFL 许可，见
 `gui/assets/OFL-NOTO.txt`）；用 `scripts/make_font_subset.py` 可重新生成。
 
-详细设计见《技术方案.md》《需求分析报告.md》；架构决策见 dev-scaffold `架构决策记录.md` ADR-001。
+详细设计见 [`docs/设计/技术方案.md`](docs/设计/技术方案.md)、[`docs/需求/需求分析报告.md`](docs/需求/需求分析报告.md)；
+架构决策见 dev-scaffold `架构决策记录.md` ADR-001。

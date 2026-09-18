@@ -3,6 +3,18 @@
 > 问题：需要跨平台支持，能否用 **egui** 实现？
 > 本文只做方案对比与选型，**不含代码改动**。版本事实基于 2026-09 核实。
 
+> **状态校注（2026-09-18 复核）**：本文保留为**选型决策记录（ADR 性质）**——§2 egui 风险评估
+> （中文字体、Linux 系统库、musl 承载不了 GUI）与 §3 的 S0–S5 对比矩阵，仍是"为什么选 egui、
+> 为什么不选 Tauri / WASM / musl 承载 GUI"的唯一依据。
+> 但**落地形态以 `docs/设计/UI架构细化方案.md` 与根目录 README 为准**，下列内容已过时：
+> 1. §4 推荐架构：`gui` 最终是 **lib**（由 `cli` 用 feature 链进同一二进制，实现"单文件 + 自动选界面"），
+>    不是独立 bin；core 实际模块为 `error / requirement / comment / gate / status / ui_mode / auth / token /
+>    digest / json`，文中所列的 `project / templates / generator / git / gates` 属 dev-scaffold 遗产，
+>    req-guard 从未包含。
+> 2. §5 构建矩阵已被 README「多平台 Release 构建与发布」取代：现为 `scripts/build-release.sh`
+>    （5 目标 × 2 变体 + SHA256SUMS），GUI 因 X11/Wayland/GTK 依赖**不做交叉编译**。
+> 3. §7 落地清单 7 步已全部完成；§8 待拍板 5 项已决策（结论见 `docs/设计/UI架构细化方案.md`）。
+
 ---
 
 ## 0. 结论先行

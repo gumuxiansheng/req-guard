@@ -2,7 +2,17 @@
 
 > 决策已定：**egui 与 TUI 都要**；图形桌面走 egui，纯命令行走 TUI；
 > workspace 拆分；GUI 定位为**纯门禁管理台**；eframe **0.36.1**。
-> 本文是《GUI跨平台方案选型.md》S2 的细化落地设计，**本轮不含代码改动**。
+> 本文是 `docs/设计/GUI跨平台方案选型.md` S2 的细化落地设计，**本轮不含代码改动**。
+
+> **状态校注（2026-09-18 复核）**：本文描述的架构**已全部落地**（workspace 四 crate、feature 门控、
+> `ui` 自动探测与 GUI→TUI 回退），仍作为 UI 设计基线保留。过时/待更新处：
+> 1. §7 落地清单：P0–P4 已完成；**P5 仍为"部分"**——CI 已接入 fmt/clippy/test/build，
+>    GitHub Actions 在 Windows/macOS 构建 `gui` 特性，但**产物发布仍待补**（见 README「多平台 Release」）。
+> 2. §8 风险表末行「沙箱环境限制、当前仍只能出方案」已过时——GUI/TUI 均已真机验证。
+> 3. §9「需要你确认的细节」5 项已全部决策：默认自动探测、界面内正文只读、内嵌 Noto Sans SC 子集、
+>    `cli` + `full` 双产物分发、不保留 `tui`/`gui` 独立二进制（结论见本文 §1.1/§3.1/§4.4 与 README）。
+> 4. §6 构建矩阵的 zigbuild 表述与现行 `scripts/build-release.sh` 不一致：
+>    现为 Linux 执行机 + rust-lld（仅两个 macOS 目标用 cargo-zigbuild），5 目标 × 2 变体。
 
 ---
 

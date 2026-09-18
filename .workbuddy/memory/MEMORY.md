@@ -11,6 +11,10 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
 - 目录：`.gates/`（入库：yaml 声明 + 清单 + 评论 + 拦截脚本）/`gates-tools/`（不入库：二进制与渲染产物）。
 - 拦截判定**唯一真相**在 `.gates/hooks/req-guard-check.{sh,ps1}` 脚本，`req-guard check` 只透传退出码。
 - req-guard 是安全机制 → **fail-closed**（区别于 sql-guard/java-guard 的 fail-open）。
+- **文档统一放 `docs/`**（2026-09-18 归拢）：`需求/` `设计/` `规范/` `提案/` + `docs/README.md` 索引；
+  根目录只留 `README.md`（项目入口）；`.workbuddy/memory/` 是 AI 工作记忆，不并入 docs。
+  新文档只进对应分类；**引用代码位置写"文件名 + 符号名"，不写行号**（行号必然腐坏）；
+  验证数字（用例/场景数）只记快照日期，以实跑为准。
 
 ## 已完成（截至 2026-09-12）
 - **workspace 已拆分**：`core`（零依赖 lib）/ `cli`（唯一 bin）/ `tui`（lib）/ `gui`（lib）；

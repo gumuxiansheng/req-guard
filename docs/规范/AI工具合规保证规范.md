@@ -1,9 +1,15 @@
 # 保证 AI 工具合规实施规范（req-guard）
 
-> 配套：《技术方案.md》《需求分析报告.md》《UI架构细化方案.md》。
+> 配套：`docs/设计/技术方案.md`、`docs/需求/需求分析报告.md`、`docs/设计/UI架构细化方案.md`。
 > 本文定义 req-guard 在"多 AI 工具共存"环境下的**保证模型**与**部署/验收清单**，
 > 明确：门禁保证什么、不保证什么、每一层必须如何配置才能算"真正生效"。
 > 适用范围：任何接入 req-guard 的项目、任何会写代码的 AI 工具（Claude Code / CodeBuddy / Codex / Cursor 及未来工具）。
+
+> **状态校注（2026-09-18 复核）**：本文各章"现状（已实现）"与当前代码一致，无需修订——
+> L2 fail-closed（`core/src/gate.rs::PRE_COMMIT_BLOCK`）、`enforce.ci: true`、`install --verify`、
+> 审批锁方案 A（`REQ_GUARD_AI_CTX`）/ B（`token`，SHA-256 落盘）/ C（`--oob`、`REQ_GUARD_OOB_ONLY`）、
+> 入库台账 `audit/ledger.md` + `audit-digest`、四工具原生 hook schema（Codex/Cursor 走 `deny` 包装）
+> 均已落地。本文是**部署与验收的唯一权威口径**，改动门禁保证能力时须同步更新第 2.2、4、6 章。
 
 ---
 
