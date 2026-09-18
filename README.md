@@ -211,6 +211,48 @@ cargo build --release -p req-guard --target aarch64-unknown-linux-musl --feature
 od -An -tx1 -N4 target/x86_64-unknown-linux-musl/release/req-guard
 ```
 
+### 发布包（可分发安装包）
+
+除裸二进制外，还有一条"开箱即用"的分发形态：**组装脚本 + 包内容模板**。
+
+```bash
+bash scripts/make-release-package.sh              # 构建 + 组装 + 打包（默认）
+bash scripts/make-release-package.sh --no-build   # 复用 dist/raw/ 直接组装
+```
+
+产出 `dist/req-guard-v<version>/`（目录）与 4 个归档：
+
+| 归档 | 内容 |
+|---|---|
+| `req-guard-v<ver>-windows-x86_64.zip` | Windows 三变体 + 全部文档/脚本/模板 |
+| `req-guard-v<ver>-linux-x86_64-musl.tar.gz` | Linux amd64 静态二进制（含执行位） |
+| `req-guard-v<ver>-linux-aarch64-musl.tar.gz` | Linux arm64 静态二进制 |
+| `req-guard-v<ver>-all.zip` | 全平台完整包（镜像/制品库分发用） |
+
+包内结构（`bin/` 平台分目录、`docs/` 文档、`scripts/` 脚本、`templates/` 接入模板）：
+
+```
+README.md  VERSION  CHANGELOG.md  SHA256SUMS.txt  THIRD-PARTY-NOTICES.md
+bin/{windows-x86_64,linux-x86_64,linux-aarch64}/   预编译二进制（cli / ui / gui 变体）
+docs/     安装指南 · 用户手册 · 校验说明 · 常见问题
+scripts/  install / uninstall / verify-checksums / selfcheck（.sh 与 .ps1 双份）
+```
+
+设计要点（都在脚本注释里写明了原因）：
+
+- **包内容模板放 `packaging/`**（入库），产物落 `dist/`（不入库）——文档与脚本可版本化、可评审。
+- **版本自证三处对齐**：`VERSION` 文件 / `req-guard -V` / 归档名，任一不符即视为混装。
+- **不动 Python 之外的删除**：组装过程只改名归档、不删文件（旧快照进 `dist/.trash/`），
+  因此在带删除保护的环境（CI/沙箱）里也能无人值守跑完。
+- **执行位写进归档条目**：Windows 上 `chmod` 是空操作，若只在本地文件系统设权限，
+  打出的 tar 里会是 0644；权限位改为在 tar/zip 条目中显式写入（`req-guard`、`*.sh` = 0755）。
+- **`.ps1` 一律补 UTF-8 BOM**：否则 Windows PowerShell 5.1 按 ANSI 读，中文乱码 + 解析报错。
+- **`{{占位符}}` 由构建脚本注入**（版本/日期/提交/工具链），文档不用手改。
+- 收尾自动跑一遍包内 `verify-checksums.sh`，27/27 通过才算组装成功。
+
+用户侧的安装、校验、自检分别由 `scripts/install.{sh,ps1}`、`verify-checksums.{sh,ps1}`、
+`selfcheck.{sh,ps1}` 完成；`selfcheck` 会实跑"未过审必须拦截 / 过审必须放行"两条路径。
+
 **如何验证发布结果**
 
 | 检查项 | 方法 | 期望 |
