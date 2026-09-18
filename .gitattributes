@@ -1,3 +1,9 @@
 # 仓库内一律 LF；Windows 检出时若把 sh 脚本变成 CRLF，会破坏 shebang 与解释执行
 * text=auto
 *.sh text eol=lf
+
+# 发布包模板（packaging/）会被组装脚本原样拷进分发包，必须与产出物保持同一套换行约定，
+# 否则"本地检出 CRLF → 打包进 tar"会让 Linux 用户拿到带 CRLF 的脚本（直接执行失败）。
+# 组装脚本虽然也会做一次 CRLF→LF 归一，但那只是兜底；源头统一才是根治。
+packaging/** text eol=lf
+scripts/*.py text eol=lf
