@@ -1193,15 +1193,18 @@ req-guard approve REQ-001 --step testplan      --reviewer 张三
 req-guard status REQ-001
 
 # 5. 解锁后 AI 才可编写代码
+
+# 6. 需求完成（或中止）后归档——门禁随之跳过该清单
+req-guard done REQ-001 --author 张三
 ```
 
 打回：`req-guard reject REQ-001 --step solution --reviewer 张三 --reason "缺少回滚方案"`
 
-## 审批锁：approve / resolve / bypass 须人类执行
+## 审批锁：approve / resolve / done / bypass 须人类执行
 
 `--reviewer` / `--author` 只是名字，不构成身份保证。因此 req-guard 给支持会话环境
 注入的 AI 工具（如 Claude Code）写入 `"REQ_GUARD_AI_CTX": "1"`，`approve / reject /
-resolve / bypass` 检测到该标记即**拒绝执行**——AI 经 Shell 自批会被堵在命令层。
+resolve / done / bypass` 检测到该标记即**拒绝执行**——AI 经 Shell 自批会被堵在命令层。
 
 - 审核人请在**自己的终端**（AI 会话之外）执行审批命令；
 - 人类误中拦截时：在不带该变量的终端重试，或先 `unset REQ_GUARD_AI_CTX`；
@@ -1549,7 +1552,16 @@ mod tests {
         let got = find_project_root(Path::new("."), 6);
         std::env::set_current_dir(&cwd).unwrap();
         let got = got.unwrap();
-        assert_eq!(got, root, "相对起点 \".\" 应先解析为 CWD 再向上找");
+        // macOS：getcwd 返回解析 symlink 的物理路径（/private/var/…），
+        // 而 env::temp_dir 给逻辑路径（/var/…）——两侧都 canonicalize 再比，
+        // Windows 上则同为 \\?\ 前缀形式，均一致。
+        assert_eq!(
+            fs::canonicalize(&got).unwrap(),
+            fs::canonicalize(&root).unwrap(),
+            "相对起点 \".\" 应先解析为 CWD 再向上找（got={:?} root={:?}）",
+            got,
+            root
+        );
         // ★ 展示给用户的路径不能带尾随 `.`：否则会出现 `C:\proj\.\.gates\…` 这种串味路径
         let shown = got.display().to_string();
         assert!(

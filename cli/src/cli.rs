@@ -8,6 +8,7 @@
 //! req-guard reject   <需求ID> --step <步骤> --reviewer <姓名> [--comment <意见>]
 //! req-guard comment  <需求ID> --author <姓名> --text <意见> [--step] [--quote] [--blocking] [--reply C001]
 //! req-guard resolve  <需求ID> <评论ID> --author <姓名>     （AI 禁止调用）
+//! req-guard done     <需求ID> --author <姓名>      归档需求（拦截随之跳过）
 //! req-guard status   [<需求ID>]          查看清单与解锁状态
 //! req-guard list
 //! req-guard comments <需求ID> [--refresh-anchors]
@@ -28,6 +29,8 @@ pub enum Action {
     Reject,
     Comment,
     Resolve,
+    /// 归档需求：整体状态置 done，拦截与 check 随之跳过该需求（AI 禁止调用）。
+    Done,
     Status,
     List,
     Comments,
@@ -157,6 +160,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "reject" => Action::Reject,
         "comment" => Action::Comment,
         "resolve" => Action::Resolve,
+        "done" => Action::Done,
         "status" => Action::Status,
         "list" => Action::List,
         "comments" => Action::Comments,
@@ -275,6 +279,11 @@ fn validate(a: &Args) -> std::result::Result<(), String> {
                 return Err("用法：req-guard resolve <需求ID> <评论ID> --author <姓名>".into());
             }
         }
+        Action::Done => {
+            if a.id.is_none() {
+                return Err("用法：req-guard done <需求ID> --author <姓名>".into());
+            }
+        }
         Action::Bypass if a.reason.is_none() => {
             return Err("bypass 必须填写 --reason <原因>（用于审计追溯）".into());
         }
@@ -307,6 +316,7 @@ fn help() -> String {
   comment  <需求ID> --author <姓名> --text <意见> [--step <步骤>]\n\
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
   resolve  <需求ID> <评论ID> --author <姓名>    关闭评论（AI 禁止调用）\n\
+  done     <需求ID> --author <姓名>    归档需求：拦截随之跳过（AI 禁止调用）\n\
   status   [<需求ID>]        查看三段状态与是否解锁\n\
   list                       列出全部需求\n\
   comments <需求ID> [--refresh-anchors]         查看评论 / 重算行号锚点\n\

@@ -170,6 +170,13 @@ fn run(a: &cli::Args) -> Result<()> {
             println!("✅ 已关闭评论 {}（需求 {}，审核人 {}）", cid, id, author);
             render::print_comment_summary(&status::req_get(root, id)?);
         }
+        Action::Done => {
+            let id = a.id.as_deref().unwrap_or("");
+            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")?;
+            let r = requirement::done(root, id, &actor)?;
+            println!("✅ 已归档：{} {}（操作人 {}）", r.id, r.title, actor);
+            println!("   归档后门禁跳过该需求；新的开发请新建清单。");
+        }
         Action::Status => {
             let id = a.id.as_deref();
             render::print_status(root, id)?;

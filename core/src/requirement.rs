@@ -277,6 +277,41 @@ pub fn review(
     Ok(r)
 }
 
+/// 归档需求：整体状态置为 `done`，拦截脚本与 `check` 随之**跳过**该需求，
+/// 不再作为"活跃需求"参与门禁判定——已解锁的项目由此回到"无活跃需求"的正常态。
+///
+/// 归档属审批类动作：AI 若能自归档，把带阻塞评论的需求归档、再 `create` 新需求，
+/// 老需求上的阻塞即失效（历史缺陷"阻塞评论只作用于最新活跃需求"的另一半），
+/// 故与 approve/reject/resolve/bypass 一样走 [`crate::auth::ensure_human`]。
+/// 幂等：已是 `done` 时直接返回，不重复写审计。
+pub fn done(root: &Path, id: &str, actor: &str) -> Result<Requirement> {
+    crate::auth::ensure_human("done")?;
+    let r = find(root, id)?;
+    let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })?;
+    if head_status(&content) == "done" {
+        return Ok(r);
+    }
+    let out = set_head_status(&content, "done");
+    fs::write(&r.path, out).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })?;
+
+    // 审计：归档改变门禁裁决的输入，属关键事件——本机日志 + 入库台账。
+    let event = format!(
+        "DONE {} actor={} channel={}",
+        r.id,
+        safe_field(actor),
+        crate::auth::declared_channel()
+    );
+    crate::gate::audit(root, &event);
+    crate::gate::audit_ledger(root, &event);
+    Ok(r)
+}
+
 // ===================== 解析辅助 =====================
 
 /// 取 GATE 标记行中 `key=value` 的值；未命中返回空串。
@@ -662,6 +697,73 @@ mod tests {
         create(&root, Some("REQ-001"), "第一个").unwrap();
         assert!(create(&root, Some("REQ-001"), "重复").is_err());
         assert!(create(&root, None, "   ").is_err(), "空标题应被拒");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn done_置done并幂等() {
+        let root = temp_dir("req-done");
+        create(&root, None, "归档测试").unwrap();
+        let r = find(&root, "REQ-001").unwrap();
+        let c = fs::read_to_string(&r.path).unwrap();
+        assert_eq!(head_status(&c), "draft");
+
+        let d = done(&root, "REQ-001", "寇工").unwrap();
+        let c = fs::read_to_string(&d.path).unwrap();
+        assert_eq!(head_status(&c), "done");
+        assert_eq!(
+            step_status(&c, "decomposition"),
+            "pending",
+            "归档不动三段状态"
+        );
+
+        // 关键事件入入库台账
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(ledger.contains("DONE REQ-001 actor=寇工"), "{}", ledger);
+
+        // 幂等：重复归档不追加审计
+        done(&root, "REQ-001", "寇工").unwrap();
+        let ledger2 = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert_eq!(
+            ledger2.matches("DONE REQ-001").count(),
+            1,
+            "幂等归档不应重复写台账：{}",
+            ledger2
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn done_归档后门禁跳过该需求() {
+        // 脚本选"最新的非 done 需求"做判定：归档未审的 REQ-002 后，
+        // 活跃需求回到已批准的 REQ-001，check 应回到放行。
+        let root = temp_dir("req-done-gate");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        create(&root, None, "已完成").unwrap();
+        for s in ["decomposition", "solution", "testplan"] {
+            review(&root, "REQ-001", s, "寇工", true, "", true).unwrap();
+        }
+        assert!(crate::gate::gate_check(&root).unwrap().is_pass());
+
+        create(&root, None, "进行中").unwrap();
+        assert!(
+            !crate::gate::gate_check(&root).unwrap().is_pass(),
+            "新建未审需求应拦截"
+        );
+
+        done(&root, "REQ-002", "寇工").unwrap();
+        let v = crate::gate::gate_check(&root).unwrap();
+        assert!(
+            v.is_pass(),
+            "归档后应跳过未审需求、回到放行：{}",
+            v.summary()
+        );
+        // 归档掉全部需求 → 门禁回到"无活跃需求"拦截（不是静默放行）
+        done(&root, "REQ-001", "寇工").unwrap();
+        assert!(
+            !crate::gate::gate_check(&root).unwrap().is_pass(),
+            "全部归档后应回到无需求拦截"
+        );
         cleanup(&root);
     }
 }

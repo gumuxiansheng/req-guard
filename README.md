@@ -35,6 +35,9 @@ req-guard status REQ-001
 req-guard comments REQ-001
 
 # 5. 解锁后 AI 方可编写代码；提交时 pre-commit 二次校验
+
+# 6. 需求完成（或中止）后归档——门禁随之跳过该清单
+req-guard done REQ-001 --author 寇工
 ```
 
 ## 审核评论（审核人只评论、不修改）
@@ -93,7 +96,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `done` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
 

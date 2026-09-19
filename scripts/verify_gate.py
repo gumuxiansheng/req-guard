@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """req-guard 拦截脚本真机验证。
 
-从 `src/gate.rs` 抽取 `HOOK_SH`，在临时目录里构造 10 个场景实跑，校验退出码。
+从 `core/src/gate.rs` 抽取 `HOOK_SH`，在临时目录里构造场景实跑，校验退出码。
 脚本必须与仓库一起版本化（原先放在 target/ 下，cargo clean 就丢）。
 
-用法：
+用法:
     python scripts/verify_gate.py
 """
 import json
@@ -185,6 +185,22 @@ CASES = [
         STDIN_AI_WRITE_COMMENTS,
         1,
         {},
+    ),
+    (
+        # 归档（done）需求被跳过：REQ-002 更新且未审但 GATE:HEAD status=done，
+        # 脚本必须跳过它、回到已批准的 REQ-001 → 放行。
+        # 若不跳过会选中 REQ-002（三段 pending）→ 恒拦截，done 命令即失效。
+        "17_归档需求被门禁跳过",
+        make_req("approved"),
+        None,
+        False,
+        None,
+        0,
+        {
+            "REQ-002.md": make_req("pending")
+            .replace("REQ-001", "REQ-002")
+            .replace("status=draft", "status=done")
+        },
     ),
 ]
 
