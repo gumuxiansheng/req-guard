@@ -43,6 +43,13 @@ jobs:
       - name: req-guard check（未过审即失败）
         run: ./req-guard check
 
+      # 编号防冲突（《docs/规范/需求编号防冲突命名规范.md》§8 P1）：同 id 多文件
+      # （slug 不同时 git 零冲突静默双 id）与文件名前缀歧义 → 硬伤退出码 1，CI 红；
+      # 自动编号污染（REQ- 后紧跟长数字）/ 缺 id 标记 → 告警不阻断。
+      # 并行开发团队必挂；单人序贯仓库可删去本步骤。
+      - name: req-guard ids --check（编号防冲突查重）
+        run: ./req-guard ids --check
+
       # L1 静默缺口检出（§4.5）：任一「在用」AI 工具配置缺 hook、缺审批锁标记、
       # 缺核心资产 → 退出码 1，CI 红。新增未知 AI 工具也会在此被要求显式登记。
       - name: req-guard install --verify（工具 hook 就位）

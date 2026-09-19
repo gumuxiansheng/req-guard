@@ -6,7 +6,7 @@
 #   3) 在 Settings → Merge requests 勾选「Pipelines must succeed」，
 #      并在分支保护里禁止直推默认分支——本机 --no-verify 绕过会被服务端抵消。
 #
-# 与 GitHub Actions 版语义完全一致：check 判定 + install --verify 检缺口。
+# 与 GitHub Actions 版语义完全一致：check 判定 + ids --check 编号查重 + install --verify 检缺口。
 # ---------------------------------------------------------------------------
 stages:
   - gate
@@ -30,6 +30,9 @@ req-guard-gate:
   script:
     # L3：硬拦截判定。三段未全批 / 有未解决阻塞评论 / 无清单 → 退出码 1，流水线红。
     - ./req-guard check
+    # 编号防冲突（规范 §8 P1）：同 id 多文件 / 前缀歧义 → 硬伤退出码 1；
+    # 并行开发团队必挂，单人序贯仓库可删去本行。
+    - ./req-guard ids --check
     # L1 静默缺口检出：AI 工具 hook / pre-commit / 核心资产缺失 → 退出码 1。
     - ./req-guard install --verify
   rules:

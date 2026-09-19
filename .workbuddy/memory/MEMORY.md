@@ -45,6 +45,10 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   `selfcheck`（实跑"未过审必拦截、过审必放行"两条路径，无 git 时用最小 `.git` 桩降级并标注）。
 - **CLI 约定：`-p/--path` 等通用选项必须写在子命令之后**（`req-guard status -p <dir>` ✅；
   `req-guard -p <dir> status` ❌ → "未知命令: -p" + 退出码 2）。写脚本文档前先用真二进制试参数顺序。
+- **需求编号防冲突已落地**（2026-09-19）：规范 `docs/规范/需求编号防冲突命名规范.md`（推荐
+  `REQ-<owner>-<YYYYMMDD>-<rrrr>`，owner 花名册唯一、随机段 Crockford32、第二段必须字母开头防
+  next_id 污染）；工具侧 `core/src/idcheck.rs`（`ids --check` 三类检测，硬伤退出码 1 + `create --id`
+  lint 不阻断）已实现并实测，存量 REQ-NNN 不迁移。
 
 ## 关键坑（复用）
 - **egui CollapsingHeader 传 `.open(Some(..))` 后点击被完全忽略**（源码 `if let Some(open) = open {...} else if clicked {toggle}`），

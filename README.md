@@ -96,7 +96,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `done` `status` `list` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `done` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
 

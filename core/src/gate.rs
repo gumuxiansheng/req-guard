@@ -1229,12 +1229,15 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
    二进制，版本与 Release tag 一致（`req-guard -V` 可核对）；
 2. 将该检查设为**必需（required）状态检查**：不通过禁止合并；
 3. 分支保护：禁止直推 `main` 等受保护分支；
-4. 建议追加一步 `req-guard install --verify`：任一在用 AI 工具缺 hook 即红，
+4. 并行开发团队建议追加一步 `req-guard ids --check`：合并后扫描需求编号冲突，
+   同 id 多文件 / 前缀歧义即红（规范详见 `docs/规范/需求编号防冲突命名规范.md`）；
+5. 建议追加一步 `req-guard install --verify`：任一在用 AI 工具缺 hook 即红，
    消除 L1 静默缺口。
 
 **开始接入**：`req-guard install` 已在本项目生成可直接部署的样例
 `.gates/ci/req-guard-ci.yml`（GitHub Actions）——把它复制到 `.github/workflows/`
-并设为必需状态检查即可；该样例同时跑 `req-guard check` 与 `install --verify`。
+并设为必需状态检查即可；该样例同时跑 `req-guard check`、`ids --check`
+与 `install --verify`。
 
 ## 审计台账与摘要（随仓库提交）
 

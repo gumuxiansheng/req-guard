@@ -23,18 +23,24 @@ main:
             fi
 
             # 门禁自举（与 GitHub Actions gate-selfcheck 一致的**工具无关**生命周期）：
-            # 真实验证 install --verify（L1 缺口检出）与 check（L3 硬拦截）两条命令。
+            # 真实验证 install --verify（L1 缺口检出）、check（L3 硬拦截）与
+            # ids --check（编号防冲突）三条命令。
             # 说明：本镜像无 powershell；run_hook 已按编译平台选解释器 → 此处走 sh。
             BIN=$PWD/target/release/req-guard
             P=$(mktemp -d); trap 'rm -rf "$P"' EXIT
             "$BIN" init -p "$P" >/dev/null
             "$BIN" install --verify -p "$P"            # 刚 init 完应全绿
+            "$BIN" ids --check -p "$P"                 # 编号防冲突：空目录应全绿
             if "$BIN" check -p "$P" 2>/dev/null; then echo "未建需求应拦截却放行"; exit 1; fi
             "$BIN" create -t "CNB 自举" -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step decomposition --reviewer 张三 -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step solution      --reviewer 张三 -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step testplan      --reviewer 张三 -p "$P" >/dev/null
             "$BIN" check -p "$P"                        # 全批后应放行
+            # 伪造"同 id 双文件"（slug 不同，git 零冲突静默共存）→ ids --check 应红
+            printf '<!-- GATE:HEAD id=REQ-001 status=draft created=0 -->\n' \
+              > "$P/.gates/requirements/REQ-001-x.md"
+            if "$BIN" ids --check -p "$P" 2>/dev/null; then echo "双 id 应红"; exit 1; fi
             printf '{"other":true}' > "$P/.codebuddy/settings.json"   # 在用工具缺 hook
             if "$BIN" install --verify -p "$P" 2>/dev/null; then echo "缺 hook 应红"; exit 1; fi
             echo "CNB 门禁自举：全部通过"

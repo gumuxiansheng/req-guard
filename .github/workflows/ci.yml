@@ -54,7 +54,8 @@ jobs:
         run: cargo build -p req-guard --release --features gui
 
   # 门禁自举演示（给使用方项目的 CI 样例，见 templates/ci/req-guard-ci.yml）：
-  # 实际验证 install --verify 与 check 两个命令的完整生命周期，并让该样例随 install 生成。
+  # 实际验证 install --verify、check、ids --check 三个命令的完整生命周期，
+  # 并让该样例随 install 生成。
   gate-selfcheck:
     name: gate self-check
     runs-on: ubuntu-latest
@@ -74,6 +75,7 @@ jobs:
           test -f "$P/.gates/ci/req-guard-ci.yml"   # 接入样例随 install 生成
           test -f "$P/.gates/hooks/req-guard-deny.sh"
           "$BIN" install --verify -p "$P"           # 刚 init 完应全绿
+          "$BIN" ids --check -p "$P"                # 编号防冲突：空目录应全绿
 
           # 1) 未创建需求 → check 拦截（退出码 1）
           if "$BIN" check -p "$P" 2>/dev/null; then echo "应拦截却放行"; exit 1; fi
@@ -84,6 +86,12 @@ jobs:
           "$BIN" approve REQ-001 --step solution      --reviewer 张三 -p "$P" >/dev/null
           "$BIN" approve REQ-001 --step testplan      --reviewer 张三 -p "$P" >/dev/null
           "$BIN" check -p "$P"                        # 全批后应放行（退出码 0）
+
+          # 2.5) 伪造"同 id 双文件"（REQ-001-x.md 与已生成的 REQ-001-*.md 同 id、
+          #      slug 不同——git 合并时零冲突静默共存）→ ids --check 应红（退出码 1）
+          printf '<!-- GATE:HEAD id=REQ-001 status=draft created=0 -->\n' \
+            > "$P/.gates/requirements/REQ-001-x.md"
+          if "$BIN" ids --check -p "$P" 2>/dev/null; then echo "双 id 应红"; exit 1; fi
 
           # 3) 在用工具配置存在但缺 hook → install --verify 应红（L1 缺口检出）
           printf '{"other":true}' > "$P/.codebuddy/settings.json"

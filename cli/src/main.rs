@@ -10,6 +10,7 @@ use cli::Action;
 use req_guard_core::comment;
 use req_guard_core::error::{GateError, Result};
 use req_guard_core::gate;
+use req_guard_core::idcheck;
 use req_guard_core::requirement;
 use req_guard_core::status;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,12 @@ fn run(a: &cli::Args) -> Result<()> {
         }
         Action::Create => {
             let title = a.title.as_deref().unwrap_or("");
+            // P3：自定义编号先过写法 lint（提示不阻断，规范 §8；自动编号无此步骤）。
+            if let Some(raw) = a.id.as_deref() {
+                for w in idcheck::lint_id(raw) {
+                    eprintln!("⚠️ 编号提示（不阻断）：{}", w.message);
+                }
+            }
             let r = requirement::create(root, a.id.as_deref(), title)?;
             println!("✅ 已创建需求清单：{} {}", r.id, r.title);
             println!("   文件 : {}", r.path.display());
@@ -185,6 +192,52 @@ fn run(a: &cli::Args) -> Result<()> {
             }
         }
         Action::List => render::print_status(root, None)?,
+        Action::Ids => {
+            if a.check {
+                // P1：三类检测的判定在 core（idcheck::check），这里只渲染与退出码。
+                let issues = idcheck::check(root)?;
+                if issues.is_empty() {
+                    println!("✅ 需求编号防冲突检测通过：无重复 id、无自动编号污染、无前缀歧义");
+                }
+                for i in &issues {
+                    let mark = if i.severity.is_error() {
+                        "✗"
+                    } else {
+                        "⚠️"
+                    };
+                    println!("{} [{}] {}", mark, i.severity.as_str(), i.message);
+                }
+                let errs = issues.iter().filter(|i| i.severity.is_error()).count();
+                let warns = issues.len() - errs;
+                if errs > 0 {
+                    eprintln!(
+                        "共 {} 项硬伤 / {} 项告警；修复硬伤后重跑 req-guard ids --check",
+                        errs, warns
+                    );
+                    std::process::exit(1);
+                } else if warns > 0 {
+                    println!("共 {} 项告警（不阻断）", warns);
+                }
+            } else {
+                // 裸 `ids`：机器可读清单（<id>\t<文件名>），供脚本 grep / CI 汇总。
+                let reqs = requirement::list(root)?;
+                if reqs.is_empty() {
+                    println!("（无需求清单）");
+                }
+                for r in &reqs {
+                    let name = r
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if r.id.is_empty() {
+                        println!("-\t{}", name);
+                    } else {
+                        println!("{}\t{}", r.id, name);
+                    }
+                }
+            }
+        }
         Action::Comments => {
             let id = a.id.as_deref().unwrap_or("");
             if a.refresh_anchors {

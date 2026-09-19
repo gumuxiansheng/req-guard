@@ -6,6 +6,19 @@
 
 ---
 
+## 未发布
+
+**新增**
+
+- 需求编号防冲突（规范《docs/规范/需求编号防冲突命名规范.md》）：`req-guard ids --check`
+  三类检测（同 id 多文件 / 自动编号污染 / 前缀歧义，硬伤退出码 1，可挂 CI / pre-push）；
+  裸 `ids` 输出 `<id>\t<文件名>` 机器可读清单；`create --id` 写法 lint（stderr 提示，不阻断）。
+- CI 样例（GitHub Actions `templates/ci/req-guard-ci.yml`、GitLab
+  `packaging/templates/ci/req-guard-ci.yml.gitlab`）同步加入 `ids --check` 步骤；
+  两条自举流水线（GitHub `gate-selfcheck`、CNB `门禁自举`）补全绿/伪造双 id 应红两条断言。
+
+---
+
 ## v0.1.3（2026-09-18）
 
 **新增**

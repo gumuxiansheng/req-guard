@@ -11,6 +11,7 @@
 //! req-guard done     <需求ID> --author <姓名>      归档需求（拦截随之跳过）
 //! req-guard status   [<需求ID>]          查看清单与解锁状态
 //! req-guard list
+//! req-guard ids [--check]               列出编号；--check 防冲突三类检测
 //! req-guard comments <需求ID> [--refresh-anchors]
 //! req-guard check                       手动执行拦截判定（退出码 0 放行 / 1 拦截）
 //! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
@@ -33,6 +34,9 @@ pub enum Action {
     Done,
     Status,
     List,
+    /// 需求编号工具：`ids` 列出全部编号；`ids --check` 执行防冲突三类检测
+    /// （同 id 多文件 / 自动编号污染 / 前缀歧义，有硬伤退出码 1）。
+    Ids,
     Comments,
     Check,
     Install,
@@ -78,6 +82,8 @@ pub struct Args {
     pub oob: bool,
     /// `install --verify`：只校验门禁就位情况（CI 用），不写入任何文件。
     pub verify: bool,
+    /// `ids --check`：执行编号防冲突三类检测（而非仅列出编号）。
+    pub check: bool,
     /// `ui --gui`：强制图形界面。
     pub gui: bool,
     /// `ui --tui`：强制终端界面。
@@ -131,6 +137,7 @@ fn default_args(action: Action) -> Args {
         token: None,
         oob: false,
         verify: false,
+        check: false,
         gui: false,
         tui: false,
     }
@@ -163,6 +170,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "done" => Action::Done,
         "status" => Action::Status,
         "list" => Action::List,
+        "ids" => Action::Ids,
         "comments" => Action::Comments,
         "check" => Action::Check,
         "install" => Action::Install,
@@ -206,6 +214,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--blocking" => a.blocking = true,
             "--refresh-anchors" => a.refresh_anchors = true,
             "--verify" => a.verify = true,
+            "--check" => a.check = true,
             "--gui" => a.gui = true,
             "--tui" => a.tui = true,
             "--tool" => {
@@ -319,6 +328,8 @@ fn help() -> String {
   done     <需求ID> --author <姓名>    归档需求：拦截随之跳过（AI 禁止调用）\n\
   status   [<需求ID>]        查看三段状态与是否解锁\n\
   list                       列出全部需求\n\
+  ids      [--check]         列出需求编号（<id>\t<文件名>）；--check 防冲突三类检测\n\
+                             （同 id 多文件 / 自动编号污染 / 前缀歧义；硬伤退出码 1，CI 可挂）\n\
   comments <需求ID> [--refresh-anchors]         查看评论 / 重算行号锚点\n\
   check                      手动拦截判定（退出码 0 放行 / 1 拦截）\n\
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
