@@ -36,6 +36,15 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   `scripts/build-release.sh`（5 目标 × 2 变体 + SHA256SUMS）、`.cnb.yml` 的 `"v*": tag_push`
   （`git:release` → 构建 → `cnbcool/attachments` 传 `./dist/*`）、`req-guard -V` 版本自证。
   产物命名 `req-guard[-ui]-<target>[.exe]`；tag 规则 `v<Cargo.toml version>`；镜像 `rust:1.88` + `RUSTUP_TOOLCHAIN=1.88.0`。
+- **可分发发布包已落地**（2026-09-19，提交 `265fce3`/`3e4c79c`）：`packaging/` 存**包内容模板**
+  （README/CHANGELOG/THIRD-PARTY-NOTICES + `docs/` 四份 + `scripts/` 四个脚本的 .sh/.ps1 双份 + CI 模板），
+  `scripts/build-release-local.sh`（Windows 宿主 7 产物）+ `scripts/make-release-package.sh`/`make_release_package.py`
+  组装 `dist/req-guard-v<ver>/` 与 4 个分平台归档。**模板入库、产物不入库**；模板里占位符 `{{VERSION}}` 等由构建脚本注入。
+  对外目录名用人类可读的平台名（`windows-x86_64` / `linux-aarch64`），target 三元组只写进 `VERSION` 的产物清单。
+  包内脚本职责：`install`（选平台变体 + 版本自证 + PATH + 可选 init）/ `uninstall` / `verify-checksums` /
+  `selfcheck`（实跑"未过审必拦截、过审必放行"两条路径，无 git 时用最小 `.git` 桩降级并标注）。
+- **CLI 约定：`-p/--path` 等通用选项必须写在子命令之后**（`req-guard status -p <dir>` ✅；
+  `req-guard -p <dir> status` ❌ → "未知命令: -p" + 退出码 2）。写脚本文档前先用真二进制试参数顺序。
 
 ## 关键坑（复用）
 - **egui CollapsingHeader 传 `.open(Some(..))` 后点击被完全忽略**（源码 `if let Some(open) = open {...} else if clicked {toggle}`），
@@ -70,6 +79,16 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   正则漏判的方向恰好是"看着在拦、其实没拦"。解析下沉到 `core::json`（零依赖递归下降解析器）；
   脚本侧保留正则**兜底**（二进制不在 PATH 时），但兜底不完备属已知降级路径。
 - `cargo clippy -D warnings` 不被识别，正确写法是 `cargo clippy --workspace --all-targets -- -D warnings`。
+- **发布包四条硬约束**（详见 2026-09-19.md）：① windows-msvc 必须 `-C target-feature=+crt-static`
+  （否则依赖 `VCRUNTIME140.dll`，"下载即运行"是假的）；② 执行位必须写进 **tar/zip 归档条目**
+  （Windows 上 `chmod`/`os.chmod` 是空操作，只在本地设权限不会进归档；目录保持 0755，否则解压后进不去）；
+  ③ Python 落盘一律 `newline="\n"`（默认 CRLF 会让 `.sh` 在 Linux 崩、让校验脚本读到 `路径\r` 而全部报 MISSING）；
+  ④ 组装流程**全程不删除文件**（旧快照 `mv` 进 `dist/.trash/`、归档先写 `.tmp` 再 `os.replace`）——
+  环境的批量删除保护会拦 `rm -rf` 甚至 Python 的 `rmtree/unlink`，只有不删才能无人值守跑完。
+- **Windows 宿主跑批处理脚本的通用坑**：Git Bash 的 `/c/...` 传 Windows Python 前要 `cygpath -w`；
+  PowerShell 的 `$psi.ArgumentList` 是 `Collection[string]`（无 `AddRange`，逐个 `Add`）且必须读走 stderr；
+  `& native 2>$null | Out-Null` 会报"无法在管道中间运行文档"；`$env:PROCESSOR_ARCHITECTURE` 可能为空需三级兜底；
+  判换行/编码用 Python 数字节，别用 `grep -c $'\r'`（会误报）。
 
 ## 已知未完成
 - **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
