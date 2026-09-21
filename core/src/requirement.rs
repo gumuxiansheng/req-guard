@@ -1186,12 +1186,12 @@ mod tests {
         // 分层：REQ-001 → misc；REQ-kd-... → 2026
         let by_id: std::collections::HashMap<_, _> =
             archived.iter().map(|a| (a.id.as_str(), &a.dst)).collect();
-        assert!(by_id["REQ-001"]
-            .to_string_lossy()
-            .ends_with("archive/misc/REQ-001.md"));
-        assert!(by_id["REQ-kd-20260919-A7F3"]
-            .to_string_lossy()
-            .ends_with("archive/2026/REQ-kd-20260919-A7F3.md"));
+        // 断言按 `/` 归一后再比对：`Path` 的分隔符是平台相关的，Windows 上 `join` 产出 `\`，
+        // 直接 `ends_with("archive/misc/…")` 会在 Windows 假红（Linux CI 永远看不到）。
+        // 归一方式与 core::gate::is_requirement_doc 的路径处理保持同一约定。
+        let dst_of = |id: &str| by_id[id].to_string_lossy().replace('\\', "/");
+        assert!(dst_of("REQ-001").ends_with("archive/misc/REQ-001.md"));
+        assert!(dst_of("REQ-kd-20260919-A7F3").ends_with("archive/2026/REQ-kd-20260919-A7F3.md"));
 
         // 顶层已被搬空 → list 为空；find 只读回退仍可定位（历史查阅）
         assert!(list(&root).unwrap().is_empty(), "归档后顶层不应再有清单");
