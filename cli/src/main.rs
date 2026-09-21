@@ -183,8 +183,62 @@ fn run(a: &cli::Args) -> Result<()> {
             let r = requirement::done(root, id, &actor)?;
             println!("✅ 已归档：{} {}（操作人 {}）", r.id, r.title, actor);
             println!("   归档后门禁跳过该需求；新的开发请新建清单。");
+            // 触发点：done 成功后自动清扫到期归档（best-effort，失败不影响 done 本身）。
+            match requirement::archive_due(root, &actor, gate::archive_after_days(root), false) {
+                Ok(list) if !list.is_empty() => {
+                    println!(
+                        "   已自动归档 {} 条（done 满 {} 天）：",
+                        list.len(),
+                        gate::archive_after_days(root)
+                    );
+                    for x in &list {
+                        println!("     - {} → {}", x.id, x.dst.display());
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("   ⚠️ 到期归档失败（不影响本次 done）：{}", e),
+            }
+        }
+        Action::Archive => {
+            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")?;
+            let list = match a.id.as_deref() {
+                Some(id) => requirement::archive_one(root, &actor, id, a.dry_run)?,
+                None => requirement::archive_due(
+                    root,
+                    &actor,
+                    gate::archive_after_days(root),
+                    a.dry_run,
+                )?,
+            };
+            if list.is_empty() {
+                if a.dry_run {
+                    println!("没有到期可归档的 done 需求。");
+                } else {
+                    println!("没有到期可归档的 done 需求（archive.after_days 已满足才搬移）。");
+                }
+            } else if a.dry_run {
+                println!("以下需求已到期，执行 archive 将搬入归档区（dry-run 未落盘）：");
+                for x in &list {
+                    println!("  {} → {}", x.id, x.dst.display());
+                }
+            } else {
+                println!("✅ 已归档 {} 条（操作人 {}）：", list.len(), actor);
+                for x in &list {
+                    println!("   - {} → {}", x.id, x.dst.display());
+                }
+            }
         }
         Action::Status => {
+            if a.archived {
+                let reqs = status::req_list_archived(root)?;
+                if reqs.is_empty() {
+                    println!("归档区为空（.gates/requirements/archive/ 下无历史需求）。");
+                } else {
+                    println!("🏛  归档区（{} 条，只读历史）：", reqs.len());
+                    render::print_req_list(&reqs);
+                }
+                return Ok(());
+            }
             let id = a.id.as_deref();
             render::print_status(root, id)?;
             if let Some(i) = id {

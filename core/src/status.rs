@@ -190,6 +190,22 @@ pub fn req_list(root: &Path) -> Result<Vec<ReqStatus>> {
     Ok(out)
 }
 
+/// 列出**归档区**全部需求的状态快照（`req-guard status --archived`）。
+///
+/// 归档区是只读历史，状态全为 [Done]；列出它是为了让人能按年找回已完结需求。
+/// 列表里 hit 到历史文件时路径显示 archive/ 相对位置，便于人工翻阅。
+pub fn req_list_archived(root: &Path) -> Result<Vec<ReqStatus>> {
+    let mut out = Vec::new();
+    for r in requirement::list_archived(root)? {
+        let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
+            path: Some(r.path.clone()),
+            source: e,
+        })?;
+        out.push(build(root, &r, &content)?);
+    }
+    Ok(out)
+}
+
 /// 由清单正文构建状态快照。
 fn build(root: &Path, r: &Requirement, content: &str) -> Result<ReqStatus> {
     let steps: Vec<StepStatus> = STEPS

@@ -32,6 +32,9 @@ pub enum Action {
     Resolve,
     /// 归档需求：整体状态置 done，拦截与 check 随之跳过该需求（AI 禁止调用）。
     Done,
+    /// 到期物理归档：done 满 `archive.after_days` 天的清单搬入
+    /// `.gates/requirements/archive/<年>/`（AI 禁止调用；`done` 后自动触发）。
+    Archive,
     Status,
     List,
     /// 需求编号工具：`ids` 列出全部编号；`ids --check` 执行防冲突三类检测
@@ -88,6 +91,10 @@ pub struct Args {
     pub gui: bool,
     /// `ui --tui`：强制终端界面。
     pub tui: bool,
+    /// `status --archived`：展示归档区历史需求。
+    pub archived: bool,
+    /// `archive --dry-run`：只列出将归档项，不搬移、不写审计。
+    pub dry_run: bool,
 }
 
 pub struct Parsed {
@@ -140,6 +147,8 @@ fn default_args(action: Action) -> Args {
         check: false,
         gui: false,
         tui: false,
+        archived: false,
+        dry_run: false,
     }
 }
 
@@ -168,6 +177,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "comment" => Action::Comment,
         "resolve" => Action::Resolve,
         "done" => Action::Done,
+        "archive" => Action::Archive,
         "status" => Action::Status,
         "list" => Action::List,
         "ids" => Action::Ids,
@@ -217,6 +227,8 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--check" => a.check = true,
             "--gui" => a.gui = true,
             "--tui" => a.tui = true,
+            "--archived" => a.archived = true,
+            "--dry-run" => a.dry_run = true,
             "--tool" => {
                 let v = next(&mut it, "--tool")?;
                 for p in v.split(',') {
@@ -326,7 +338,11 @@ fn help() -> String {
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
   resolve  <需求ID> <评论ID> --author <姓名>    关闭评论（AI 禁止调用）\n\
   done     <需求ID> --author <姓名>    归档需求：拦截随之跳过（AI 禁止调用）\n\
-  status   [<需求ID>]        查看三段状态与是否解锁\n\
+  archive  [<需求ID>] --author <姓名> [--dry-run]\n\
+                                     到期物理归档：done 满 archive.after_days 天的\n\
+                                     清单搬入 archive/<年>/（done 成功后自动触发；\n\
+                                     此命令用于手动补扫；--dry-run 只预览不搬移）\n\
+  status   [<需求ID>] [--archived]   查看三段状态与是否解锁；--archived 展示归档历史\n\
   list                       列出全部需求\n\
   ids      [--check]         列出需求编号（<id>\t<文件名>）；--check 防冲突三类检测\n\
                              （同 id 多文件 / 自动编号污染 / 前缀歧义；硬伤退出码 1，CI 可挂）\n\

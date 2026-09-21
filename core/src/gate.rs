@@ -224,6 +224,42 @@ pub fn strict_order(root: &Path) -> bool {
     true
 }
 
+/// 读取 `.gates/req-guard.yaml` 的 `archive.after_days`（缺省 **30**）。
+///
+/// 与 [`strict_order`] 同为零依赖逐行解析：只在 `archive:` 区块内匹配 `after_days:`。
+/// 语义：done 满 N 天后，`req-guard done` 成功时自动物理归档；`0` = done 即归档。
+pub fn archive_after_days(root: &Path) -> u32 {
+    let path = root.join(".gates/req-guard.yaml");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return 30;
+    };
+    let mut in_archive = false;
+    let mut found: Option<u32> = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == "archive:" {
+            in_archive = true;
+            continue;
+        }
+        if in_archive {
+            if line.starts_with(' ') {
+                if let Some(v) = t.strip_prefix("after_days:") {
+                    let v = v.split('#').next().unwrap_or("").trim();
+                    if let Ok(n) = v.parse::<u32>() {
+                        found = Some(n); // 重复键：后者覆盖前者（贴合常见 YAML 语义）
+                    }
+                }
+            } else if !t.is_empty() {
+                in_archive = false; // 缩进结束，离开 archive 区块
+            }
+        }
+    }
+    found.unwrap_or(30)
+}
+
 /// 内置 AI 工具配置映射（借鉴 teamai：声明式注入各工具**原生**配置）。
 ///
 /// 各工具 hook schema 存在差异（尤其事件名、matcher、拦截语义）——必须注入
@@ -290,9 +326,17 @@ pub fn known_tools() -> Vec<&'static str> {
     TOOL_PROFILES.iter().map(|t| t.name).collect()
 }
 
-/// 默认注入的工具（本机以 WorkBuddy/CodeBuddy 为主，同时覆盖 Claude Code）。
+/// 默认注入的工具：**全部内置 profile**（claude / codebuddy / codex / cursor）。
+///
+/// L1 覆盖的边界要诚实：只有能注册 PreToolUse 式 hook 的工具才能被 L1 拦到；
+/// 无 hook 机制的 agent（Copilot/Trae/Gemini 等）不在 profile 内，只能靠 L2/L3 兜底。
 pub fn default_tools() -> Vec<String> {
-    vec!["claude".to_string(), "codebuddy".to_string()]
+    vec![
+        "claude".to_string(),
+        "codebuddy".to_string(),
+        "codex".to_string(),
+        "cursor".to_string(),
+    ]
 }
 
 /// 校验工具名合法。
@@ -361,6 +405,17 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
 
     append_pre_commit(root, &mut created, &mut notes)?;
     append_gitignore(root, &mut created, &mut notes)?;
+
+    // L3 强提示：enforce.ci 默认 true，但 install 不会替用户写 CI 编排（那是仓库配置），
+    // 未接入时提示人工接入——避免"装完只有两层"的默认现状被误当作三层已齐。
+    if !verify_ci(root).is_empty() {
+        notes.push(
+            "L3 提示：未检测到 CI 编排调用 req-guard——请把 .gates/ci/req-guard-ci.yml \
+             复制进 CI（如 .github/workflows/）并设为必需状态检查，或在 req-guard.yaml \
+             显式设 enforce.ci: false 声明放弃"
+                .into(),
+        );
+    }
 
     if verbose {
         for n in &notes {
@@ -674,6 +729,20 @@ pub fn pretool_verdict(root: &Path, payload: &str) -> PretoolVerdict {
         ));
     }
 
+    // 1.5) 归档区彻底禁写：已归档是生命周期终点，任何修改都破坏历史证据链
+    //（必须在 is_requirement_doc 之前——否则 archive/ 路径会当"清单正文"放行）。
+    if fp
+        .replace('\\', "/")
+        .contains(".gates/requirements/archive/")
+    {
+        audit(root, &format!("BLOCK-AI-WRITE-ARCHIVE {}", fp));
+        return PretoolVerdict::Block(format!(
+            "归档需求禁止 AI 修改（历史证据不可变）：{}\n\
+             归档区是只读历史，请以新需求清单承接后续改动",
+            fp
+        ));
+    }
+
     // 2) 清单正文：允许 AI 写，但**状态行一个字都不许变**（防自批）
     if is_requirement_doc(&fp) {
         return match doc_write_guard(root, &fp, payload) {
@@ -910,6 +979,93 @@ sh .gates/hooks/req-guard-check.sh || exit 1
 /// `.gitignore` 需要忽略的门禁本机运行态文件。
 pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
 
+/// 读取 `.gates/req-guard.yaml` 的 `enforce.ci` 开关（缺省 **true**，fail-closed）。
+///
+/// 与 [`strict_order`] 同为零依赖逐行解析：只在 `enforce:` 区块内匹配 `ci:`，
+/// 避免误读文件其他位置的同名键。
+fn enforce_ci(root: &Path) -> bool {
+    let path = root.join(".gates/req-guard.yaml");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return true;
+    };
+    let mut in_enforce = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == "enforce:" {
+            in_enforce = true;
+            continue;
+        }
+        if in_enforce {
+            if line.starts_with(' ') {
+                if let Some(v) = t.strip_prefix("ci:") {
+                    // 值可能带行内注释（模板即 `ci: true   # ...`），先按 `#` 截断再判定。
+                    let v = v.split('#').next().unwrap_or("").trim();
+                    return !v.eq_ignore_ascii_case("false");
+                }
+            } else if !t.is_empty() {
+                in_enforce = false; // 缩进结束，离开 enforce 区块
+            }
+        }
+    }
+    true
+}
+
+/// L3 CI 接入体检：`enforce.ci` 默认 true，仓库就必须有 CI 编排**实际调用** `req-guard`，
+/// 否则本机的任何绕过（含 `git commit --no-verify`）在服务端无人抵消，"三层"实际只剩两层。
+///
+/// 覆盖常见编排位置：GitHub Actions（`.github/workflows/*.yml`）、GitLab（`.gitlab-ci.yml`）、
+/// CircleCI（`.circleci/config.yml`）、CNB（`.cnb.yml`）。判定宽松：编排内容含 `req-guard`
+/// 即视为已接入（门禁 job 的注释/命令均含该字样，宽松匹配避免把已接入误判为缺口）。
+/// 显式 `enforce.ci: false` 时不体检（声明放弃 L3）。
+fn verify_ci(root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !enforce_ci(root) {
+        return problems;
+    }
+    let mut orchs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(root.join(".github/workflows")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_yaml = matches!(p.extension().and_then(|x| x.to_str()), Some("yml" | "yaml"));
+            if is_yaml {
+                orchs.push(p);
+            }
+        }
+    }
+    for rel in [".gitlab-ci.yml", ".circleci/config.yml", ".cnb.yml"] {
+        let p = root.join(rel);
+        if p.exists() {
+            orchs.push(p);
+        }
+    }
+    if orchs.is_empty() {
+        problems.push(
+            "未检测到任何 CI 编排文件（.github/workflows/、.gitlab-ci.yml、.circleci/、.cnb.yml）\
+             ——L3 未落地：enforce.ci 默认 true，AI 在本机 --no-verify 将无人兜底；\
+             请把 .gates/ci/req-guard-ci.yml 复制进 CI 目录并设为必需状态检查，\
+             或显式设 enforce.ci: false 声明放弃"
+                .into(),
+        );
+        return problems;
+    }
+    if !orchs.iter().any(|p| {
+        fs::read_to_string(p)
+            .map(|c| c.contains("req-guard"))
+            .unwrap_or(false)
+    }) {
+        let names: Vec<String> = orchs.iter().map(|p| p.display().to_string()).collect();
+        problems.push(format!(
+            "存在 CI 编排（{}）但未调用 req-guard——L3 缺口：本机绕过（含 --no-verify）\
+             服务端无人抵消；把 .gates/ci/req-guard-ci.yml 复制进编排并设为必需状态检查",
+            names.join(", ")
+        ));
+    }
+    problems
+}
+
 /// `req-guard install --verify`：校验门禁是否真正就位（§4.5，供 CI 使用）。
 ///
 /// 返回**问题清单**：空 = 全部通过；非空 = 存在"静默缺口"，CI 应据此红。
@@ -919,7 +1075,8 @@ pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
 /// - env 注入型工具（如 claude）缺 [`crate::auth::AI_CTX_ENV`] → 审批锁缺口；
 /// - 有 `.git` 但 pre-commit 未含拦截 → **L2 缺口**；
 /// - 有 `.git` 且 pre-commit 已接入但**缺执行位** → **L2 静默失效**（类 Unix 上
-///   git 会跳过不可执行钩子，内容再对也不会拦）。
+///   git 会跳过不可执行钩子，内容再对也不会拦）；
+/// - `enforce.ci` 默认 true 但无 CI 编排调用 `req-guard` → **L3 缺口**（§4.3）。
 ///
 /// 未安装（配置不存在）的工具不要求——不制造噪音；未知新工具出现时，
 /// 由团队把它登记进 `TOOL_PROFILES` 后纳入校验白名单。
@@ -983,6 +1140,10 @@ pub fn verify_install(root: &Path) -> Vec<String> {
             }
         }
     }
+
+    // L3 CI 接入体检（§4.3）：enforce.ci 默认 true——必须真有 CI 编排调用 req-guard，
+    // 否则样例没复制出去时"默认三层"实际只有两层（本机任何绕过服务端无人抵消）。
+    problems.extend(verify_ci(root));
 
     problems
 }
@@ -1156,6 +1317,12 @@ bypass:
   enabled: true
   default_ttl_minutes: 60
   require_reason: true
+
+# 到期自动归档：done 满 N 天后，req-guard done 成功时自动把清单
+# 物理搬入 .gates/requirements/archive/<创建年份>/（无日期段 → misc/）
+# 0 = done 即刻归档；手动补扫：req-guard archive
+archive:
+  after_days: 30
 "#;
 
 /// `.gates/README.md`：门禁使用说明（随项目生成，便于新成员自助）。
@@ -1195,10 +1362,27 @@ req-guard status REQ-001
 # 5. 解锁后 AI 才可编写代码
 
 # 6. 需求完成（或中止）后归档——门禁随之跳过该清单
+#    done 满 archive.after_days 天（默认 30）后，下次 done 时自动物理归档；
+#    手动补扫：req-guard archive --author <姓名>（--dry-run 先预览）
 req-guard done REQ-001 --author 张三
+
+# （可选）查看归档历史
+req-guard status --archived
 ```
 
 打回：`req-guard reject REQ-001 --step solution --reviewer 张三 --reason "缺少回滚方案"`
+
+## 到期归档（done 满 N 天后自动搬入 archive/）
+
+需求文档会越积越多，全部平铺在 `.gates/requirements/` 会让 `status`/`list` 越来越长。
+`req-guard done` 成功后，系统自动扫描 done 满 `archive.after_days` 天（默认 30，
+可在 `.gates/req-guard.yaml` 的 `archive.after_days` 调整）的清单，**成对搬移**
+（清单 + 评论）到 `.gates/requirements/archive/<创建年份>/`（无日期段 → `misc/`）：
+
+- 归档区是**只读历史**：拦截脚本、`list`、自动编号都不再看它，但 `status`/`comments`
+  仍可按 id 查到（`req-guard status REQ-001`、`req-guard status --archived`）；
+- 归档**不复号**：`create` 自动编号会跳过归档区已用过的 `REQ-NNN`；
+- AI 不得修改归档区文件（原样保留历史证据）。
 
 ## 审批锁：approve / resolve / done / bypass 须人类执行
 
@@ -1219,6 +1403,11 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 
 绕过窗口内放行，但**每次都写审计日志** `.gates/audit/gate-audit.log`。
 `.gates/.bypass` 已被 `.gitignore` 忽略，不会入库。
+
+**人肉开发场景**：typo 修正、文档笔误、线上热修、临时试改等不值得建 REQ 的改动，
+可直接 `bypass --reason <原因> --ttl <分钟>`（默认 60 分钟，到期自动失效）。
+但 bypass 是**应急阀不是常规通道**——功能与架构改动必须先建 REQ 走三段审核；
+事后请补建需求并 `req-guard done <REQ-ID> --author <姓名>` 归档，把账还上。
 
 ## L3 CI 强制门禁（部署规范）
 
@@ -1618,6 +1807,23 @@ mod tests {
     }
 
     #[test]
+    fn archive_after_days_读yaml且缺省30() {
+        let root = temp_dir("arch-days");
+        assert_eq!(archive_after_days(&root), 30, "缺文件时默认 30 天");
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        let y = root.join(".gates/req-guard.yaml");
+        fs::write(&y, "archive:\n  after_days: 7\n").unwrap();
+        assert_eq!(archive_after_days(&root), 7);
+        fs::write(&y, "archive:\n  after_days: 0  # done 即归档\n").unwrap();
+        assert_eq!(archive_after_days(&root), 0, "行内注释应先截断再解析");
+        fs::write(&y, "archive:\n  after_days: 0 # 注释\n  after_days: 9\n").unwrap();
+        assert_eq!(archive_after_days(&root), 9, "后者覆盖前者");
+        fs::write(&y, "archive: false\n").unwrap();
+        assert_eq!(archive_after_days(&root), 30, "非键值不得命中");
+        cleanup(&root);
+    }
+
+    #[test]
     fn 拦截脚本排除评论文件() {
         assert!(
             HOOK_SH.contains(r"grep -v '\.comments\.md$'"),
@@ -1890,6 +2096,13 @@ mod tests {
         // 就会在另一平台上虚报 L1 缺口 / 凭空提示"请手工合并"。
         let root = temp_dir("cross-platform");
         install(&root, &["claude".to_string()], false).unwrap();
+        let wf = root.join(".github/workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(
+            wf.join("req-guard-ci.yml"),
+            "name: gate\nrun: req-guard check\n",
+        )
+        .unwrap();
 
         let cfg = root.join(".claude/settings.json");
         for rel in [HOOK_SH_REL, HOOK_PS1_REL] {
@@ -1929,11 +2142,18 @@ mod tests {
         // 1) 未安装：核心资产缺失即报
         assert!(!verify_install(&root).is_empty());
 
-        // 2) 正常安装（claude：hook + env 齐备）→ 全绿
+        // 2) 正常安装（claude：hook + env 齐备）+ 接入 CI 编排 → 全绿
         install(&root, &["claude".to_string()], false).unwrap();
+        let wf = root.join(".github/workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(
+            wf.join("req-guard-ci.yml"),
+            "name: gate\nrun: req-guard check\n",
+        )
+        .unwrap();
         assert!(
             verify_install(&root).is_empty(),
-            "刚装完应通过：{:?}",
+            "刚装完且已接 CI 应通过：{:?}",
             verify_install(&root)
         );
 
@@ -2194,6 +2414,29 @@ mod tests {
     }
 
     #[test]
+    fn pretool_归档区彻底禁写() {
+        let root = temp_dir("pretool-archive");
+        // 归档区路径即使只是写正文（状态行未变）也必须拦——读档案是历史，写不行
+        let payload = r#"{"tool_input":{"file_path":".gates/requirements/archive/2026/REQ-001.md","content":"新正文"}}"#;
+        match pretool_verdict(&root, payload) {
+            PretoolVerdict::Block(reason) => {
+                assert!(reason.contains("归档"), "原因应点明归档区：{}", reason)
+            }
+            other => panic!("归档区写入必须拦截，实际：{:?}", other),
+        }
+        // Windows 反斜杠路径同样拦截
+        let win = r#"{"tool_input":{"file_path":".gates\\requirements\\archive\\misc\\REQ-001.md","content":"x"}}"#;
+        assert!(matches!(
+            pretool_verdict(&root, win),
+            PretoolVerdict::Block(_)
+        ));
+        // 拦截留痕
+        let log = fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap();
+        assert!(log.contains("BLOCK-AI-WRITE-ARCHIVE"), "{}", log);
+        cleanup(&root);
+    }
+
+    #[test]
     fn pretool_清单正文可写但状态行不可改() {
         let root = temp_dir("pretool-doc");
         let rel = ".gates/requirements/REQ-001.md";
@@ -2316,10 +2559,17 @@ mod tests {
         let root = temp_dir("hook-mode");
         fs::create_dir_all(root.join(".git/hooks")).unwrap();
         install(&root, &["none".to_string()], false).unwrap();
+        let wf = root.join(".github/workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(
+            wf.join("req-guard-ci.yml"),
+            "name: gate\nrun: req-guard check\n",
+        )
+        .unwrap();
 
         assert!(
             verify_install(&root).is_empty(),
-            "刚装完不应有缺口：{:?}",
+            "刚装完且已接 CI 不应有缺口：{:?}",
             verify_install(&root)
         );
         assert!(
@@ -2362,7 +2612,14 @@ mod tests {
         let root = temp_dir("verify-mode");
         fs::create_dir_all(root.join(".git/hooks")).unwrap();
         install(&root, &["none".to_string()], false).unwrap();
-        assert!(verify_install(&root).is_empty(), "刚装完应全绿");
+        let wf = root.join(".github/workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(
+            wf.join("req-guard-ci.yml"),
+            "name: gate\nrun: req-guard check\n",
+        )
+        .unwrap();
+        assert!(verify_install(&root).is_empty(), "刚装完且已接 CI 应全绿");
 
         let hook = root.join(".git/hooks/pre-commit");
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o644)).unwrap();
@@ -2373,5 +2630,110 @@ mod tests {
             problems
         );
         cleanup(&root);
+    }
+
+    #[test]
+    fn verify_install_检出ci未接入() {
+        let root = temp_dir("verify-ci");
+        install(&root, &["none".to_string()], false).unwrap();
+
+        // 1) 无任何 CI 编排 → L3 未落地（红）
+        let p = verify_install(&root);
+        assert!(
+            p.iter().any(|x| x.contains("L3")),
+            "无编排必须检出：{:?}",
+            p
+        );
+
+        // 2) 有编排但不含 req-guard → 红（L3 缺口：有 CI 却漏接）
+        let wf = root.join(".github/workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(wf.join("other.yml"), "name: build\non: [push]\n").unwrap();
+        let p = verify_install(&root);
+        assert!(
+            p.iter()
+                .any(|x| x.contains("L3") && x.contains("req-guard")),
+            "编排不含 req-guard 必须检出：{:?}",
+            p
+        );
+
+        // 3) 接入后（编排含 req-guard）→ CI 项通过，无 L3 缺口
+        fs::write(
+            wf.join("req-guard-ci.yml"),
+            "name: gate\non: [push]\nsteps:\n  - run: req-guard check\n",
+        )
+        .unwrap();
+        let p = verify_install(&root);
+        assert!(
+            p.iter().all(|x| !x.contains("L3")),
+            "接入后不应有 L3 缺口：{:?}",
+            p
+        );
+
+        // 4) 显式 enforce.ci: false → 声明放弃 L3，不体检
+        fs::remove_dir_all(&wf).unwrap();
+        fs::write(
+            root.join(".gates/req-guard.yaml"),
+            "version: 1\nenforce:\n  ci: false\n",
+        )
+        .unwrap();
+        let p = verify_install(&root);
+        assert!(
+            p.iter().all(|x| !x.contains("L3")),
+            "显式放弃后不得报 L3：{:?}",
+            p
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn enforce_ci_读yaml且缺省fail_closed() {
+        let root = temp_dir("enforce-ci");
+        assert!(enforce_ci(&root), "缺文件时应 fail-closed = true");
+
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        fs::write(
+            root.join(".gates/req-guard.yaml"),
+            "version: 1\nenforce:\n  ai_tool_hook: true\n  ci: false\n",
+        )
+        .unwrap();
+        assert!(!enforce_ci(&root));
+
+        fs::write(
+            root.join(".gates/req-guard.yaml"),
+            "version: 1\nenforce:\n  ci: true\n",
+        )
+        .unwrap();
+        assert!(enforce_ci(&root));
+
+        // 模板真实形态：值带行内注释（`ci: false   # 说明`）——注释不得参与判定
+        fs::write(
+            root.join(".gates/req-guard.yaml"),
+            "version: 1\nenforce:\n  ai_tool_hook: true   # AI 工具 PreToolUse\n  ci: false             # CI 侧拦截\n",
+        )
+        .unwrap();
+        assert!(!enforce_ci(&root), "行内注释后的 false 必须被识别");
+
+        // enforce 区块外的同名键不参与判定（未声明时 fail-closed = true）
+        fs::write(
+            root.join(".gates/req-guard.yaml"),
+            "version: 1\nci: false\nenforce:\n  pre_commit: true\n",
+        )
+        .unwrap();
+        assert!(enforce_ci(&root), "enforce 外 ci 键不得干扰判定");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn default_tools_覆盖全部内置工具() {
+        let def = default_tools();
+        for t in known_tools() {
+            assert!(
+                def.iter().any(|d| d == t),
+                "默认注入应覆盖 {}（实际：{:?}）",
+                t,
+                def
+            );
+        }
     }
 }

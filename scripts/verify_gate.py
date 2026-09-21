@@ -117,7 +117,10 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
     if comments:
         (work / REQ_DIR / "REQ-001.comments.md").write_text(comments, encoding="utf-8")
     for fname, content in (extra or {}).items():
-        (work / REQ_DIR / fname).write_text(content, encoding="utf-8")
+        # extra 键可为相对 REQ_DIR 的子路径（如 archive/2026/REQ-00x.md）
+        dst = work / REQ_DIR / fname
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="utf-8")
     if bypass:
         expires = int(time.time()) + 3600
         (work / ".gates" / ".bypass").write_text(
@@ -200,6 +203,22 @@ CASES = [
             "REQ-002.md": make_req("pending")
             .replace("REQ-001", "REQ-002")
             .replace("status=draft", "status=done")
+        },
+    ),
+    (
+        # 到期物理归档后的子目录（archive/<年>/）必须被脚本**无视**：
+        # 文件未审（pending）但只要在子目录里就不该被选为活跃需求。
+        # 若 `ls | grep '\.md$'` 递归进子目录 → 会选中它 → 恒拦截，
+        # 归档功能就把自己锁死了（方案选子目录正是因为四处扫描点都不递归）。
+        "18_归档子目录不干扰活跃需求定位",
+        make_req("approved"),
+        None,
+        False,
+        None,
+        0,
+        {
+            "archive/2026/REQ-003.md": make_req("pending")
+            .replace("REQ-001", "REQ-003")
         },
     ),
 ]

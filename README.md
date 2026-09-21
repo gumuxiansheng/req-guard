@@ -37,8 +37,24 @@ req-guard comments REQ-001
 # 5. 解锁后 AI 方可编写代码；提交时 pre-commit 二次校验
 
 # 6. 需求完成（或中止）后归档——门禁随之跳过该清单
+#    done 满 archive.after_days 天（默认 30，见 .gates/req-guard.yaml）后自动物理归档；
+#    手动补扫：req-guard archive --author 寇工（--dry-run 先预览）
 req-guard done REQ-001 --author 寇工
+
+# （可选）查看归档历史
+req-guard status --archived
 ```
+
+## 到期归档：需求文档不再无限膨胀
+
+全部需求平铺在 `.gates/requirements/` 会让 `status`/`list` 越滚越长。`req-guard done`
+成功后自动扫描 done 满 `archive.after_days`（默认 30）天的清单，把**清单 + 评论**
+成对搬入 `.gates/requirements/archive/<创建年份>/`（无日期段 → `misc/`）：
+
+- 归档区是**只读历史**：拦截脚本、`list`、自动编号都不再看它；`status`/`comments`
+  仍可按 id 查询（`req-guard status REQ-001`）；
+- 归档**不复号**：自动编号跳过归档区已用过的 `REQ-NNN`（id 是永久主键）；
+- AI 工具无法写入归档区（原样保留历史证据，`hook-check` 直接拦截）；
 
 ## 审核评论（审核人只评论、不修改）
 
@@ -60,23 +76,37 @@ req-guard resolve REQ-001 C001 --author 寇工
 req-guard comments REQ-001 --refresh-anchors
 ```
 
-## 应急绕过
+## 应急绕过（有痕、有时效）
 
 ```bash
-req-guard bypass --reason "线上热修，事后补审" --ttl 60   # 有痕、有时效
+req-guard bypass --reason "线上热修，事后补审" --ttl 60   # 有痕、有时效（默认 60 分钟）
 req-guard check                                            # 手动判定（CI 用）
 ```
+
+**人肉开发什么时候该用**：bypass 是为**不打算走完整审核**的改动准备的应急阀——
+单行 typo / 文档笔误 / 线上热修 / 实验性试改等，为它们建 REQ 是小题大做。
+但它是**应急阀，不是常规通道**：功能开发、架构改动、任何可能长期存在的代码，
+必须先建 REQ 走三段审核，事后补 REQ 是例外不是常态。
+
+- 每次绕过强制审计：原因（`--reason` 必填）+ 时效（`--ttl`，默认 60 分钟，到期自动失效）
+  全部入 `audit/gate-audit.log` 与入库台账 `ledger.md`；
+- 事后请补建 REQ 并归档（`req-guard done <REQ-ID> --author <姓名>`），把账还上；
+- 高频使用（每周数次）是流程失控信号：说明需求拆分或审核节拍出了问题，
+  先修流程而不是继续绕。
 
 ## 合规部署（三层 + 锁）
 
 ```bash
-req-guard install --verify   # 校验资产 / 各 AI 工具 hook / pre-commit 就位（CI 步骤，缺口退出码 1）
+req-guard install --verify   # 校验资产 / AI 工具 hook / pre-commit / CI 接入就位（CI 步骤，缺口退出码 1）
 req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gates/audit/DIGEST
 ```
 
 - **L2 fail-closed**：`.gates/hooks/req-guard-check.sh` 缺失时 `git commit` 被阻止（非静默放行）
-- **L3 默认开启**：`enforce.ci: true`——流水线调 `req-guard check` 并设为必需状态检查 + 分支保护
-- **工具原生 schema**：为 claude / codebuddy / codex / cursor 各自注入原生 hook 配置；
+- **L3 默认开启**：`enforce.ci: true`——流水线调 `req-guard check` 并设为必需状态检查 + 分支保护；
+  `install --verify` 会**体检 CI 是否真接入**（无编排或编排未调用 req-guard 即红；可显式 `enforce.ci: false` 放弃）
+- **工具原生 schema**：默认注入全部内置工具 claude / codebuddy / codex / cursor，各自注入
+  原生 hook 配置（`install --tool` 可指定子集）；无 PreToolUse 机制的 agent（Copilot / Trae 等）
+  **无法被 L1 拦到**，只能靠 L2/L3 兜底；
   Codex/Cursor 走 deny 包装（exit 2）适配其拦截语义，CodeBuddy 已修正为 `.codebuddy/settings.json`
 - **审批锁（方案 A）**：Claude Code / CodeBuddy 会话注入 `REQ_GUARD_AI_CTX=1`（配置 `env` 段），
   `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批
@@ -96,7 +126,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `done` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
 
@@ -133,10 +163,11 @@ GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段�
 ```
 .gates/
 ├── req-guard.yaml               # 门禁声明
-├── requirements/                # REQ-00N-*.md 清单 + *.comments.md 评论
+├── requirements/                # 活跃：REQ-00N-*.md 清单 + *.comments.md 评论
+├── requirements/archive/<年>/   # 到期归档（done 满 N 天自动搬入；misc/ 存无日期段）
 ├── hooks/req-guard-check.{sh,ps1}   # 拦截脚本（Claude/CodeBuddy 直连）
 ├── hooks/req-guard-deny.{sh,ps1}    # deny 包装：Codex/Cursor 拦截编码转 exit 2
-├── ci/req-guard-ci.yml          # L3 接入样例（GitHub Actions），复制进 .github/workflows/
+├── ci/req-guard-ci.yml          # L3 接入样例（GitHub Actions），复制进 .github/workflows/；install 未接 CI 会提示，--verify 未接入即红
 └── audit/gate-audit.log         # 审计（不入库）
 ```
 

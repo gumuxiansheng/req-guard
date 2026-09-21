@@ -18,10 +18,15 @@ pub fn print_status(root: &Path, id: Option<&str>) -> Result<()> {
         println!("  创建：req-guard create -t \"<需求标题>\"");
         return Ok(());
     }
-    for r in &reqs {
+    print_req_list(&reqs);
+    Ok(())
+}
+
+/// 渲染一批状态卡片（活跃列表与 `--archived` 归档列表共用）。
+pub fn print_req_list(reqs: &[ReqStatus]) {
+    for r in reqs {
         print_one(r);
     }
-    Ok(())
 }
 
 /// 渲染单条需求的状态卡片。
