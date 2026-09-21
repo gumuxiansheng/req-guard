@@ -1,6 +1,6 @@
 [package]
 name = "req-guard-gui"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "req-guard 桌面门禁管理台（eframe / egui）"
 

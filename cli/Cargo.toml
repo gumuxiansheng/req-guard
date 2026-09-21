@@ -1,6 +1,6 @@
 [package]
 name = "req-guard"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "AI 需求门禁：三段清单审核（需求分解/技术方案/测试计划）+ 硬拦截"
 

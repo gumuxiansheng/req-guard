@@ -28,7 +28,7 @@ jobs:
       #   A. 从官方 Release 拉取（推荐）：版本号与仓库 .gates 所需版本对齐
       - name: 下载 req-guard（Release）
         run: |
-          VER=0.1.0   # TODO: 改为你要使用的版本（见 Cargo.toml version / Release tag）
+          VER=0.1.4   # TODO: 改为你要使用的版本（见 Cargo.toml version / Release tag）
           curl -fsSL -o req-guard \
             "https://github.com/<owner>/<repo>/releases/download/v${VER}/req-guard-x86_64-unknown-linux-musl"
           chmod +x req-guard

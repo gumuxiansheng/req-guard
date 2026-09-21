@@ -6,7 +6,7 @@
 
 ---
 
-## 未发布
+## v0.1.4（2026-09-21）
 
 **新增**
 
@@ -16,6 +16,13 @@
 - CI 样例（GitHub Actions `templates/ci/req-guard-ci.yml`、GitLab
   `packaging/templates/ci/req-guard-ci.yml.gitlab`）同步加入 `ids --check` 步骤；
   两条自举流水线（GitHub `gate-selfcheck`、CNB `门禁自举`）补全绿/伪造双 id 应红两条断言。
+
+**改进**
+
+- 版本号统一到 `0.1.4`：根 `Cargo.toml` 的 `[workspace.package] version` 与
+  core / cli / tui / gui 四个成员 crate 对齐；两份 CI 接入样例的版本占位同步更新，
+  避免下游按旧版本号拉取不存在的 Release 附件。
+  发布包的 `-V` 输出 / `VERSION` / 归档名三处自证仍由构建脚本从 `Cargo.toml` 注入。
 
 ---
 

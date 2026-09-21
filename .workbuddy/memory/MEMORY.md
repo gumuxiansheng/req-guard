@@ -15,6 +15,12 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   根目录只留 `README.md`（项目入口）；`.workbuddy/memory/` 是 AI 工作记忆，不并入 docs。
   新文档只进对应分类；**引用代码位置写"文件名 + 符号名"，不写行号**（行号必然腐坏）；
   验证数字（用例/场景数）只记快照日期，以实跑为准。
+- **版本号唯一真相 = 根 `Cargo.toml` 的 `[workspace.package] version`**，但 4 个成员 crate
+  （core/cli/tui/gui）的 `version` 是**硬编码**而非 `version.workspace = true` → bump 必须 5 处一起改；
+  再加 `Cargo.lock`（构建自刷）+ 两份 CI 样例（`templates/ci/req-guard-ci.yml` 的 `VER`、
+  `packaging/templates/ci/*.gitlab` 的 `REQ_GUARD_VERSION`）+ `packaging/CHANGELOG.md`。
+  发布包文档一律 `{{VERSION}}` 占位符，由 `scripts/make-release-package.sh` 从 Cargo.toml 解析注入，
+  **不要手改**。（2026-09-21 统一到 v0.1.4）
 
 ## 已完成（截至 2026-09-12）
 - **workspace 已拆分**：`core`（零依赖 lib）/ `cli`（唯一 bin）/ `tui`（lib）/ `gui`（lib）；
@@ -51,6 +57,10 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   lint 不阻断）已实现并实测，存量 REQ-NNN 不迁移。
 
 ## 关键坑（复用）
+- **测试里比较"路径后缀"必须先归一分隔符**：`Path::to_string_lossy().ends_with("a/b/c")`
+  在 Linux 绿、**Windows 必红**（`join` 产出 `\`）。断言前 `.replace('\\', "/")`
+  （生产代码里 `gate::is_requirement_doc` 已是这个约定）。2026-09-21 修过一次此类假红，
+  原因是 Windows 本地很少跑全量 `cargo test --workspace`，CI 在 Linux 上永远看不见。
 - **egui CollapsingHeader 传 `.open(Some(..))` 后点击被完全忽略**（源码 `if let Some(open) = open {...} else if clicked {toggle}`），
   要"选中段展开"必须自己接管 `header_response.clicked()`；批准/打回后要前进光标到下一个未通过段；已通过段不显示审核按钮。
 - **GUI 真机点击验证（Windows）**：PowerShell Add-Type 被安全策略拦 → Python venv + ctypes；
