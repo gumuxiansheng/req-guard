@@ -18,15 +18,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    env:
-      # ubuntu-latest 没有 X11/Wayland 系统库，而 gui 的 eframe 关掉了 default-features
-      # （默认的 x11 / wayland 后端未启用）→ Linux 上编 winit 必报
-      #   "The platform you're compiling for is not supported by winit"
-      # 与下方「构建 release（含 GUI）」的 runner.os != 'Linux' 门控保持一致：
-      # Linux 上 GUI crate 不进 lint / test；Windows / macOS 仍全量覆盖 gui。
-      # 注意本值直接插值进 run（不要加引号），空值即等价于不带该参数。
-      GUI_EXCL: ${{ runner.os == 'Linux' && '--exclude req-guard-gui' || '' }}
+        # GUI crate 在 Linux 不参与 lint / test：gui 的 eframe 关了 default-features，
+        # 连带 x11 / wayland / winit-default 后端未启用 → ubuntu 上编 winit 直接
+        #   error: The platform you're compiling for is not supported by winit
+        # 与下方「构建 release（含 GUI）」的 runner.os != 'Linux' 门控保持一致；
+        # Windows / macOS 仍全量覆盖 gui（gui_excl 为空）。
+        #
+        # 平台差异放在 matrix 维度而不是 job 级 env：`runner` 上下文在
+        # jobs.<job_id>.env 中**不可用**（该处只支持 github/needs/strategy/matrix/
+        # vars/secrets/inputs），写 `runner.os == 'Linux'` 会直接报
+        # "Unrecognized named-value: 'runner'"。matrix 值在渲染期即为字面量，
+        # 也不依赖 shell 的变量展开语义。
+        include:
+          - os: ubuntu-latest
+            gui_excl: "--exclude req-guard-gui"
+          - os: windows-latest
+            gui_excl: ""
+          - os: macos-latest
+            gui_excl: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +48,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: 静态检查（零警告为门槛）
-        run: cargo clippy --workspace --all-targets ${{ env.GUI_EXCL }} -- -D warnings
+        run: cargo clippy --workspace --all-targets ${{ matrix.gui_excl }} -- -D warnings
 
       - name: 单元测试（全 workspace）
-        run: cargo test --workspace ${{ env.GUI_EXCL }}
+        run: cargo test --workspace ${{ matrix.gui_excl }}
 
       - name: 拦截脚本场景验证
         shell: bash
