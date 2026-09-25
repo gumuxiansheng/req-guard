@@ -9,6 +9,15 @@ description = "req-guard 桌面门禁管理台（eframe / egui）"
 #
 # 依赖说明：GUI 是唯一引入重量依赖的地方（eframe ≈ 18–64MB），
 # 因此必须 feature 门控，绝不污染 default 构建。
+#
+# ⚠️ 平台约束：`default-features = false` 同时也关掉了 eframe 自带的 x11 / wayland 后端，
+# 于是在 Linux 上编 winit 会直接
+#   compile_error!("The platform you're compiling for is not supported by winit")
+# 因此 ubuntu-latest 上 `--workspace` 的 lint / test 必须排除本 crate
+# （.github/workflows/ci.yml 的 GUI_EXCL），release 构建同样只在 windows / macOS
+# 原生执行机构建（无 Linux 交叉编译，见 scripts/build-release.sh）。
+# 将来若要支持 Linux GUI：补 `features = [..., "x11", "wayland"]` 并在环境里装
+# X11/Wayland 系统库，再放开 CI 的排除。
 [dependencies]
 req-guard-core = { path = "../core" }
 eframe = { version = "0.36.1", default-features = false, features = ["wgpu"] }

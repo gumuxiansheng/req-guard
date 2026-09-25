@@ -19,6 +19,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      # ubuntu-latest 没有 X11/Wayland 系统库，而 gui 的 eframe 关掉了 default-features
+      # （默认的 x11 / wayland 后端未启用）→ Linux 上编 winit 必报
+      #   "The platform you're compiling for is not supported by winit"
+      # 与下方「构建 release（含 GUI）」的 runner.os != 'Linux' 门控保持一致：
+      # Linux 上 GUI crate 不进 lint / test；Windows / macOS 仍全量覆盖 gui。
+      # 注意本值直接插值进 run（不要加引号），空值即等价于不带该参数。
+      GUI_EXCL: ${{ runner.os == 'Linux' && '--exclude req-guard-gui' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +39,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: 静态检查（零警告为门槛）
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets ${{ env.GUI_EXCL }} -- -D warnings
 
       - name: 单元测试（全 workspace）
-        run: cargo test --workspace
+        run: cargo test --workspace ${{ env.GUI_EXCL }}
 
       - name: 拦截脚本场景验证
         shell: bash
@@ -50,7 +58,9 @@ jobs:
 
       - name: 构建 release（含 GUI）
         if: runner.os != 'Linux'
-        # Linux 需要 X11/Wayland 系统库（libxcb/libxkbcommon 等），交给 P5 的产物矩阵处理
+        # Linux 编不了 GUI 的根因是 eframe 的 x11 / wayland 后端 feature 未启用
+        # （见 gui/Cargo.toml 的「平台约束」），而非单纯缺系统库；GUI 也不在发布矩阵内，
+        # 故只在 Windows / macOS 原生执行机构建。
         run: cargo build -p req-guard --release --features gui
 
   # 门禁自举演示（给使用方项目的 CI 样例，见 templates/ci/req-guard-ci.yml）：

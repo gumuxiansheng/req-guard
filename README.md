@@ -190,6 +190,11 @@ python scripts/verify_gate.py          # 拦截脚本真机场景（13 固定场
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，
 > 直接 `cargo build` 会失败。需把 MSVC `bin/Hostx64/x64` 前置到 `PATH`，并设置 `LIB`
 > 指向 MSVC `lib/x64` 与 Windows Kits 的 `um/x64`、`ucrt/x64`。
+>
+> **Linux 上跑静态检查 / 单测必须排除 `gui`**：`gui` 的 eframe 关了 `default-features`
+> （连带 x11 / wayland 后端），Linux 上编 winit 会直接
+> `compile_error!("The platform you're compiling for is not supported by winit")`。
+> 加 `--exclude req-guard-gui`（CI 同理，见 `.github/workflows/ci.yml` 的 `GUI_EXCL`）。
 
 ## 多平台 Release 构建与发布
 
