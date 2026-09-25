@@ -2,7 +2,9 @@
 # ---------------------------------------------------------------------------
 # 使用方法：
 #   1) 已在本仓库执行过 `req-guard init`（生成 .gates/ 需求清单与拦截脚本）；
-#   2) 把本文件复制到你的 .github/workflows/req-guard-ci.yml（本项目已生成在此）；
+#   2) 把本文件（`req-guard init` 后生成在 .gates/ci/）复制到
+#      .github/workflows/req-guard-ci.yml —— 不复制出去 = L3 未落地：
+#      `req-guard install --verify` 会因此红（enforce.ci 默认 true，fail-closed）；
 #   3) 在仓库 Branch protection 中把本 job 设为「必需（required）」状态检查，
 #      禁止直推 main：不通过即无法合并。这样任何本机绕过（含 --no-verify）都会被服务端抵消。
 #

@@ -74,7 +74,17 @@ jobs:
           "$BIN" init -p "$P" >/dev/null
           test -f "$P/.gates/ci/req-guard-ci.yml"   # 接入样例随 install 生成
           test -f "$P/.gates/hooks/req-guard-deny.sh"
-          "$BIN" install --verify -p "$P"           # 刚 init 完应全绿
+
+          # L3 fail-closed 双向自举：init **有意不替用户写 CI 编排**（那是仓库配置，
+          # core/src/gate.rs 安装流程有明确注释），而 enforce.ci 默认 true ——
+          # 因此"刚 init 完就全绿"是错误假设：未接 CI 时 verify 必须红，
+          # 否则"默认三层"名不副实（本机 --no-verify 在服务端无人抵消）。
+          if "$BIN" install --verify -p "$P" 2>/dev/null; then echo "未接 CI 应红"; exit 1; fi
+          # 按 verify 的提示把样例复制进 CI 目录 → 应全绿
+          mkdir -p "$P/.github/workflows"
+          cp "$P/.gates/ci/req-guard-ci.yml" "$P/.github/workflows/req-guard-ci.yml"
+          "$BIN" install --verify -p "$P"           # 接入 CI 后应全绿
+
           "$BIN" ids --check -p "$P"                # 编号防冲突：空目录应全绿
 
           # 1) 未创建需求 → check 拦截（退出码 1）
