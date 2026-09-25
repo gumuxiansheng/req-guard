@@ -84,6 +84,10 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   （`reconfigure(encoding="utf-8", errors="replace")` + `subprocess(encoding="utf-8")`），CI 再兜 `PYTHONIOENCODING: utf-8`。
 - **hook 配置的"是否已接入"判定必须按词干**：`marker_of` 取 `req-guard-check` / `req-guard-deny`
   （不带 .sh/.ps1），否则 Windows↔Linux 互装互验必假红；渲染出的命令才可平台相关。
+- **`install --verify` 的 L3 体检是 fail-closed**：`init` 只把 CI 样例生成到 `.gates/ci/`，
+  **有意不替用户写 CI 编排**；`enforce.ci` 默认 true → 样例没复制进 `.github/workflows/` 等目录时
+  **必红（退出码 1，报"未检测到任何 CI 编排文件"）**。任何自举脚本/文档都不得断言"刚 init 完就全绿"，
+  须**双向断言**（未接 CI 必红 / 复制样例后必绿）。2026-09-25 修 CI `gate-selfcheck` 时踩到（提交 0c0a173）。
 - **任何"由工具自动执行"的落盘脚本都必须补执行位**（`ensure_executable`，0o755）：
   git 在 Unix 上**静默跳过**不可执行钩子，`fs::write` 默认 0644 → L2 完全失效且 `--verify`
   只查内容会假绿。同理：`install` 的"已接入"提前返回分支也要补 chmod，否则旧仓库无法自愈；
