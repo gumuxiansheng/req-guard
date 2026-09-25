@@ -88,6 +88,16 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   **有意不替用户写 CI 编排**；`enforce.ci` 默认 true → 样例没复制进 `.github/workflows/` 等目录时
   **必红（退出码 1，报"未检测到任何 CI 编排文件"）**。任何自举脚本/文档都不得断言"刚 init 完就全绿"，
   须**双向断言**（未接 CI 必红 / 复制样例后必绿）。2026-09-25 修 CI `gate-selfcheck` 时踩到（提交 0c0a173）。
+- **`gui` crate 在 Linux 不参与 lint / test**：其 eframe 关了 `default-features`，连带
+  `x11`/`wayland`/`winit/default` 后端未启用 → ubuntu 上编 winit 直接
+  `compile_error!("The platform you're compiling for is not supported by winit")`
+  （是 **feature 缺失**，不是缺系统库）。CI 用 matrix 维度 `gui_excl` 给 Linux 加
+  `--exclude req-guard-gui`，与 `runner.os != 'Linux'` 的 GUI 构建门控对齐；本地 Linux 开发同理。
+- **GitHub Actions 的 `runner` 上下文在 `jobs.<job_id>.env` 中不可用**（该处只允许
+  `github`/`needs`/`strategy`/`matrix`/`vars`/`secrets`/`inputs`）→ 在 job 级 env 写
+  `${{ runner.os == 'Linux' && ... || '' }}` 会直接判 workflow 无效
+  （`Unrecognized named-value: 'runner'`）；只有 step 级 `env`/`if`/`run` 才有 `runner`。
+  平台差异请用 matrix include 维度（渲染期即字面量）。2026-09-25（提交 171e57c）。
 - **任何"由工具自动执行"的落盘脚本都必须补执行位**（`ensure_executable`，0o755）：
   git 在 Unix 上**静默跳过**不可执行钩子，`fs::write` 默认 0644 → L2 完全失效且 `--verify`
   只查内容会假绿。同理：`install` 的"已接入"提前返回分支也要补 chmod，否则旧仓库无法自愈；
