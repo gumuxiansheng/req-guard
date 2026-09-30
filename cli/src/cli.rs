@@ -351,9 +351,11 @@ fn help() -> String {
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
   audit-digest               审计日志 SHA-256 摘要写入入库 DIGEST（PR 可比对）\n\
-  token issue  [--ttl 60]   签发审批令牌（方案 B，原文仅打印一次，请带外保存）\n\
-  token status               查看令牌启用状态与到期\n\
-  token revoke               撤销并禁用审批令牌\n\
+  token issue  [<需求ID>] [--step <步骤>] [--ttl 60]\n\
+                              签发审批凭据（L3 下为一次性票据，可绑定需求+步骤；\n\
+                              原文仅打印一次，请带外保存）\n\
+  token status               查看严格等级与凭据状态\n\
+  token revoke               撤销并禁用审批凭据\n\
   ui       [--gui | --tui]   打开门禁管理台（需以 --features tui 构建）\n\
   hook-check                 PreToolUse hook 内部命令：读 stdin 校验 AI 写操作\n\
 \n\
@@ -361,7 +363,7 @@ fn help() -> String {
   -p, --path <项目根>   默认当前目录\n\
   -V, --version         输出版本号\n\
   -h, --help            输出本帮助\n\
-  --token <令牌>        审批令牌（方案 B）；或用 REQ_GUARD_TOKEN\n\
+  --token <凭据>        审批凭据；L0–L1 亦可用环境变量 REQ_GUARD_TOKEN\n\
   --oob                 声明带外审批渠道（方案 C；亦可写 req-guard oob <命令>）\n\
 \n\
 步骤: decomposition(需求分解) -> solution(技术方案) -> testplan(测试计划)\n\

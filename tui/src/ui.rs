@@ -1,6 +1,6 @@
 //! TUI 渲染层：只负责把 `App` 的状态画出来，不做任何判定。
 
-use crate::app::{App, Overlay, Prompt};
+use crate::app::{App, Focus, Overlay, Prompt};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -39,6 +39,31 @@ pub fn render(f: &mut Frame, app: &App) {
     if let Some(prompt) = app.prompt {
         render_prompt(f, app, prompt, area);
     }
+}
+
+/// 面板外框：聚焦时用青色边框 + 标题前缀 `▶`。
+///
+/// 必须有可见的焦点指示——否则用户按 `↑↓` 却不知道"现在动的是谁"，
+/// 只能靠试错（正是"上下键没反应"的观感来源之一）。
+fn pane(title: &str, focused: bool) -> Block<'static> {
+    let t = if focused {
+        format!(" ▶{}", title)
+    } else {
+        format!("  {}", title)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .title(t)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        })
+}
+
+/// 面板是否处于聚焦状态。
+fn focused(app: &App, f: Focus) -> bool {
+    app.focus == f
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -85,11 +110,10 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" 需求列表（{}） ", app.reqs.len())),
-    );
+    let list = List::new(items).block(pane(
+        &format!(" 需求列表（{}） ", app.reqs.len()),
+        focused(app, Focus::Requirements),
+    ));
     f.render_widget(list, area);
 }
 
@@ -163,24 +187,33 @@ fn render_steps(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" 三段审核（{}/3 已通过） ", r.approved_count()));
+    let block = pane(
+        &format!(" 三段审核（{}/3 已通过） ", r.approved_count()),
+        focused(app, Focus::Steps),
+    );
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_body(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
     let lines: Vec<Line> = app.body.iter().map(|l| Line::from(l.clone())).collect();
+    // 标题点明"这是第几段"，与三段列表的选中项一一对应，防止看错段。
     let title = if r.open_comments > 0 {
         format!(
-            " 正文（只读）· 评论 {} 条（阻塞 {}） ",
-            r.open_comments, r.blocking_comments
+            " 正文（只读）· {}. {} · 评论 {} 条（阻塞 {}） ",
+            app.step + 1,
+            r.steps.get(app.step).map(|s| s.label).unwrap_or("未知段"),
+            r.open_comments,
+            r.blocking_comments
         )
     } else {
-        " 正文（只读） ".to_string()
+        format!(
+            " 正文（只读）· {}. {} ",
+            app.step + 1,
+            r.steps.get(app.step).map(|s| s.label).unwrap_or("未知段")
+        )
     };
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(pane(&title, focused(app, Focus::Body)))
         .wrap(Wrap { trim: false })
         .scroll((app.body_scroll, 0));
     f.render_widget(p, area);
@@ -189,7 +222,9 @@ fn render_body(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.message {
         Some(m) => Line::from(Span::styled(m.clone(), Style::default().fg(Color::Yellow))),
-        None => Line::from(" a批准 r打回 n新建 g检查 b绕过 L审计 R刷新 ↑↓选择 ←→切段 ?帮助 q退出 "),
+        None => Line::from(
+            " a批准 r打回 n新建 g检查 b绕过 L审计 R刷新 ↑↓选择 ←→/Tab 换焦点 ?帮助 q退出 ",
+        ),
     };
     // 折行显示：终端窄时也不至于把「q退出」这类关键提示裁掉。
     f.render_widget(
@@ -205,10 +240,10 @@ fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = vec![
         Line::from(""),
-        Line::from("  键位"),
-        Line::from("    ↑/k  ↓/j          选择需求"),
-        Line::from("    ←/h  →/l  Tab     切换三段（正文随之切换）"),
-        Line::from("    PageUp/PageDown   滚动正文"),
+        Line::from("  键位（↑↓ 作用于带 ▶ 的面板）"),
+        Line::from("    ↑/k  ↓/j          在聚焦面板内选择：需求 / 三段 / 正文滚动"),
+        Line::from("    ←/h  →/l  Tab     切换焦点：需求列表 → 三段 → 正文（Shift+Tab 反向）"),
+        Line::from("    PageUp/PageDown   滚动正文（无需先切焦点）"),
         Line::from(""),
         Line::from("  操作"),
         Line::from("    a  批准当前段（输入审核人）"),
@@ -379,6 +414,42 @@ mod tests {
         assert!(text.contains("测试计划"));
         assert!(text.contains("未解锁"), "三段未过时应显示未解锁");
         assert!(text.contains("0/3 已通过"), "进度应显示 0/3");
+        // 焦点指示：默认聚焦三段，其面板标题带 ▶（否则用户按 ↑↓ 不知道在动谁）
+        assert!(
+            text.contains("▶ 三段审核"),
+            "聚焦面板须有可见标记：\n{}",
+            text
+        );
+        // 正文面板标题点明当前段，且正文只含该段内容
+        assert!(
+            text.contains("正文（只读）· 1. 需求分解"),
+            "正文标题应标明段号"
+        );
+        assert!(
+            !text.contains("总体思路"),
+            "第一段视图里不应出现第二段的正文：\n{}",
+            text
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 换段后正文面板只显示该段() {
+        let root = temp_dir("section-view");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let text = screen(&draw(&app, 120, 34));
+        assert!(
+            text.contains("正文（只读）· 2. 技术方案"),
+            "标题应切到第二段"
+        );
+        assert!(text.contains("总体思路"), "应显示第二段正文");
+        assert!(
+            !text.contains("验收标准"),
+            "不应把第一段正文一起显示出来：\n{}",
+            text
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -432,24 +503,79 @@ mod tests {
         let root = temp_dir("section-jump");
         req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
         let mut app = App::new(&root);
+        // 默认聚焦三段：↑↓ 直接换段（这正是历史缺陷：焦点从未被赋值，
+        // 于是 ↑↓ 只动需求列表、换段只能靠 ←→）
+        assert_eq!(app.focus, Focus::Steps, "进来就该聚焦三段");
         assert!(
             app.body.iter().any(|l| l.contains("需求分解")),
             "初始应显示第一段"
         );
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.step, 1, "↓ 应切到第二段");
         assert!(
             app.body.iter().any(|l| l.contains("技术方案")),
-            "→ 应切到第二段并定位正文"
+            "切段后应定位到该段正文"
         );
         assert!(
             !app.body.iter().any(|l| l.contains("测试计划")),
             "第二段不应混入第三段内容"
         );
-        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.step, 0, "↑ 应回到第一段");
         assert!(
             app.body.iter().any(|l| l.contains("需求分解")),
             "← 应回到第一段"
         );
+        // 边界：第一段再按 ↑ 不越界、也不跳到需求列表
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!((app.step, app.selected), (0, 0), "段首 ↑ 应停在原地");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 左右键与tab只切换焦点_不再直接切段() {
+        let root = temp_dir("focus-cycle");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        assert_eq!(app.focus, Focus::Steps);
+
+        // → 到正文：只换焦点，段不变
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!((app.focus, app.step), (Focus::Body, 0));
+        // ↓ 在正文聚焦时滚动，而不是换段
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!((app.step, app.body_scroll), (0, 1), "正文聚焦时 ↓ 滚动正文");
+        // → 回绕到需求列表；此时 ↓ 才动需求列表（只有一条，故停在原地）
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Requirements);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!((app.selected, app.step), (0, 0), "单条需求时不动");
+        // Tab 正向、Shift+Tab（BackTab）反向
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Steps);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.focus, Focus::Requirements, "Shift+Tab 应反向回绕");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 多需求时上下键切换需求() {
+        let root = temp_dir("req-nav");
+        req_guard_core::requirement::create(&root, None, "第一条").expect("创建需求");
+        req_guard_core::requirement::create(&root, None, "第二条").expect("创建需求");
+        let mut app = App::new(&root);
+        // 需求列表按文件名/id 排序，找到"第二条"的位置再断言跳转结果
+        let second = app
+            .reqs
+            .iter()
+            .position(|r| r.title == "第二条")
+            .expect("应包含第二条");
+        app.focus = Focus::Requirements;
+        for _ in 0..second {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.selected, second, "↓ 应逐条下移");
+        assert_eq!(app.step, 0, "换需求后段游标归零");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -458,7 +584,7 @@ mod tests {
         let root = temp_dir("refresh-keep");
         req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
         let mut app = App::new(&root);
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.body_scroll = 2;
         app.reload();
         assert_eq!(app.step, 1, "自动刷新不应重置当前段");

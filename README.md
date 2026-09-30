@@ -11,7 +11,9 @@
 - **证据不可篡改**：评论独立文件，AI 禁止直接写、禁止 resolve（只能 reply）
 - **审计留痕**：拦截/放行/绕过/评论全部入 `audit/gate-audit.log`
 - **应急绕过**：有时效、必填原因；**不覆盖评论证据保护**
-- **审批锁**：`approve/reject/resolve/bypass` 检测 AI 会话标记（`REQ_GUARD_AI_CTX`）即拒，堵 AI 自批
+- **审批锁**：`approve/reject/resolve/bypass` 须出示人类凭据才放行——AI 会话标记（方案 A）、
+  审批令牌（方案 B）、带外声明（方案 C）、终端挑战码（方案 D）；**严格模式下无凭据即拒**，
+  不依赖"AI 工具是否已登记"，堵 AI 自批
 - 零外部依赖（纯 Rust 标准库），开箱即 build
 
 ## 快速上手
@@ -108,12 +110,25 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
   原生 hook 配置（`install --tool` 可指定子集）；无 PreToolUse 机制的 agent（Copilot / Trae 等）
   **无法被 L1 拦到**，只能靠 L2/L3 兜底；
   Codex/Cursor 走 deny 包装（exit 2）适配其拦截语义，CodeBuddy 已修正为 `.codebuddy/settings.json`
-- **审批锁（方案 A）**：Claude Code / CodeBuddy 会话注入 `REQ_GUARD_AI_CTX=1`（配置 `env` 段），
-  `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批
-- **审批令牌（方案 B）**：`req-guard token issue` 签发短期令牌（原文仅打印一次，人类带外持有），
-  启用后审批必须携带有效令牌，AI 拿不到 → 无法自批；`token status/revoke` 查询与撤销
+- **审批锁（方案 A，软标记）**：Claude Code / CodeBuddy 会话注入 `REQ_GUARD_AI_CTX=1`（配置 `env` 段），
+  `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批。
+  ⚠️ 白名单式：**未登记的 AI 工具会话内没有该标记**，"没标记 = 人类"是 fail-open，
+  靠它单独挡不住新工具（2026-09-29 Firedit 事故）
+- **审批凭据（方案 B）**：`req-guard token issue` 签发凭据（原文仅打印一次，人类带外持有），
+  启用后审批必须携带有效凭据，AI 拿不到 → 无法自批；`token status/revoke` 查询与撤销。
+  凭据管理本身受审批锁保护：已有生效凭据时重签/撤销**必须出示当前凭据**（防 AI 静默替换）
 - **带外审批（方案 C）**：审批显式声明带外渠道 `--oob` 或 `req-guard oob <命令>`；
   设 `REQ_GUARD_OOB_ONLY=1` 可强制"仅接受带外审批"；台账按 `channel=oob|interactive` 留痕
+- **人类在场证明（方案 D，fail-closed）**：审批必须出示凭据，或在**真实终端**输入一次性挑战码。
+  AI 的执行通道是管道（实测 stdin/stdout 均非 TTY），两者都拿不出 → 被拒；
+  且不依赖"工具是否已登记"，新工具不登记也不会静默失效。台账带 `tty=`/`ai=` 通道指纹，AI 代跑（`tty=0`）可直接检出
+- **审批严格等级 `auth.level`（0–3，逐级包含；`init` 模板默认 L3）**：
+  `L1` 起**签发凭据必须人类在真实终端**（AI 再也无法 `token issue` 自签后自批）；
+  `L2` 起凭据**只认进程内显式传入**，不再读 `REQ_GUARD_TOKEN`（环境变量会被同会话 AI 子进程继承）；
+  `L3` 起凭据升级为**一次性范围票据**（绑定 `<需求ID>:<步骤>`，用后即废，不可重放，静态令牌不受理）。
+  环境变量 `REQ_GUARD_AUTH_LEVEL` 与 `REQ_GUARD_STRICT_AUTH` **只能抬高等级**，不能降低。
+  GUI / TUI 由界面进程**进程内签发并内存持有**凭据（人类点击界面即在场证明），
+  既不落在 stdout / 环境变量里，也无需先 `export REQ_GUARD_TOKEN`
 - **payload 真解析**：拦截脚本第 0 段优先调 `req-guard hook-check`，由 Rust 解析 AI 工具的
   PreToolUse JSON——路径可写成 `.gates\u002f…comments.md` 这类 Unicode 转义，与明文**完全等价**，
   脚本用正则抠字段会漏判并静默放过；`req-guard` 不在 PATH 时退回正则粗判（保底，不完备）
@@ -128,7 +143,7 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 
 `init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
-（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批令牌 `--token`/`REQ_GUARD_TOKEN`；带外审批 `--oob`/`REQ_GUARD_OOB`）
+（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批凭据 `--token`（L0–L1 亦可用 `REQ_GUARD_TOKEN`）；带外审批 `--oob`/`REQ_GUARD_OOB`；审批严格等级 `auth.level` / `REQ_GUARD_AUTH_LEVEL` / `REQ_GUARD_STRICT_AUTH`）
 
 ## 门禁管理台（TUI / GUI）
 
@@ -142,11 +157,14 @@ req-guard ui --tui      # 强制终端界面
 req-guard ui --gui      # 强制桌面界面
 ```
 
-TUI 键位：`↑↓` 选择需求 · `←→/Tab` 切段 · `a` 批准 · `r` 打回 · `n` 新建 · `g` 门禁检查 ·
+TUI 键位：`↑↓` 在当前聚焦面板内选择（默认聚焦「三段」，进来直接按 `↑↓` 换段；焦点面板标题带 `▶`）·
+`←→/Tab` 切换焦点（需求列表 → 三段 → 正文，`Shift+Tab` 反向）· `PageUp/PageDown` 滚动正文 ·
+`a` 批准 · `r` 打回 · `n` 新建 · `g` 门禁检查 ·
 `b` 应急绕过 · `L` 审计日志 · `R` 刷新 · `?` 帮助 · `q` 退出。
 
 GUI 为三面板：左需求列表（红=被卡 / 绿=已解锁）、右三段折叠清单（状态 + 审核人 + 只读正文 + 批准/打回）、
 底部操作区（创建/刷新/检查/绕过/审计），另可切换项目根目录。
+展开哪一段就只看那一段的正文（切段规则在 core，与 TUI 一致），不必在整篇清单里自己找。
 
 > 界面只做**管理台**：状态读写全部走 core，与 CLI 行为完全等价（不会出现"界面放行、CLI 拦截"）。
 > 清单正文在界面中**只读**——正文由 AI/编辑器维护，界面只负责审核决策。

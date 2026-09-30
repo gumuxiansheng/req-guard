@@ -5,9 +5,12 @@
 > 明确：门禁保证什么、不保证什么、每一层必须如何配置才能算"真正生效"。
 > 适用范围：任何接入 req-guard 的项目、任何会写代码的 AI 工具（Claude Code / CodeBuddy / Codex / Cursor 及未来工具）。
 
-> **状态校注（2026-09-18 复核）**：本文各章"现状（已实现）"与当前代码一致，无需修订——
+> **状态校注（2026-09-30 复核）**：本文各章"现状（已实现）"与当前代码一致，无需修订——
 > L2 fail-closed（`core/src/gate.rs::PRE_COMMIT_BLOCK`）、`enforce.ci: true`、`install --verify`、
-> 审批锁方案 A（`REQ_GUARD_AI_CTX`）/ B（`token`，SHA-256 落盘）/ C（`--oob`、`REQ_GUARD_OOB_ONLY`）、
+> 审批锁方案 A（`REQ_GUARD_AI_CTX`）/ B（`token`，SHA-256 落盘）/ C（`--oob`、`REQ_GUARD_OOB_ONLY`）
+> / **D（终端挑战码在场证明）**、
+> **审批严格等级 `auth.level` 0–3**（L1 签发须人类 TTY、L2 凭据只认进程内传入、L3 一次性范围票据；
+> 旧键 `auth.strict: true` 等价 L1）、
 > 入库台账 `audit/ledger.md` + `audit-digest`、四工具原生 hook schema（Codex/Cursor 走 `deny` 包装）
 > 均已落地。本文是**部署与验收的唯一权威口径**，改动门禁保证能力时须同步更新第 2.2、4、6 章。
 
@@ -53,11 +56,15 @@ req-guard 是 gates-toolkit 的流程门禁，管"AI **该不该写**"。本规�
 3. **L1 仅作 UX 快失败**，其缺位不得削弱 L2/L3。
 
 > **落地进展（2026-09）**：§4.2 L2 fail-closed、§4.3 `enforce.ci` 默认 true、
-> §4.4 **方案 A + 方案 B + 方案 C**（`REQ_GUARD_AI_CTX` 软标记 + `token issue/status/revoke`
-> 审批令牌 + `--oob`/`oob <命令>` 带外声明与 `REQ_GUARD_OOB_ONLY` 强制开关）、
+> §4.4 **方案 A + 方案 B + 方案 C + 方案 D + 严格等级 `auth.level`（0–3）**
+> （`REQ_GUARD_AI_CTX` 软标记 + `token issue/status/revoke`
+> 审批凭据 + `--oob`/`oob <命令>` 带外声明与 `REQ_GUARD_OOB_ONLY` 强制开关 + **严格模式下
+> "无凭据即拒"与终端挑战码** + **L1 禁 AI 自签 / L2 断环境变量通道 / L3 一次性范围票据**）、
 > §4.5 `install --verify`、§4.6 入库台账 + `audit-digest` 已实现；Claude/CodeBuddy/Codex/Cursor
 > 已各自注入**原生 hook schema**（Codex/Cursor 走 deny 包装适配其 exit 2 拦截语义）——见第 8 章附录。
 > 方案 C 目前为流程化带外（渠道声明 + 留痕），非对称签名需打破"零外部依赖"（见 §7）。
+> **方案 D 的由来**：2026-09-29 Firedit 事故——WorkBuddy 未登记在注入列表、其会话内无
+> `REQ_GUARD_AI_CTX`，"没标记 = 人类"导致 AI 自批成功。判级已反转为 fail-closed（详见 §4.4）。
 
 ---
 
@@ -153,44 +160,104 @@ sh .gates/hooks/req-guard-check.sh || exit 1
 
 ### 4.4 锁 —— 审批动作鉴权（最关键，堵自批）
 
-**现状（方案 A + 方案 B 已实现）**：`core/src/auth.rs` 提供 `ensure_human()`，在
-`requirement::review`（approve/reject）、`comment::resolve`、`gate::bypass` 入口
-统一判定（core 层生效，CLI/TUI/GUI 同约束）：
+**现状（方案 A/B/C/D + L3 一次性票据已实现）**：`core/src/auth.rs` 提供 `ensure_human()`，在
+`requirement::review`（approve/reject）、`comment::resolve`、`requirement::done`、
+`requirement::archive_*`、`gate::bypass` 入口统一判定（core 层生效，CLI/TUI/GUI 同约束）：
 - **方案 A**：`install` 给支持会话 env 的工具（claude 与 codebuddy）注入
   `"env": {"REQ_GUARD_AI_CTX": "1"}`；检测到该标记即拒；
-- **方案 B**：`core/src/token.rs` 签发短期令牌，原文仅打印一次、由人类带外持有
+- **方案 B**：`core/src/token.rs` 签发凭据，原文仅打印一次、由人类带外持有
   （存密码管理器/自身会话）；库文件只存 **SHA-256 哈希**于 `~/.config/req-guard/guard.cfg`（0600）。
-  **一旦启用令牌，`approve/reject/resolve/bypass` 必须携带有效令牌**（`--token <值>` 或
-  环境 `REQ_GUARD_TOKEN`），否则 fail-closed 拒绝——AI 不知道令牌值，无法自批。
-- 未启用令牌时自动回退方案 A；`token status/revoke` 查询与撤销。
-
-方案 A 可被 `env -u` 剥离；方案 B 强度来自"令牌值只由人类知道"。残留边界：
-codex/cursor 原生配置**无 env 段**，方案 A 无法覆盖其 Shell 路径；且无 OS keychain
-（受"零外部依赖"约束），令牌文件与 AI 同用户可读——并发多机 / 强隔离仍建议方案 C。
+  - `static`（L0–L2）：短期令牌，TTL 内可重复使用；
+  - `scoped`（L3）：**一次性范围票据**，`scope=<需求ID>:<步骤>` 绑定审批对象，
+    **用后即废**（`used=true`），同一张票无法重放。
+- 未启用凭据时自动回退方案 A；`token status/revoke` 查询与撤销。
 - **方案 C**（已实现，流程化带外）：`approve/reject/resolve/bypass` 可显式声明带外
   渠道（`--oob` 或 `req-guard oob <命令>`）；设 `REQ_GUARD_OOB_ONLY=1` 时强制"仅接受
   带外审批"（未声明即拒，fail-closed）。审批事件按 `channel=oob|interactive` 写入入库台账。
   零依赖下**不引入非对称数字签名**——C 的隔离与留痕来自"渠道显式声明 + 审计标注入库"；
   若需独立签名者（私钥带外、公钥验证）的密码学强隔离，须为 core 引入密码学依赖（见 §7 边界）。
 
+- **方案 D**（**人类在场证明**，fail-closed）：审批必须出示凭据，或在**真实终端**输入一次性
+  挑战码。物理依据：AI 的执行通道是管道，**实测 stdin/stdout/stderr 均非 TTY**，既看不到
+  交互提示也无法回读挑战码 → 天然被拒；且不依赖"AI 工具是否已登记"，新工具不登记也不会
+  静默失效。审批事件在台账里带 `tty=`/`ai=` 通道指纹，`tty=0` 即非人类终端。
+
+**审批严格等级 `auth.level`（0–3，逐级包含）——判定的主轴**：
+配置在 `.gates/req-guard.yaml`（随仓库版本化、改动 PR 可见，`init` 模板默认 L3）。
+环境变量 `REQ_GUARD_AUTH_LEVEL` / `REQ_GUARD_STRICT_AUTH` 只能**抬高**、不能降低
+（取 max），避免自身成为 AI 的降级开关。
+
+| 等级 | 签发（`token issue/revoke`） | 审批（approve/reject/resolve/done/archive/bypass） |
+| --- | --- | --- |
+| **L0** | 仅方案 A 软标记 | 已启用凭据模式才要求凭据；否则放行（旧行为，不打断存量项目） |
+| **L1** | **必须人类在真实终端**（TTY 挑战码） | 无凭据即拒（凭据 / TTY 挑战二选一） |
+| **L2** | 同 L1；GUI/TUI 走**进程内签发** | L1 + 凭据只认**进程内显式传入**，不读 `REQ_GUARD_TOKEN` 环境变量 |
+| **L3** | 同 L2，且签发的是一次性票据 | L2 + 凭据必须是**一次性范围票据**（静态令牌不受理） |
+
+**为什么必须有 L1（堵自签）**：凭据是方案 B 的信任根。若 `token issue` 无人看守，AI 自签
+凭据再自批，方案 B 一招即破（2026-09-29 发现的设计缺陷）。L1 起签发/撤销必须过 TTY 挑战，
+AI 的管道通道拿不出。
+
+**为什么必须有 L2（断环境变量）**：`export REQ_GUARD_TOKEN=…` 会被同一 shell 会话里的
+AI 子进程**继承**，等于把凭据交给 AI。L2 起凭据只认进程内显式传入（CLI `--token` 参数、
+GUI/TUI 内存字段），凭据不出人类进程。
+
+**为什么必须有 L3（抗重放）**：静态令牌在 TTL 内可被重放、且与审批对象无关。L3 改为一次性
+范围票据（绑定 `<需求ID>:<步骤>`，用后即废）。**不采用"口令 + HMAC 挑战应答"**：核验方若要
+本地校验 `HMAC(口令, 挑战)`，就必须把口令（或等价密钥）落到与 AI 同用户可读的存储里，
+AI 直接照算即可伪造——那是安全剧场。零依赖下，一次性票据才是可落地的抗重放手段。
+
+**为什么必须有 D（2026-09-29 Firedit 事故）**：方案 A 是**白名单注入**——`install` 只往
+claude / codebuddy / codex / cursor 四个 profile 写配置，WorkBuddy 不在列表且**不读**
+`.codebuddy/settings.json`、`~/.workbuddy/settings.json` 也无 env/hooks 段 → AI 会话内
+无任何 `REQ_GUARD_*` 变量 → `ensure_human` 判定"非 AI 上下文"→ approve 直接放行。
+即**"没标记 = 人类"是 fail-open**：工具未登记 = 审批锁静默失效。
+判级因此反转为 **"无凭据即拒"**（L1 起），而非"无标记即人类"。
+
+**判级顺序**（`core/src/auth.rs::authorize`，正交叠加）：
+1. AI 上下文标记非空 → 拒（A，任何等级都生效）；
+2. **L0**：已启用凭据模式 → 必须出示有效凭据，否则放行（旧行为）；
+3. **L1+**：凭据有效 → 放行；否则 TTY 在场证明 → 放行；两样都没有 → 拒（fail-closed）；
+4. `REQ_GUARD_OOB_ONLY=1` → 必须已声明带外渠道（C）。
+
+**凭据管理自身的审批锁**：`token issue/revoke` 同属审批类动作（`ensure_token_admin`）——
+AI 若能自签凭据即可"自签→自批"，方案 B 一招即破。规则：已有生效凭据时重签/撤销
+**必须出示当前凭据**（阻止静默替换）；尚无凭据时 L1+ 要求人类在场。
+**GUI/TUI 是例外且是解法**：它们是**人类亲手启动并点击**的界面进程，界面里的确认动作
+即由界面进程**进程内签发**凭据（`auth::ui_issue_credential`），凭据全程只在该进程内存里，
+不经 stdout、不经环境变量、不落剪贴板——AI 无法凭空拉起一个带人类交互的界面，也无法点击
+按钮。这同时解决了两个问题："AI 拿不到凭据"与"GUI 不必先 `export REQ_GUARD_TOKEN`"。
+
 **规范（任选其一，强度递增）**：
 
 | 方案 | 机制 | 强度 | 实现要点 |
 |---|---|---|---|
-| A. `REQ_GUARD_AI_CTX` 软标记 | AI 的 shell 会话自动带此变量，`approve/resolve/bypass` 检测到即拒 | 中（提高门槛，AI 可 `env -u` 剥离） | 包装器/启动脚本注入；命令层读取并拒绝 |
-| B. reviewer token | 签发短期令牌，存于 AI 不可读位置（OS keychain / 受保护文件）；命令需带令牌 | 高 | 令牌生成/校验；服务端可复核 |
+| A. `REQ_GUARD_AI_CTX` 软标记 | AI 的 shell 会话自动带此变量，`approve/resolve/bypass` 检测到即拒 | 中（**白名单式**：未登记工具静默失效；AI 可 `env -u` 剥离） | 包装器/启动脚本注入；命令层读取并拒绝 |
+| B. reviewer token | 签发短期令牌，原文由人类带外持有（库文件只存哈希） | 高（强度来自"凭据值只有人知道"） | 令牌生成/校验；`token issue` 本身须受锁保护 |
 | C. 带外审批 | 人类在独立终端/Web 台签批，门禁只信任带人类签名的审批记录 | 最高 | 审批与 AI 执行上下文完全隔离 |
+| D. 在场证明 | 终端一次性挑战码；非 TTY 通道一律拿不出 | 高（**fail-closed，不依赖工具登记**） | 台账记 `tty=`/`ai=` |
+| E. 严格等级 `auth.level` | 把 A/B/D 的正交加固按 0–3 级组合，逐级收紧签发与审批 | 最高（L3，可配置） | `gate::auth_level`；`REQ_GUARD_AUTH_LEVEL` 只能抬高 |
 
-**落地状态**：A/B 已实现；C 已实现**流程化带外**（`--oob`/`oob <命令>` 渠道声明 + `REQ_GUARD_OOB_ONLY` 强制 + 台账 `channel=` 留痕）。C 的**签名级隔离**（独立签名者、私钥带外、公钥验证）需非对称签名，当前零外部依赖下不可达（见 §7），列为远期。
+**落地状态**：A/B/C/D 与 `auth.level`（0–3）均已实现；`init` 模板默认 **L3**，
+存量项目只需写 `auth: level: <0-3>`（旧键 `strict: true` 等价 L1，不降级）。
 
-> 纯字符串身份**不构成保证**。推荐 B 或 C 作为生产保证；A 可作为开发期快速加固。
+> 纯字符串身份**不构成保证**。推荐 **B 或 D**（可叠加）作为生产保证；A 仅作开发期快速加固。
+> 同用户隔离下**没有本地不可伪造的凭据**（guard.cfg 与 AI 同用户可写），
+> 最终兜底仍是**事后复核**：审批须与人类在 PR / CI 侧的批准对应，见 §7 边界。
 
 **校验清单（锁）**：
 - [ ] AI 上下文内执行 `req-guard approve` → 被拒（路径 A 失效）
 - [ ] AI 上下文内执行 `req-guard resolve` → 被拒（路径 B 失效）
 - [ ] AI 直接写 `.gates/.bypass`（超长 `expires_epoch`）→ 被凭据/审计机制识别（路径 C 失效）
-- [ ] 真实人类在带外/带令牌审批 → 正常通过
-
+- [ ] **未登记的 AI 工具（无 `REQ_GUARD_AI_CTX`）在 L1+ 下执行 `approve` → 被拒**（路径 D，事故场景）
+- [ ] AI 执行 `req-guard token issue`（非 TTY）→ 被拒（L1，自签失效）
+- [ ] L2：`REQ_GUARD_TOKEN=… req-guard approve` → 被拒（环境变量通道已禁用）
+- [ ] L3：同一张票据审第二次 → 被拒（`used=true`，抗重放）
+- [ ] L3：票据 `scope` 与目标需求/步骤不符 → 被拒
+- [ ] L3：用静态令牌审批 → 被拒（只认一次性票据）
+- [ ] `REQ_GUARD_AUTH_LEVEL=0` 试图降低 L3 项目的等级 → 审批仍被拒（只能抬高）
+- [ ] 真实人类在带外/带凭据或在 GUI 界面里审批 → 正常通过
+- [ ] 台账 `tty=0` 的审批事件 → 复核时标红（AI 代跑特征）
 ### 4.5 L1 注入器：未知工具默认拒绝（消除静默缺口）
 
 **现状（已实现）**：提供 `req-guard install --verify`——核心资产缺失、在用工具配置

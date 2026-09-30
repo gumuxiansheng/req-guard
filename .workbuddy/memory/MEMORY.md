@@ -118,6 +118,29 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
   `& native 2>$null | Out-Null` 会报"无法在管道中间运行文档"；`$env:PROCESSOR_ARCHITECTURE` 可能为空需三级兜底；
   判换行/编码用 Python 数字节，别用 `grep -c $'\r'`（会误报）。
 
+- **审批锁是"白名单注入"，不是"默认拒绝"**（2026-09-29 Firedit 事故）：`gate.rs` 的 TOOLS 只登记
+  claude / codebuddy / codex / cursor，`REQ_GUARD_AI_CTX` 只注入前两者的 `settings.json`。
+  **WorkBuddy 不在列表**（它不读 `.codebuddy/`，`~/.workbuddy/settings.json` 也无 env/hooks 段）
+  → AI 会话里无任何 `REQ_GUARD_*` 变量 → `auth::ensure_human` 判定"非 AI 上下文"→ approve 直接放行。
+  → 已通过**方案 D（2026-09-29 落地）**修复：AI 通道实测 stdin/stdout/stderr **全非 TTY**
+  → 严格模式（`auth.strict: true` 或 `REQ_GUARD_STRICT_AUTH=1`）下审批须出示凭据
+  （令牌 或 终端一次性挑战码），**无凭据即拒**；`init` 模板已默认开启方案 D。**新工具不登记也不会静默失效**。
+
+- **`req-guard token issue/revoke/status` 未走 `ensure_human`**（2026-09-29 发现 → 当晚已修）：
+  AI 可自签令牌再自批，方案 B 一招破解。现 `token issue/revoke` 走 `auth::ensure_token_admin`
+  ——已有有效令牌时重签/撤销**必须出示当前令牌**，严格模式下首次签发要求 TTY 在场。
+- 同用户隔离下**没有本地不可伪造的审批凭据**：guard.cfg 与 AI 同用户可读写，AI 可写自己的哈希。
+  方案 B 的强度只来自"令牌原文只有人知道"，最终兜底仍是**事后审计 + 服务端复核**（审批须与人类在
+  PR/CI 侧的批准对应），不要把本地状态当自证。
+
+- **Windows 上令牌熵曾退化（2026-09-30 已修）**：`token::random_hex` 旧实现把 `now`/`pid`
+  在循环外取一次 → 32 字节全由单一 128 位状态派生，实际熵仅约 20~30 bit；而 `guard.cfg` 的
+  哈希与 AI 同用户可读 → AI 可**离线暴力猜原文**再自批。现已改为逐字节采样时间抖动 + 混入
+  ASLR 栈地址 + 滚动状态；弱熵平台由 CLI 提示缩短 TTL。**任何"AI 可离线验证猜测"的凭据，
+  熵不够就等于没有**。
+- **GUI/TUI 在严格模式下审批会被拒**（非 TTY）：唯一干净解法是从已 `export REQ_GUARD_TOKEN`
+  的终端启动；⚠️ 令牌**不可**写进系统级环境变量（AI 同用户会继承 → 令牌失去意义）。
+
 ## 已知未完成
 - **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
   CNB 流水线尚未在真实 tag 上端到端跑过一次（需先 push `v0.1.0`）。

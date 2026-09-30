@@ -260,6 +260,64 @@ pub fn archive_after_days(root: &Path) -> u32 {
     found.unwrap_or(30)
 }
 
+/// 审批严格等级上限：`auth.level` 最高只认 3（见 [`auth_level`]）。
+pub const AUTH_LEVEL_MAX: u8 = 3;
+
+/// 读取 `.gates/req-guard.yaml` 的 `auth.level`（0–3，缺省见下）。
+///
+/// 逐级包含（正交叠加，判定在 [`crate::auth`]）：
+/// - **L1**：令牌签发/撤销**必须人类在真实终端**（TTY 挑战码）；审批"无凭据即拒"。
+///   这一级直接掐死"AI 执行 `token issue` 自签令牌再自批"。
+/// - **L2**：L1 + 审批凭据**只认进程内显式传入**，不再读 `REQ_GUARD_TOKEN`
+///   环境变量（环境变量会被同一 shell 会话里的 AI 子进程继承）；GUI 提供
+///   进程内签发与内存持有，审批不再依赖终端导出令牌。
+/// - **L3**：L2 + 审批凭据升级为**一次性范围票据**（绑定需求+步骤，用后即废），
+///   静态令牌不可重放受限。
+///
+/// 兼容旧键：只写了 `auth.strict: true` 而未写 `level:` 的项目按 **L1** 计
+/// （等于旧"严格模式"的强度，不降级）；两者都没有 → **L0**（不打断存量项目）。
+/// 值越界收敛到 `0..=AUTH_LEVEL_MAX`。
+pub fn auth_level(root: &Path) -> u8 {
+    let path = root.join(".gates/req-guard.yaml");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut in_auth = false;
+    let mut strict: Option<bool> = None;
+    let mut level: Option<u8> = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == "auth:" {
+            in_auth = true;
+            continue;
+        }
+        if in_auth {
+            if line.starts_with(' ') {
+                let v = t.split('#').next().unwrap_or("").trim();
+                if let Some(rest) = v.strip_prefix("level:") {
+                    if let Ok(n) = rest.trim().parse::<u8>() {
+                        level = Some(n.min(AUTH_LEVEL_MAX)); // 重复键：后者覆盖
+                    }
+                } else if let Some(rest) = v.strip_prefix("strict:") {
+                    strict = Some(!rest.trim().eq_ignore_ascii_case("false"));
+                }
+            } else if !t.is_empty() {
+                in_auth = false;
+            }
+        }
+    }
+    match level {
+        Some(l) => l.min(AUTH_LEVEL_MAX),
+        None => match strict {
+            Some(true) => 1,
+            _ => 0,
+        },
+    }
+}
+
 /// 内置 AI 工具配置映射（借鉴 teamai：声明式注入各工具**原生**配置）。
 ///
 /// 各工具 hook schema 存在差异（尤其事件名、matcher、拦截语义）——必须注入
@@ -842,8 +900,8 @@ pub fn audit_tail(root: &Path, n: usize) -> Result<Vec<String>> {
 
 /// 生成有时效的应急绕过令牌（写入 `.gates/.bypass`，并记审计）。
 pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Result<PathBuf> {
-    // 审批锁（§4.4 方案 A）：绕过同样是审批类动作，AI 会话内禁止自助开启。
-    crate::auth::ensure_human("bypass")?;
+    // 审批锁（§4.4）：绕过同样是审批类动作，AI 会话内禁止自助开启。
+    crate::auth::ensure_human("bypass", root, crate::token::ScopeCheck::Exact("bypass"))?;
     if reason.trim().is_empty() {
         return Err(GateError::Validation(
             "应急绕过必须填写原因（--reason），否则无法追溯".into(),
@@ -865,16 +923,20 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         source: e,
     })?;
     let bypass_event = format!(
-        "BYPASS-OPEN actor={} ttl={}min reason={} channel={}",
+        "BYPASS-OPEN actor={} ttl={}min reason={} channel={} {}",
         one_line(actor),
         ttl_minutes,
         one_line(reason),
-        crate::auth::declared_channel()
+        crate::auth::declared_channel(),
+        crate::auth::audit_ctx()
     );
     audit(root, &bypass_event);
     // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）
     audit_ledger(root, &bypass_event);
-    write_file(root, ".gates/.bypass", &content)
+    let written = write_file(root, ".gates/.bypass", &content)?;
+    // L3：绕过已生效 → 消费一次性票据（否则同一张票可在 TTL 内反复开绕过）。
+    crate::auth::consume_credential_if_scoped();
+    Ok(written)
 }
 
 // ===================== 注入实现 =====================
@@ -1311,6 +1373,19 @@ blocked_tools:
   - Edit
   - MultiEdit
   - NotebookEdit
+
+# 审批严格等级（0–3，逐级包含；判定见 core/src/auth.rs）。
+# 背景：方案 A（AI 会话标记）是白名单注入，未登记的 AI 工具（如 WorkBuddy）
+# 会话内没有标记，"没标记 = 人类"会让审批锁**静默失效**。
+#   0 = 仅方案 A 软标记（不打断存量项目）
+#   1 = 审批"无凭据即拒"；且 token issue/revoke 必须人类在真实终端（TTY 挑战码）
+#       —— 掐死"AI 执行 token issue 自签令牌再自批"
+#   2 = 1 + 审批凭据只认进程内显式传入，不读 REQ_GUARD_TOKEN 环境变量
+#       （环境变量会被同 shell 会话的 AI 子进程继承）；GUI 进程内签发并内存持有
+#   3 = 2 + 凭据升级为一次性范围票据：绑定需求+步骤，用后即废（抗重放）
+# 兼容旧键：仅写 auth.strict: true 而未写 level 时按 1 计。
+auth:
+  level: 3
 
 # 应急绕过（有时效、必填原因、强制审计）
 bypass:
@@ -1820,6 +1895,36 @@ mod tests {
         assert_eq!(archive_after_days(&root), 9, "后者覆盖前者");
         fs::write(&y, "archive: false\n").unwrap();
         assert_eq!(archive_after_days(&root), 30, "非键值不得命中");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn auth_level_分级与兼容strict() {
+        let root = temp_dir("auth-level");
+        assert_eq!(auth_level(&root), 0, "缺文件默认 L0（不打断存量项目）");
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        let y = root.join(".gates/req-guard.yaml");
+        fs::write(&y, "auth:\n  level: 3\n").unwrap();
+        assert_eq!(auth_level(&root), 3);
+        fs::write(&y, "auth:\n  level: 2  # 进程内凭据\n").unwrap();
+        assert_eq!(auth_level(&root), 2, "行内注释先截断");
+        // 越界收敛，不得把 9 当成"比 3 更严"而失控
+        fs::write(&y, "auth:\n  level: 9\n").unwrap();
+        assert_eq!(auth_level(&root), AUTH_LEVEL_MAX);
+        // 兼容旧键：只写 strict: true → L1（等于旧严格模式强度，不降级）
+        fs::write(&y, "auth:\n  strict: true  # 无凭据即拒\n").unwrap();
+        assert_eq!(auth_level(&root), 1, "行内注释先截断，且 strict 折算为 L1");
+        fs::write(&y, "auth:\n  strict: false\n").unwrap();
+        assert_eq!(auth_level(&root), 0);
+        // 同时存在时以 level 为准
+        fs::write(&y, "auth:\n  strict: true\n  level: 3\n").unwrap();
+        assert_eq!(auth_level(&root), 3);
+        // 只认 auth 区块：别处的 strict/level 不得误命中
+        fs::write(&y, "strict_order: true\nlevel: 3\n").unwrap();
+        assert_eq!(auth_level(&root), 0, "只认 auth 区块");
+        // init 模板必须默认最严（新项目一律 fail-closed）
+        fs::write(&y, REQ_GUARD_YAML).unwrap();
+        assert_eq!(auth_level(&root), AUTH_LEVEL_MAX, "init 模板须默认最高级");
         cleanup(&root);
     }
 
@@ -2525,6 +2630,8 @@ mod tests {
     fn gate_check_绕过窗口放行时标记bypassed() {
         let root = temp_dir("check-bypass");
         install(&root, &["none".to_string()], false).unwrap();
+        // 本用例验的是"绕过窗口放行并标记"，与鉴权无关：降为 L0 以免依赖人类凭据。
+        crate::testutil::disable_auth(&root);
         assert!(
             !gate_check(&root).unwrap().is_pass(),
             "前置条件：无需求时本应拦截，以确保放行确实由绕过窗口导致"

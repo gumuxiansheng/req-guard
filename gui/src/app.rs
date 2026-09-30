@@ -33,7 +33,7 @@ pub struct App {
     pub selected: usize,
     /// 选中的步骤下标。
     pub step: usize,
-    /// 当前需求正文（只读展示）。
+    /// 当前需求**全文**（只读；按段展示时用 [`requirement::section_of`] 切片）。
     pub body: String,
     pub dialog: Dialog,
     pub input_title: String,
@@ -142,7 +142,14 @@ impl App {
             return;
         }
         let strict = gate::strict_order(&self.root);
-        match requirement::review(&self.root, &id, step, &reviewer, true, "", strict) {
+        // 界面进程内签发凭据：以"人类点击本界面"为在场证明，凭据全程只在进程内存里，
+        // 不经 stdout / 环境变量（见 core auth::ui_issue_credential）。L0 为无操作。
+        if !self.prepare_credential(&format!("{}:{}", id, step)) {
+            return;
+        }
+        let outcome = requirement::review(&self.root, &id, step, &reviewer, true, "", strict);
+        req_guard_core::auth::clear_credential();
+        match outcome {
             Ok(_) => {
                 self.dialog = Dialog::None;
                 self.input_reviewer.clear();
@@ -153,6 +160,23 @@ impl App {
                 self.message = Some(format!("已批准 {} / {}", id, requirement::step_label(step)));
             }
             Err(e) => self.message = Some(format!("批准失败：{}", e)),
+        }
+    }
+
+    /// 界面进程内签发凭据（见 [`req_guard_core::auth::ui_issue_credential`]）。
+    ///
+    /// 返回 `false` 表示签发失败（`message` 已写明原因，调用方应放弃本次动作）；
+    /// L0 下是无操作且返回 `true`——未开加固的项目照旧可审批。
+    ///
+    /// ★ 这是方案 2 解决"GUI 拿不到令牌"的关键：凭据由界面进程**自己签发并持有**，
+    /// 不经 CLI stdout，也不需要人类先 `export REQ_GUARD_TOKEN`。
+    fn prepare_credential(&mut self, scope: &str) -> bool {
+        match req_guard_core::auth::ui_issue_credential(&self.root, scope) {
+            Ok(_) => true,
+            Err(e) => {
+                self.message = Some(format!("签发界面凭据失败：{}", e));
+                false
+            }
         }
     }
 
@@ -184,7 +208,13 @@ impl App {
             return;
         }
         let strict = gate::strict_order(&self.root);
-        match requirement::review(&self.root, &id, step, &reviewer, false, &reason, strict) {
+        // 同 approve：界面进程内签发凭据（人类点击 = 在场证明）。
+        if !self.prepare_credential(&format!("{}:{}", id, step)) {
+            return;
+        }
+        let outcome = requirement::review(&self.root, &id, step, &reviewer, false, &reason, strict);
+        req_guard_core::auth::clear_credential();
+        match outcome {
             Ok(_) => {
                 // 打回原因同步落成阻塞性评论，保证 AI 必然看到"为什么被打回"。
                 let _ = comment::add(
@@ -215,7 +245,12 @@ impl App {
             self.message = Some("应急绕过必须填写原因".into());
             return;
         }
-        match gate::bypass(&self.root, &reason, "gui", 60) {
+        if !self.prepare_credential("bypass") {
+            return;
+        }
+        let outcome = gate::bypass(&self.root, &reason, "gui", 60);
+        req_guard_core::auth::clear_credential();
+        match outcome {
             Ok(_) => {
                 self.dialog = Dialog::None;
                 self.input_reason.clear();
@@ -419,8 +454,10 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                 let resp = egui::CollapsingHeader::new(header)
                     .open(Some(i == app.step))
                     .show(ui, |ui| {
-                        // 正文只读：清单正文由 AI/编辑器维护，界面只做审核决策。
-                        let mut text = app.body.clone();
+                        // 只显示**这一段**（需求分解 / 技术方案 / 测试计划），而不是整篇清单：
+                        // 展开哪一段就看到哪一段，审核人不必自己在全文里找对应节，避免看错段点错批准。
+                        // 切段规则在 core（与 TUI 同一条规则），定位失败时回退整篇。
+                        let mut text = requirement::section_of(&app.body, i);
                         add_sized_text_edit(ui, &mut text);
                     });
                 if resp.header_response.clicked() {

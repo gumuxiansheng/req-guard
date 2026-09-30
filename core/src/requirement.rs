@@ -59,6 +59,44 @@ pub fn step_label(step: &str) -> &'static str {
     "未知步骤"
 }
 
+/// 截取清单正文中第 `step` 段（下标按 [`STEPS`]）的片段。
+///
+/// 边界就是 Markdown 二级标题：从 `## <n>. <标题>` 起，到下一个 `## ` 止
+/// （`## 审核记录` 同样是二级标题，因此末段不会把审核记录吞进来）。
+/// 数字与标题间的分隔符不强求（`## 1.` / `## 1 ` 都认），但**数字必须对得上**。
+///
+/// 定位失败（老格式、标题被改坏）时**回退整篇**：宁可多显示，也不能让界面白屏——
+/// 界面是审核人唯一的判断依据，静默隐藏内容比多显示危险得多。
+///
+/// 放在 core 而不是各前端：TUI 与 GUI 必须按同一条规则切段，否则"两个界面看到的
+/// 不是同一份东西"，对门禁工具而言是不可接受的（与"判定唯一真相在 core"同源）。
+pub fn section_of(content: &str, step: usize) -> String {
+    /// 二级标题的行号（`## …` 一律算边界）。
+    fn is_heading(line: &str) -> bool {
+        line.trim_start().starts_with("## ")
+    }
+    /// 二级标题里声明的段落序号（`## 2. 技术方案` → `Some(2)`）。
+    fn heading_no(line: &str) -> Option<usize> {
+        let rest = line.trim_start().strip_prefix("## ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(start) = lines.iter().position(|l| heading_no(l) == Some(step + 1)) else {
+        return content.to_string();
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| is_heading(l))
+        .map_or(lines.len(), |i| start + 1 + i);
+    let mut out = lines[start..end].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// 校验步骤键合法。
 pub fn validate_step(step: &str) -> Result<()> {
     if STEPS.iter().any(|s| s.0 == step) {
@@ -260,9 +298,14 @@ pub fn review(
     reason: &str,
     strict: bool,
 ) -> Result<Requirement> {
-    // 审批锁（§4.4 方案 A）：approve/reject 不得在 AI 执行上下文内发生，
+    // 审批锁（§4.4）：approve/reject 不得在 AI 执行上下文内发生，
     // 否则 AI 经 Shell 自批即可把状态欺诈骗成 approved。
-    crate::auth::ensure_human(if pass { "approve" } else { "reject" })?;
+    // L3 下凭据是**绑定该需求+步骤**的一次性票据（见 core/src/token.rs）。
+    crate::auth::ensure_human(
+        if pass { "approve" } else { "reject" },
+        root,
+        crate::token::ScopeCheck::Exact(&format!("{}:{}", id, step)),
+    )?;
     validate_step(step)?;
     let r = find(root, id)?;
     let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
@@ -337,15 +380,19 @@ pub fn review(
         source: e,
     })?;
 
+    // L3：审批已落盘 → 消费一次性票据（用后即废，杜绝同一凭据重放第二次审批）。
+    crate::auth::consume_credential_if_scoped();
+
     // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）；
     // 渠道标注（方案 C）让"审批来自带外/交互"可审计。
     let event = format!(
-        "{} {} step={} reviewer={} channel={}",
+        "{} {} step={} reviewer={} channel={} {}",
         if pass { "APPROVE" } else { "REJECT" },
         r.id,
         step,
         safe_field(reviewer),
-        crate::auth::declared_channel()
+        crate::auth::declared_channel(),
+        crate::auth::audit_ctx()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
@@ -361,7 +408,11 @@ pub fn review(
 /// 故与 approve/reject/resolve/bypass 一样走 [`crate::auth::ensure_human`]。
 /// 幂等：已是 `done` 时直接返回，不重复写审计。
 pub fn done(root: &Path, id: &str, actor: &str) -> Result<Requirement> {
-    crate::auth::ensure_human("done")?;
+    crate::auth::ensure_human(
+        "done",
+        root,
+        crate::token::ScopeCheck::Exact(&format!("done:{}", id)),
+    )?;
     let r = find(root, id)?;
     // 文件已物理归档（find 只读回退命中）：幂等返回即可，不再重复写审计。
     if is_archived_path(&r.path) {
@@ -382,12 +433,16 @@ pub fn done(root: &Path, id: &str, actor: &str) -> Result<Requirement> {
         source: e,
     })?;
 
+    // L3：归档已落盘 → 消费一次性票据。
+    crate::auth::consume_credential_if_scoped();
+
     // 审计：归档改变门禁裁决的输入，属关键事件——本机日志 + 入库台账。
     let event = format!(
-        "DONE {} actor={} channel={}",
+        "DONE {} actor={} channel={} {}",
         r.id,
         safe_field(actor),
-        crate::auth::declared_channel()
+        crate::auth::declared_channel(),
+        crate::auth::audit_ctx()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
@@ -425,7 +480,30 @@ pub fn archive_due(
     after_days: u32,
     dry_run: bool,
 ) -> Result<Vec<ArchivedReq>> {
-    crate::auth::ensure_human("archive")?;
+    crate::auth::ensure_human("archive", root, crate::token::ScopeCheck::Exact("archive"))?;
+    archive_due_inner(root, actor, after_days, dry_run)
+}
+
+/// `done` 成功后的自动清扫入口：**已在同一人类授权窗口内**，不重复鉴权。
+///
+/// 存在理由：L1+ 下一次人类授权只对应一份凭据，若自动清扫再走一遍 [`archive_due`]，
+/// 人类会看到一条无意义的"archive 缺凭据"告警。外部脚本仍只能走 [`archive_due`]
+/// （`done` 本身受鉴权保护，能走到这里的进程必然刚通过过鉴权）。
+pub fn archive_due_authorized(
+    root: &Path,
+    actor: &str,
+    after_days: u32,
+    dry_run: bool,
+) -> Result<Vec<ArchivedReq>> {
+    archive_due_inner(root, actor, after_days, dry_run)
+}
+
+fn archive_due_inner(
+    root: &Path,
+    actor: &str,
+    after_days: u32,
+    dry_run: bool,
+) -> Result<Vec<ArchivedReq>> {
     let mut out = Vec::new();
     for r in list(root)? {
         let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
@@ -446,6 +524,10 @@ pub fn archive_due(
             }
         }
     }
+    // L3：实际发生了搬移才消费票据（dry-run / 无可归档项不该白丢一张票）。
+    if !dry_run && !out.is_empty() {
+        crate::auth::consume_credential_if_scoped();
+    }
     Ok(out)
 }
 
@@ -454,7 +536,7 @@ pub fn archive_due(
 /// 与 [`archive_due`] 同一条搬移链，仅校验更严：明确指定 id，且**禁止归档活跃需求**
 /// （未 done 一律拒绝——否则等于给"AI 把带阻塞评论的需求挪走逃逸门禁"开了后门）。
 pub fn archive_one(root: &Path, actor: &str, id: &str, dry_run: bool) -> Result<Vec<ArchivedReq>> {
-    crate::auth::ensure_human("archive")?;
+    crate::auth::ensure_human("archive", root, crate::token::ScopeCheck::Exact("archive"))?;
     let r = find(root, id)?;
     if is_archived_path(&r.path) {
         return Err(GateError::Validation(format!(
@@ -477,6 +559,10 @@ pub fn archive_one(root: &Path, actor: &str, id: &str, dry_run: bool) -> Result<
     let mut out = Vec::new();
     if let Some(a) = move_archived(root, &r, actor, dry_run, false)? {
         out.push(a);
+    }
+    // L3：实际搬移成功才消费票据。
+    if !dry_run && !out.is_empty() {
+        crate::auth::consume_credential_if_scoped();
     }
     Ok(out)
 }
@@ -528,11 +614,12 @@ fn move_archived(
         })?;
     }
     let event = format!(
-        "ARCHIVE {} actor={} auto={} channel={}",
+        "ARCHIVE {} actor={} auto={} channel={} {}",
         r.id,
         safe_field(actor),
         if is_auto { 1 } else { 0 },
-        crate::auth::declared_channel()
+        crate::auth::declared_channel(),
+        crate::auth::audit_ctx()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
@@ -942,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn section_of_按二级标题切段且不越界() {
+        let doc = "# REQ-001 登录改造\n\n\
+                   ## 1. 需求分解\n\n- 背景\n\n\
+                   ## 2. 技术方案\n\n- 总体思路\n\n\
+                   ## 3. 测试计划\n\n- 用例\n\n\
+                   ## 审核记录\n\n<!-- GATE:AUDIT -->\n";
+        // 各段只含自己的内容
+        let s0 = section_of(doc, 0);
+        assert!(s0.contains("## 1. 需求分解") && s0.contains("背景"));
+        assert!(!s0.contains("技术方案"), "第一段不得混入第二段：{}", s0);
+        let s1 = section_of(doc, 1);
+        assert!(s1.contains("## 2. 技术方案") && s1.contains("总体思路"));
+        assert!(!s1.contains("测试计划"));
+        assert!(!s1.contains("需求分解"), "段首即边界，不得回吞上一段");
+        // 末段必须停在下一个二级标题（审核记录）之前，否则审核记录会被当成正文
+        let s2 = section_of(doc, 2);
+        assert!(s2.contains("- 用例"));
+        assert!(!s2.contains("审核记录"), "末段不得吞掉审核记录：{}", s2);
+        // 标题写法宽松：数字后面的分隔符不影响定位
+        assert!(section_of("## 1 需求分解\n- a\n", 0).contains("- a"));
+        // 定位不到 → 回退整篇（宁可多显示，不能白屏）
+        assert_eq!(section_of(doc, 9), doc);
+        assert_eq!(section_of("- 没有标题的清单\n", 0), "- 没有标题的清单\n");
+    }
+
+    #[test]
     fn token_解析键值且缺失返回空() {
         let l = "<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=寇工 updated=2026-09-11_0100 -->";
         assert_eq!(token(l, "name"), "solution");
@@ -1097,6 +1210,8 @@ mod tests {
         // 活跃需求回到已批准的 REQ-001，check 应回到放行。
         let root = temp_dir("req-done-gate");
         crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        // 本用例验的是"归档后门禁跳过"，与鉴权无关：降为 L0 以免依赖人类凭据。
+        crate::testutil::disable_auth(&root);
         create(&root, None, "已完成").unwrap();
         for s in ["decomposition", "solution", "testplan"] {
             review(&root, "REQ-001", s, "寇工", true, "", true).unwrap();

@@ -61,6 +61,14 @@ pub enum Overlay {
     Audit,
 }
 
+/// 焦点环的顺序（也是界面上面板的排布顺序）：
+/// 需求列表（左）→ 三段（右上）→ 正文（右下）。
+///
+/// `↑↓` 作用于**当前聚焦的面板**；`←→`/`Tab` 在环上移动焦点。
+/// 之所以要有焦点概念：需求列表与三段都是**纵向**列表，`↑↓` 必须只服务其中一个，
+/// 否则"按 ↓ 到底该动谁"无法自洽。
+const FOCUS_RING: [Focus; 3] = [Focus::Requirements, Focus::Steps, Focus::Body];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Requirements,
@@ -71,14 +79,13 @@ pub enum Focus {
 /// TUI 全局状态。
 pub struct App {
     pub focus: Focus,
-    document: Vec<String>,
     pub root: PathBuf,
     pub reqs: Vec<ReqStatus>,
     /// 选中的需求下标。
     pub selected: usize,
     /// 选中的步骤下标（0..3）。
     pub step: usize,
-    /// 当前需求正文（只读展示）。
+    /// 当前段的正文（只读展示，只含选中那一段）。
     pub body: Vec<String>,
     pub body_scroll: u16,
     pub overlay: Overlay,
@@ -98,8 +105,8 @@ pub struct App {
 impl App {
     pub fn new(root: &Path) -> App {
         let mut app = App {
-            focus: Focus::Requirements,
-            document: Vec::new(),
+            // 默认聚焦"三段"：审核是这个界面的主任务，进来按 ↑↓ 就该能换段
+            focus: Focus::Steps,
             root: root.to_path_buf(),
             reqs: Vec::new(),
             selected: 0,
@@ -162,18 +169,23 @@ impl App {
     }
 
     /// 加载当前需求正文（只读）。切段时直接在本段起始处打开正文。
+    ///
+    /// 切段规则由 core 的 [`requirement::section_of`] 提供（与 GUI 同一条规则）：
+    /// 界面只显示**选中那一段**，而不是整篇清单——否则审核人得自己在全文里找对应段，
+    /// 极易"看错段点错批准"。
     pub fn load_body(&mut self) {
         self.body.clear();
         self.body_scroll = 0;
         let Some(r) = self.current() else { return };
         match std::fs::read_to_string(&r.path) {
             Ok(text) => {
-                self.document = text.lines().map(|l| l.to_string()).collect();
-                self.body = section_lines(&self.document, self.step);
+                self.body = requirement::section_of(&text, self.step)
+                    .lines()
+                    .map(|l| l.to_string())
+                    .collect();
             }
             Err(e) => {
-                self.document = vec![format!("读取正文失败：{}", e)];
-                self.body = self.document.clone();
+                self.body = vec![format!("读取正文失败：{}", e)];
             }
         }
         self.body_scroll = self
@@ -221,22 +233,24 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Requirements => self.move_selection(-1),
+                Focus::Steps => self.move_step(-1),
                 Focus::Body => {
                     self.body_scroll = self.body_scroll.saturating_sub(1);
                     self.clamp_scroll();
                 }
-                Focus::Steps => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
                 Focus::Requirements => self.move_selection(1),
+                Focus::Steps => self.move_step(1),
                 Focus::Body => {
                     self.body_scroll = self.body_scroll.saturating_add(1);
                     self.clamp_scroll();
                 }
-                Focus::Steps => {}
             },
-            KeyCode::Left | KeyCode::Char('h') => self.move_step(-1),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => self.move_step(1),
+            // ←→/Tab 只负责**移动焦点**，不再直接切段：三段是纵向列表，切段归 ↑↓
+            // （历史缺陷：焦点状态机从未被赋值，导致 ↑↓ 只动需求列表、←→ 反而在切段）
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => self.cycle_focus(false),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => self.cycle_focus(true),
             KeyCode::PageDown | KeyCode::Char('J') => {
                 self.body_scroll = self.body_scroll.saturating_add(10)
             }
@@ -250,6 +264,21 @@ impl App {
             KeyCode::Char('b') => self.open_prompt(Prompt::BypassReason),
             _ => {}
         }
+    }
+
+    /// 在 [`FOCUS_RING`] 上移动焦点（`←→` / `Tab` / `Shift+Tab`），到端点回绕。
+    fn cycle_focus(&mut self, forward: bool) {
+        let n = FOCUS_RING.len();
+        let i = FOCUS_RING
+            .iter()
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
+        let next = if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        };
+        self.focus = FOCUS_RING[next];
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -354,6 +383,20 @@ impl App {
         }
     }
 
+    /// 界面进程内签发凭据（见 [`req_guard_core::auth::ui_issue_credential`]）。
+    ///
+    /// 返回 `false` 表示签发失败（此时 `message` 已写明原因，调用方应放弃本次动作）。
+    /// L0 下该调用是无操作且返回 `true`——保持"未开加固的项目照旧可用"。
+    fn prepare_credential(&mut self, scope: &str) -> bool {
+        match req_guard_core::auth::ui_issue_credential(&self.root, scope) {
+            Ok(_) => true,
+            Err(e) => {
+                self.message = Some(format!("签发界面凭据失败：{}", e));
+                false
+            }
+        }
+    }
+
     /// 提交弹窗（按类型分派到 core）。
     fn submit_prompt(&mut self) {
         let Some(p) = self.prompt else { return };
@@ -406,7 +449,13 @@ impl App {
                     return;
                 }
                 let actor = "tui";
-                match gate::bypass(&self.root, &value, actor, 60) {
+                // 界面进程内签发凭据（以"人类亲手操作界面"为在场证明，见 core auth）。
+                if !self.prepare_credential("bypass") {
+                    return;
+                }
+                let outcome = gate::bypass(&self.root, &value, actor, 60);
+                req_guard_core::auth::clear_credential();
+                match outcome {
                     Ok(_) => {
                         self.prompt = None;
                         self.input.clear();
@@ -432,8 +481,16 @@ impl App {
             String::new()
         };
         let strict = gate::strict_order(&self.root);
+        // 界面进程内签发凭据：以"人类亲手操作界面"为在场证明，全程不落 stdout/环境变量
+        // （见 core auth::ui_issue_credential）。L0 时为无操作，保持旧行为。
+        if !self.prepare_credential(&format!("{}:{}", id, step)) {
+            return;
+        }
+        let outcome =
+            requirement::review(&self.root, &id, step, &reviewer, !reject, &reason, strict);
+        req_guard_core::auth::clear_credential();
 
-        match requirement::review(&self.root, &id, step, &reviewer, !reject, &reason, strict) {
+        match outcome {
             Ok(_) => {
                 // 打回时把原因同时留成评论，保证 AI 能看到"为什么被打回"。
                 if reject {
@@ -464,22 +521,6 @@ impl App {
             Err(e) => self.message = Some(format!("操作失败：{}", e)),
         }
     }
-}
-
-/// 按步骤下标截取对应段落（`## 1. 需求分解` / `## 2. 技术方案` / `## 3. 测试计划`）。
-/// 找不到标题时回退到整篇文档，保证老格式清单也能显示。
-fn section_lines(document: &[String], step: usize) -> Vec<String> {
-    let Some(start) = document
-        .iter()
-        .position(|l| l.trim_start().starts_with(&format!("## {}", step + 1)))
-    else {
-        return document.to_vec();
-    };
-    let end = document[start + 1..]
-        .iter()
-        .position(|l| l.trim_start().starts_with("## "))
-        .map_or(document.len(), |i| start + 1 + i);
-    document[start..end].to_vec()
 }
 
 /// 初始化终端并进入事件循环。

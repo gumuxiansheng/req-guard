@@ -28,3 +28,15 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 pub fn cleanup(dir: &std::path::Path) {
     let _ = fs::remove_dir_all(dir);
 }
+
+/// 测试用：把项目审批严格等级降到 L0。
+///
+/// 用途：`install` 写出的模板默认 `auth.level: 3`（新项目一律最严），而多数单测
+/// 验的是门禁/归档等**非鉴权**行为，不该依赖"人类凭据"（那需要真实终端或 guard.cfg）。
+/// 追加一个 `auth:` 块即可——[`crate::gate::auth_level`] 以最后一次出现的 `level:` 为准。
+pub fn disable_auth(root: &std::path::Path) {
+    let y = root.join(".gates/req-guard.yaml");
+    let mut s = fs::read_to_string(&y).unwrap_or_default();
+    s.push_str("\nauth:\n  level: 0\n");
+    fs::write(&y, s).expect("写入测试 yaml 失败");
+}

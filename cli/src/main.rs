@@ -32,12 +32,11 @@ fn main() {
 fn run(a: &cli::Args) -> Result<()> {
     let resolved = resolve_root(a);
     let root = resolved.as_path();
-    // 方案 B：审批命令显式给 --token 时注入环境，供 core 的 ensure_human 校验。
-    // （无 --token 则走 REQ_GUARD_TOKEN 环境变量；未启用令牌则回退方案 A）
+    // 审批凭据：--token 显式给出时注入**进程内**凭据（不再写环境变量——
+    // 环境变量会被同 shell 会话的 AI 子进程继承，见 core/src/auth.rs 的 L2）。
+    // 未给 --token 时，L0–L1 仍可由 core 回退读取 REQ_GUARD_TOKEN；L2 起只认此处。
     if let Some(t) = a.token.as_deref() {
-        if !t.trim().is_empty() {
-            std::env::set_var(req_guard_core::token::TOKEN_ENV, t);
-        }
+        req_guard_core::auth::set_credential(Some(t.to_string()));
     }
     // 方案 C：审批显式声明带外渠道（供 core 校验与台账 channel 标注）。
     if a.oob {
@@ -184,7 +183,12 @@ fn run(a: &cli::Args) -> Result<()> {
             println!("✅ 已归档：{} {}（操作人 {}）", r.id, r.title, actor);
             println!("   归档后门禁跳过该需求；新的开发请新建清单。");
             // 触发点：done 成功后自动清扫到期归档（best-effort，失败不影响 done 本身）。
-            match requirement::archive_due(root, &actor, gate::archive_after_days(root), false) {
+            match requirement::archive_due_authorized(
+                root,
+                &actor,
+                gate::archive_after_days(root),
+                false,
+            ) {
                 Ok(list) if !list.is_empty() => {
                     println!(
                         "   已自动归档 {} 条（done 满 {} 天）：",
@@ -420,36 +424,118 @@ fn resolve_root(a: &cli::Args) -> PathBuf {
 /// 审批令牌管理（方案 B）。
 fn run_token(_root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
     use req_guard_core::token;
+    let level = req_guard_core::auth::effective_level(_root);
     match sub {
         "issue" => {
-            let (raw, expires, ttl, path) = token::issue(a.ttl)?;
-            println!("✅ 已签发审批令牌（方案 B，有效期 {} 分钟）", ttl);
+            // 审批锁：凭据是方案 B 的信任根，AI 若能自签即可"自签→自批"，
+            // 故 issue 必须过 ensure_token_admin（已有凭据→须出示当前凭据；
+            // L1+ → 须人类在真实终端完成挑战码，管道签不出来）。
+            req_guard_core::auth::ensure_token_admin("token issue", _root)?;
+            // L3：一律签发**一次性票据**（静态令牌会重放，L3 不再受理）。
+            let (raw, expires, ttl, path, mode_note) = if level >= 3 {
+                let scope = match (a.id.as_deref(), a.step.as_deref()) {
+                    (Some(id), Some(step)) if !id.trim().is_empty() && !step.trim().is_empty() => {
+                        format!("{}:{}", id.trim(), step.trim())
+                    }
+                    _ => String::new(), // 未绑定对象 → 通用单次票
+                };
+                let (raw, exp, ttl, path) = token::issue_scoped(a.ttl, &scope)?;
+                let note = if scope.is_empty() {
+                    "一次性票据（通用：可审任意一个需求/步骤，用后即废）".to_string()
+                } else {
+                    format!("一次性票据（绑定 {}，用后即废）", scope)
+                };
+                (raw, exp, ttl, path, note)
+            } else {
+                let (raw, exp, ttl, path) = token::issue(a.ttl)?;
+                (
+                    raw,
+                    exp,
+                    ttl,
+                    path,
+                    "短期令牌（TTL 内可重复使用）".to_string(),
+                )
+            };
+            println!("✅ 已签发审批凭据（{}，有效期 {} 分钟）", mode_note, ttl);
             println!("   配置  : {}", path.display());
-            println!("   ⚠️ 请立即复制下面这串令牌原文——仅显示一次，不落盘：");
-            println!("   ┌─ 令牌 ────────────────────────────────────");
+            println!("   ⚠️ 请立即复制下面这串原文——仅显示一次，不落盘：");
+            println!("   ┌─ 凭据 ────────────────────────────────────");
             println!("   {}", raw);
             println!("   └──────────────────────────────────────────");
             println!("   到期 epoch : {}", expires);
-            println!("   用法 : req-guard approve REQ-001 --step decomposition --reviewer 张三 --token <令牌>");
-            println!("         或先 export REQ_GUARD_TOKEN=<令牌> 后省略 --token");
-            println!("   请把令牌存入密码管理器/自身会话，勿提交版本库、勿发给 AI。");
-        }
-        "status" => match token::load() {
-            Some(cfg) => {
-                println!("✅ 审批令牌已启用（方案 B）");
-                println!("   到期 epoch : {}", cfg.expires_epoch);
-                println!("   哈希(前12) : {}", &cfg.hash[..cfg.hash.len().min(12)]);
-            }
-            None => {
+            if !token::entropy_strong() {
                 println!(
-                    "ℹ️  审批令牌（方案 B）未启用，当前鉴权为方案 A（REQ_GUARD_AI_CTX 软标记）"
+                    "   ⚠️ 本机无 /dev/urandom（Windows），凭据熵来自时间抖动 + ASLR 地址混合，\
+                     强度低于内核 CSPRNG；\n\
+                     \x20    guard.cfg 里的哈希与 AI 同用户可读，建议**缩短 TTL** 并妥善保管原文。"
                 );
             }
-        },
+            println!(
+                "   用法 : req-guard approve REQ-001 --step decomposition --reviewer 张三 --token <凭据>"
+            );
+            if level < 2 {
+                println!("         或先 export REQ_GUARD_TOKEN=<凭据> 后省略 --token");
+            } else {
+                println!(
+                    "   注意 : 本机审批严格等级 L{}，凭据**只能**用 --token 显式传入（环境变量通道已禁用，\n\
+                     \x20        因为它会被同一 shell 会话里的 AI 子进程继承）。",
+                    level
+                );
+            }
+            println!("   请把凭据存入密码管理器/自身会话，勿提交版本库、勿发给 AI。");
+        }
+        "status" => {
+            println!(
+                "审批严格等级 : L{}（.gates/req-guard.yaml 的 auth.level）",
+                level
+            );
+            match token::load_any() {
+                Some(cfg) => {
+                    let state = if !cfg.enabled {
+                        "已撤销/未启用"
+                    } else if cfg.used {
+                        "已消费（一次性票据用完即废）"
+                    } else if cfg.expires_epoch <= req_guard_core::gate::now_epoch() {
+                        "已过期"
+                    } else {
+                        "生效中"
+                    };
+                    let mode = match cfg.mode {
+                        token::Mode::Static => "static（短期令牌）",
+                        token::Mode::Scoped => "scoped（一次性票据）",
+                    };
+                    println!("凭据状态     : {}", state);
+                    println!("凭据形态     : {}", mode);
+                    if !cfg.scope.is_empty() {
+                        println!("绑定范围     : {}", cfg.scope);
+                    }
+                    println!("到期 epoch   : {}", cfg.expires_epoch);
+                    if !cfg.hash.is_empty() {
+                        println!("哈希(前12)   : {}", &cfg.hash[..cfg.hash.len().min(12)]);
+                    }
+                    if token::load().is_none() {
+                        println!("→ 当前无生效凭据：审批在 L1+ 下须靠真实终端挑战码，或由 GUI 进程内签发。");
+                    }
+                }
+                None => {
+                    println!("凭据状态     : 从未签发");
+                    if level == 0 {
+                        println!("→ L0：鉴权仅靠方案 A 软标记（REQ_GUARD_AI_CTX）。");
+                    } else {
+                        println!(
+                            "→ L{}：审批须凭据或真实终端挑战码（AI 管道拿不出）。",
+                            level
+                        );
+                    }
+                }
+            }
+        }
         "revoke" => {
+            // 同 issue：撤销凭据同样是审批类动作（AI 撤销后再自签即为绕过）。
+            req_guard_core::auth::ensure_token_admin("token revoke", _root)?;
             let path = token::revoke()?;
-            println!("✅ 已撤销并禁用审批令牌：{}", path.display());
-            println!("   审批鉴权已回退到方案 A。");
+            println!("✅ 已撤销并禁用审批凭据：{}", path.display());
+            println!("   审批鉴权回退到本机严格等级决定的其他通道。");
         }
         _ => unreachable!("token 子命令已在校验层限制为 issue/status/revoke"),
     }
