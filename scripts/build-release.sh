@@ -2,6 +2,10 @@
 # req-guard 多平台 Release 二进制构建脚本
 # （供 CNB tag_push 流水线调用，也可在任意 Linux x86_64 机器上手动复现）
 #
+# ⚠️ 只想在本机产出一份二进制的，请改跑 scripts/build-release-native.sh：
+#    那个脚本不装依赖、不联网、只编 host 三元组。本脚本面向 Debian 容器专用，
+#    会 apt-get 装 mingw/binutils 并下载 Zig，在 macOS 上会直接卡在 apt-get。
+#
 # 产物矩阵：5 个目标 × 2 个变体
 #   目标                       说明
 #   ─────────────────────────  ────────────────────────────────────────────

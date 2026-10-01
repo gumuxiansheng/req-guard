@@ -141,6 +141,20 @@ gates-toolkit 家族的**流程门禁**（管"AI 该不该写"），与 sql-guar
 - **GUI/TUI 在严格模式下审批会被拒**（非 TTY）：唯一干净解法是从已 `export REQ_GUARD_TOKEN`
   的终端启动；⚠️ 令牌**不可**写进系统级环境变量（AI 同用户会继承 → 令牌失去意义）。
 
+- **本机 `sed` 是 toybox 0.8.13，不是 GNU sed**（2026-10-01）：BRE 里 `[[:space:]]` 与 `v\?`
+  组合会**静默解析失败返回空串**（`sed -n 's/^req-guard[[:space:]]*v\?//p'` 抽不到版本号，
+  而去掉 `v\?` 就正常）。写**本机可跑**的解析脚本一律用 `awk`，不要用 `sed -n 's/.../\1/p'`
+  （`build-release.sh` 里那套只在 Debian CI 的 GNU sed 下成立，本机跑会假红）。
+
+## 构建脚本分工（2026-10-01 定型）
+- `scripts/build-release.sh` = **CI 专用**（Debian 容器）：`apt-get` 装 mingw/binutils + 下载
+  Zig/cargo-zigbuild，交叉 5 目标 × 2 变体；**在 macOS 上会直接卡在 apt-get**。
+- `scripts/build-release-native.sh` = **本机专用**（新增）：只编 `rustc -vV` 自报的 host 三元组，
+  不装依赖不联网，产出 `dist/req-guard-<host>` / `dist/req-guard-ui-<host>` + SHA256SUMS，
+  命名与 CI 矩阵一致所以可同放 `dist/`；带产物 `--version` 自证。GUI 变体本机可用
+  `cargo build --release -p req-guard --features full`（GUI 无法交叉编译），但脚本故意不做，
+  以免 `dist/` 混入 CI 不发布的件。
+
 ## 已知未完成
 - **P5 剩余**：GUI 产物的原生产物矩阵（GitHub Actions windows/macos 原生构建并发布）尚未做；
   CNB 流水线尚未在真实 tag 上端到端跑过一次（需先 push `v0.1.0`）。
