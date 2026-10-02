@@ -909,10 +909,15 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
     }
     let now = now_epoch();
     let expires = now + ttl_minutes.saturating_mul(60);
+    // 身份绑定（§4.4）：绕过是门禁上唯一的"合法逃逸口"，不绑定身份就等于给了
+    // 一个匿名开关——绕过必须能回答"谁开的"。
+    let stamp = crate::identity::bind(root, actor)?;
     let content = format!(
-        "reason={}\nactor={}\ncreated_epoch={}\nexpires_epoch={}\nttl_minutes={}\n",
+        "reason={}\nactor={}\nemail={}\nsig={}\ncreated_epoch={}\nexpires_epoch={}\nttl_minutes={}\n",
         one_line(reason),
-        one_line(actor),
+        one_line(&stamp.reviewer),
+        one_line(&stamp.email),
+        one_line(&stamp.sig),
         now,
         expires,
         ttl_minutes
@@ -923,12 +928,13 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         source: e,
     })?;
     let bypass_event = format!(
-        "BYPASS-OPEN actor={} ttl={}min reason={} channel={} {}",
-        one_line(actor),
+        "BYPASS-OPEN actor={} ttl={}min reason={} channel={} {} {}",
+        one_line(&stamp.reviewer),
         ttl_minutes,
         one_line(reason),
         crate::auth::declared_channel(),
-        crate::auth::audit_ctx()
+        crate::auth::audit_ctx(),
+        stamp.audit_fields()
     );
     audit(root, &bypass_event);
     // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）

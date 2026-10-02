@@ -257,6 +257,9 @@ pub fn resolve(root: &Path, req_id: &str, cid: &str, author: &str) -> Result<()>
             "AI 不能关闭（resolve）评论，只能 reply；关闭权归审核人".into(),
         ));
     }
+    // 身份绑定（§4.4）：`is_ai` 只挡字面量 "ai"，AI 完全可以自报 `--author 张三`
+    // 绕开它；把关闭人锚定到 git 身份才是真约束（L1+ 冲突即拒）。
+    let stamp = crate::identity::bind(root, author)?;
     let path = comments_path(root, req_id)?;
     if !path.exists() {
         return Err(GateError::Validation(format!(
@@ -289,12 +292,13 @@ pub fn resolve(root: &Path, req_id: &str, cid: &str, author: &str) -> Result<()>
     // L3：关评已落盘 → 消费一次性票据。
     crate::auth::consume_credential_if_scoped();
     let resolve_event = format!(
-        "COMMENT-RESOLVE {} id={} reviewer={} channel={} {}",
+        "COMMENT-RESOLVE {} id={} reviewer={} channel={} {} {}",
         req_id,
         cid,
-        safe_field(author),
+        safe_field(&stamp.reviewer),
         crate::auth::declared_channel(),
-        crate::auth::audit_ctx()
+        crate::auth::audit_ctx(),
+        stamp.audit_fields()
     );
     crate::gate::audit(root, &resolve_event);
     // 关评解除拦截 → 关键事件入入库台账（§4.6）

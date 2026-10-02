@@ -4,8 +4,8 @@
 //! ```text
 //! req-guard init                        初始化 .gates/ 门禁（脚本 + AI hook + pre-commit）
 //! req-guard create   -t <标题>           创建需求清单
-//! req-guard approve  <需求ID> --step <步骤> --reviewer <姓名> [--comment <意见>]
-//! req-guard reject   <需求ID> --step <步骤> --reviewer <姓名> [--comment <意见>]
+//! req-guard approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
+//! req-guard reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
 //! req-guard comment  <需求ID> --author <姓名> --text <意见> [--step] [--quote] [--blocking] [--reply C001]
 //! req-guard resolve  <需求ID> <评论ID> --author <姓名>     （AI 禁止调用）
 //! req-guard done     <需求ID> --author <姓名>      归档需求（拦截随之跳过）
@@ -17,6 +17,7 @@
 //! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
 //! req-guard bypass   --reason <原因> [--ttl 60]
 //! req-guard audit-digest                 审计日志 SHA-256 摘要写入入库 DIGEST
+//! req-guard whoami                       打印审批身份（git 身份 + sig + auth 等级）
 //! req-guard hook-check                   PreToolUse hook 内部命令（读 stdin，由拦截脚本调用）
 //! req-guard -V | --version              输出版本号（与 Cargo.toml / Release tag 一致）
 //! ```
@@ -46,6 +47,8 @@ pub enum Action {
     Bypass,
     /// 生成审计摘要：本机 gate-audit.log 的 SHA-256 → 入库 DIGEST（PR 可比对）。
     AuditDigest,
+    /// 打印本仓库的审批身份（git 身份 + 指纹 sig + 当前 auth 等级）。
+    Whoami,
     /// 审批令牌管理（方案 B）：`token <issue|status|revoke>`。
     Token {
         sub: String,
@@ -186,6 +189,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "install" => Action::Install,
         "bypass" => Action::Bypass,
         "audit-digest" => Action::AuditDigest,
+        "whoami" => Action::Whoami,
         "token" => {
             // subcommand：token <issue|status|revoke>
             let sub = match it.peek() {
@@ -332,8 +336,9 @@ fn help() -> String {
 命令:\n\
   init                       初始化 .gates/ 门禁（脚本 + AI 工具 hook + pre-commit）\n\
   create   -t <标题>         创建需求清单（REQ-001…）\n\
-  approve  <需求ID> --step <步骤> --reviewer <姓名> [--comment <意见>]\n\
-  reject   <需求ID> --step <步骤> --reviewer <姓名> [--comment <意见>]\n\
+  approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
+  reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
+                             --reviewer 可省略：缺省取 git 身份（user.name）\n\
   comment  <需求ID> --author <姓名> --text <意见> [--step <步骤>]\n\
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
   resolve  <需求ID> <评论ID> --author <姓名>    关闭评论（AI 禁止调用）\n\
@@ -351,6 +356,7 @@ fn help() -> String {
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
   audit-digest               审计日志 SHA-256 摘要写入入库 DIGEST（PR 可比对）\n\
+  whoami                     打印本仓库审批身份（git 身份 + sig 指纹 + auth 等级）\n\
   token issue  [<需求ID>] [--step <步骤>] [--ttl 60]\n\
                               签发审批凭据（L3 下为一次性票据，可绑定需求+步骤；\n\
                               原文仅打印一次，请带外保存）\n\

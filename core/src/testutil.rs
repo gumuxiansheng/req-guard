@@ -35,8 +35,19 @@ pub fn cleanup(dir: &std::path::Path) {
 /// 验的是门禁/归档等**非鉴权**行为，不该依赖"人类凭据"（那需要真实终端或 guard.cfg）。
 /// 追加一个 `auth:` 块即可——[`crate::gate::auth_level`] 以最后一次出现的 `level:` 为准。
 pub fn disable_auth(root: &std::path::Path) {
+    set_auth_level(root, 0);
+}
+
+/// 测试用：把项目审批严格等级设为指定值（含 [`disable_auth`] 的 L0）。
+///
+/// [`crate::gate::auth_level`] 以最后一次出现的 `level:` 为准，故重复追加安全。
+pub fn set_auth_level(root: &std::path::Path, level: u8) {
     let y = root.join(".gates/req-guard.yaml");
+    // 允许在只建了临时根目录（尚无 .gates/）的场景直接调用
+    if let Some(dir) = y.parent() {
+        fs::create_dir_all(dir).expect("创建测试 .gates 目录失败");
+    }
     let mut s = fs::read_to_string(&y).unwrap_or_default();
-    s.push_str("\nauth:\n  level: 0\n");
+    s.push_str(&format!("\nauth:\n  level: {}\n", level));
     fs::write(&y, s).expect("写入测试 yaml 失败");
 }

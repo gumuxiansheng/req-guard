@@ -101,6 +101,7 @@ req-guard check                                            # 手动判定（CI �
 ```bash
 req-guard install --verify   # 校验资产 / AI 工具 hook / pre-commit / CI 接入就位（CI 步骤，缺口退出码 1）
 req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gates/audit/DIGEST
+req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 + auth 等级 + AI 上下文判定
 ```
 
 - **L2 fail-closed**：`.gates/hooks/req-guard-check.sh` 缺失时 `git commit` 被阻止（非静默放行）
@@ -135,15 +136,28 @@ req-guard audit-digest       # 本机审计日志 SHA-256 摘要 → 入库 .gat
 - **清单正文可写、状态行不可改**：AI 可用 Write 整篇填写 `.gates/requirements/*.md`
   （不等三段批准——否则"AI 填三段正文"这步会被门禁自己拦死）；但 GATE 状态行必须与磁盘
   **逐行一致**，改动即拦截（防 AI 自批）；片段编辑（Edit）无法与基线比对，一律禁止
+- **身份绑定（可归属）**：`approve/reject/resolve/done/bypass` 的操作人**自动取 git 身份**
+  （`git config user.name/user.email`，即提交本身的署名），并把 `email` + 指纹 `sig` 写进
+  `GATE:STEP` 标记行、审核记录、入库台账与 `.bypass`；`--reviewer` 可省略。
+  `auth.level ≥ 1` 时 `--reviewer` 与 git 身份冲突、或取不到 git 身份**一律拒绝**；
+  `L0` 放行但台账标 `mismatch=1` 供事后批量捞出。
+  `req-guard whoami` 可先查看"我会以谁的身份落账"。
+  ⚠️ `sig` 是**公开可复算的派生值**（无密钥），本项保证"审批记录归属到某个 git 身份"，
+  **不保证"审批不可伪造"**——AI 仍可 `git config user.name` 伪造身份。它与方案 D 叠加而非替代，
+  真正兜底仍是服务端 required 检查 + 事后复核
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见 [`docs/规范/AI工具合规保证规范.md`](docs/规范/AI工具合规保证规范.md)。
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `token` `oob` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
-（`req-guard -h` 查看完整参数；`-p` 指定项目根；身份回退环境变量 `REQ_GUARD_REVIEWER`；审批凭据 `--token`（L0–L1 亦可用 `REQ_GUARD_TOKEN`）；带外审批 `--oob`/`REQ_GUARD_OOB`；审批严格等级 `auth.level` / `REQ_GUARD_AUTH_LEVEL` / `REQ_GUARD_STRICT_AUTH`）
+（`req-guard -h` 查看完整参数；`-p` 指定项目根；**操作人身份取 git 身份**（`user.name`），
+`--reviewer` / `--author` 可省略，回退顺序为「参数 → `REQ_GUARD_REVIEWER` → git 身份」，
+无 git 环境时可用 `REQ_GUARD_REVIEWER_EMAIL` 声明邮箱；审批凭据 `--token`（L0–L1 亦可用
+`REQ_GUARD_TOKEN`）；带外审批 `--oob`/`REQ_GUARD_OOB`；审批严格等级 `auth.level` /
+`REQ_GUARD_AUTH_LEVEL` / `REQ_GUARD_STRICT_AUTH`）
 
 ## 门禁管理台（TUI / GUI）
 

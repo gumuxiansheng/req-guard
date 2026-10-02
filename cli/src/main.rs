@@ -96,7 +96,7 @@ fn run(a: &cli::Args) -> Result<()> {
             let pass = matches!(a.action, Action::Approve);
             let id = a.id.as_deref().unwrap_or("");
             let step = a.step.as_deref().unwrap_or("");
-            let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer")?;
+            let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
             // 是否强制审核顺序，由 .gates/req-guard.yaml 的 strict_order 决定（缺失时 fail-closed = true）。
             let strict = gate::strict_order(root);
             let r = requirement::review(
@@ -137,7 +137,7 @@ fn run(a: &cli::Args) -> Result<()> {
         }
         Action::Comment => {
             let id = a.id.as_deref().unwrap_or("");
-            let author = resolve_identity(a.author.as_deref(), "评论作者", "--author")?;
+            let author = resolve_identity(a.author.as_deref(), "评论作者", "--author", root)?;
             let text = a.text.as_deref().unwrap_or("");
             let c = comment::add(
                 root,
@@ -171,14 +171,14 @@ fn run(a: &cli::Args) -> Result<()> {
         Action::Resolve => {
             let id = a.id.as_deref().unwrap_or("");
             let cid = a.comment_id.as_deref().unwrap_or("");
-            let author = resolve_identity(a.author.as_deref(), "审核人", "--author")?;
+            let author = resolve_identity(a.author.as_deref(), "审核人", "--author", root)?;
             comment::resolve(root, id, cid, &author)?;
             println!("✅ 已关闭评论 {}（需求 {}，审核人 {}）", cid, id, author);
             render::print_comment_summary(&status::req_get(root, id)?);
         }
         Action::Done => {
             let id = a.id.as_deref().unwrap_or("");
-            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")?;
+            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author", root)?;
             let r = requirement::done(root, id, &actor)?;
             println!("✅ 已归档：{} {}（操作人 {}）", r.id, r.title, actor);
             println!("   归档后门禁跳过该需求；新的开发请新建清单。");
@@ -204,7 +204,7 @@ fn run(a: &cli::Args) -> Result<()> {
             }
         }
         Action::Archive => {
-            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")?;
+            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author", root)?;
             let list = match a.id.as_deref() {
                 Some(id) => requirement::archive_one(root, &actor, id, a.dry_run)?,
                 None => requirement::archive_due(
@@ -365,7 +365,9 @@ fn run(a: &cli::Args) -> Result<()> {
             }
         }
         Action::Bypass => {
-            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author")
+            // 绕过是门禁上唯一的合法逃逸口：操作人缺省取 git 身份（不再是 "unknown"），
+            // 否则 identity::bind 在 auth.level≥1 下会因身份对不上而拒绝绕过。
+            let actor = resolve_identity(a.author.as_deref(), "操作人", "--author", root)
                 .unwrap_or_else(|_| "unknown".to_string());
             let p = gate::bypass(root, a.reason.as_deref().unwrap_or(""), &actor, a.ttl)?;
             println!(
@@ -386,6 +388,45 @@ fn run(a: &cli::Args) -> Result<()> {
             println!(
                 "   请将 {} 随本次改动提交；PR 中可与各本机日志比对以发现篡改。",
                 path.display()
+            );
+        }
+        Action::Whoami => {
+            // 身份绑定的自查入口：让管理员/审核人能在审批前确认"我会以谁的身份落账"。
+            let level = req_guard_core::auth::effective_level(root);
+            let facts = req_guard_core::identity::collect(root);
+            println!("仓库根  : {}", root.display());
+            match &facts.git {
+                Some(id) => {
+                    println!("审批身份 : {} <{}>", id.name, id.email);
+                    println!("指纹 sig : {}", id.sig);
+                }
+                None => println!("审批身份 : 未取到 git 身份（user.name 为空或不在 git 仓库内）"),
+            }
+            println!("auth 等级: L{}", level);
+            if facts.git.is_none() {
+                println!(
+                    "           无 git 环境时可用环境变量兜底：{} 声明邮箱、REQ_GUARD_REVIEWER 声明姓名",
+                    req_guard_core::identity::EMAIL_ENV
+                );
+            }
+            if level == 0 {
+                println!(
+                    "           L0：身份冲突或缺失只放行并留痕（台账 mismatch=1）；\
+                     要强制可归属请设 auth.level >= 1"
+                );
+            } else {
+                println!(
+                    "           L{}：--reviewer 与上面身份不一致（或取不到身份）时，审批会被直接拒绝",
+                    level
+                );
+            }
+            println!(
+                "AI 上下文 : {}",
+                if req_guard_core::auth::is_ai_context() {
+                    "是（审批类命令会被拒绝）"
+                } else {
+                    "否"
+                }
             );
         }
         Action::Token { ref sub } => run_token(root, a, sub)?,
@@ -608,7 +649,17 @@ fn run_ui(root: &Path, a: &cli::Args) -> Result<()> {
 }
 
 /// 身份：优先命令行参数，回退环境变量 `REQ_GUARD_REVIEWER`，都没有则报错。
-fn resolve_identity(v: Option<&str>, label: &str, flag: &str) -> Result<String> {
+/// 解析审批人/作者名：命令行 > 环境变量 > **git 身份**。
+///
+/// 最后一档取 git 身份（`git config user.name`）是刻意的：审批人本来就等于
+/// 提交署名者，让人每次手打姓名既啰嗦又容易打错（打错会在 auth.level≥1 下
+/// 被身份绑定判为冲突而拒绝——那是好事，但不该由"手打错字"触发）。
+fn resolve_identity(
+    v: Option<&str>,
+    label: &str,
+    flag: &str,
+    root: &std::path::Path,
+) -> Result<String> {
     if let Some(s) = v {
         if !s.trim().is_empty() {
             return Ok(s.trim().to_string());
@@ -619,8 +670,12 @@ fn resolve_identity(v: Option<&str>, label: &str, flag: &str) -> Result<String> 
             return Ok(s.trim().to_string());
         }
     }
+    if let Some(id) = req_guard_core::identity::current(root) {
+        return Ok(id.name);
+    }
     Err(GateError::Validation(format!(
-        "缺少{}：请使用 {} <姓名>，或设置环境变量 REQ_GUARD_REVIEWER",
+        "缺少{}：请使用 {} <姓名>，或设置环境变量 REQ_GUARD_REVIEWER，\
+         或配置 git 身份（git config user.name \"你的名字\"）后由 req-guard 自动取用",
         label, flag
     )))
 }

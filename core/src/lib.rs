@@ -11,6 +11,8 @@ pub mod error;
 pub mod gate;
 /// 需求编号防冲突检查（`ids --check` 三类检测 + `create --id` 写法 lint）。
 pub mod idcheck;
+/// 审批身份绑定（git identity + 内联指纹 `sig=`）。
+pub mod identity;
 /// AI 工具 hook payload 解析（PreToolUse 的 stdin JSON）。
 pub mod json;
 pub mod requirement;

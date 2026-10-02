@@ -343,15 +343,20 @@ pub fn review(
 
     let new_status = if pass { "approved" } else { "rejected" };
     let ts = safe_field(&crate::gate::now_str());
-    let rv = safe_field(reviewer);
+    // 身份绑定（§4.4）：把自报的 --reviewer 锚定到 git 身份，L1+ 对冲突/取不到 fail-closed。
+    // 必须在 validate_step 之后、落盘之前完成——身份不可归属的审批不该留下任何痕迹。
+    let stamp = crate::identity::bind(root, reviewer)?;
+    let rv = safe_field(&stamp.reviewer);
+    let em = safe_field(&stamp.email);
+    let sg = safe_field(&stamp.sig);
 
     let mut out = String::new();
     for line in content.lines() {
         if line.contains("GATE:STEP") && token(line, "name") == step {
             let label = token(line, "label");
             out.push_str(&format!(
-                "<!-- GATE:STEP name={} label={} status={} reviewer={} updated={} -->\n",
-                step, label, new_status, rv, ts
+                "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} -->\n",
+                step, label, new_status, rv, em, sg, ts
             ));
         } else {
             out.push_str(line);
@@ -362,9 +367,10 @@ pub fn review(
     out = append_audit(
         &out,
         &format!(
-            "- {} | {} | {} | {} | {}\n",
+            "- {} | {} <{}> | {} | {} | {}\n",
             ts,
             rv,
+            em,
             step,
             new_status,
             if reason.trim().is_empty() {
@@ -386,13 +392,14 @@ pub fn review(
     // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）；
     // 渠道标注（方案 C）让"审批来自带外/交互"可审计。
     let event = format!(
-        "{} {} step={} reviewer={} channel={} {}",
+        "{} {} step={} reviewer={} channel={} {} {}",
         if pass { "APPROVE" } else { "REJECT" },
         r.id,
         step,
-        safe_field(reviewer),
+        safe_field(&stamp.reviewer),
         crate::auth::declared_channel(),
-        crate::auth::audit_ctx()
+        crate::auth::audit_ctx(),
+        stamp.audit_fields()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
@@ -427,6 +434,8 @@ pub fn done(root: &Path, id: &str, actor: &str) -> Result<Requirement> {
     }
     // done 时间戳：到期自动归档据此判龄（文件名里的 YYYYMMDD 是创建日期，不是归档判据）。
     let now = safe_field(&crate::gate::now_str());
+    // 身份绑定（§4.4）：归档同样改变门禁裁决的输入，actor 必须可归属。
+    let stamp = crate::identity::bind(root, actor)?;
     let out = set_head_status(&content, "done", Some(&now));
     fs::write(&r.path, out).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
@@ -438,11 +447,12 @@ pub fn done(root: &Path, id: &str, actor: &str) -> Result<Requirement> {
 
     // 审计：归档改变门禁裁决的输入，属关键事件——本机日志 + 入库台账。
     let event = format!(
-        "DONE {} actor={} channel={} {}",
+        "DONE {} actor={} channel={} {} {}",
         r.id,
-        safe_field(actor),
+        safe_field(&stamp.reviewer),
         crate::auth::declared_channel(),
-        crate::auth::audit_ctx()
+        crate::auth::audit_ctx(),
+        stamp.audit_fields()
     );
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
@@ -1159,6 +1169,43 @@ mod tests {
         assert_eq!(step_status(&content, "testplan"), "approved");
         assert_eq!(head_status(&content), "approved", "三步齐备应整体解锁");
         assert!(content.contains("## 审核记录"), "应写入审核记录区块");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn review_审批记录落身份戳() {
+        // 端到端：身份绑定必须同时出现在 GATE:STEP 标记行、审核记录区块与入库台账。
+        // 断言只校验"形状"（字段存在、email 与 sig 同生共死），不校验具体取值——
+        // 取值依赖运行机的 git 全局身份，CI 上不可控。
+        let root = temp_dir("req-review-id");
+        create(&root, None, "身份绑定").unwrap();
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+
+        let r = find(&root, "REQ-001").unwrap();
+        let content = fs::read_to_string(&r.path).unwrap();
+        let line = step_line(&content, "decomposition").expect("应有 STEP 标记行");
+        assert_eq!(token(line, "reviewer"), "寇工");
+        let email = token(line, "email");
+        let sig = token(line, "sig");
+        assert!(
+            (email.is_empty() && sig.is_empty()) || (!email.is_empty() && !sig.is_empty()),
+            "email 与 sig 必须同时存在或同时缺省，实际 email={:?} sig={:?}",
+            email,
+            sig
+        );
+        assert!(
+            content.contains(&format!("寇工 <{}>", email)),
+            "审核记录应带邮箱：{}",
+            content
+        );
+
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(ledger.contains("APPROVE REQ-001"), "{}", ledger);
+        assert!(
+            ledger.contains("email=") && ledger.contains("sig="),
+            "台账须留身份戳: {}",
+            ledger
+        );
         cleanup(&root);
     }
 
