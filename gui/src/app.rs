@@ -24,6 +24,12 @@ pub enum Dialog {
     Bypass,
     Audit,
     CheckResult,
+    /// 评论面板：看评论 / 新增 / 关闭（resolve）/ 重算行号锚点。
+    Comments,
+    /// 新增评论（`input_blocking` 决定是否阻塞）。
+    NewComment,
+    /// 关闭（resolve）选中的评论：需要审核人署名。
+    ResolveComment,
 }
 
 /// 管理台状态。
@@ -53,6 +59,14 @@ pub struct App {
     pub check_pass: bool,
     pub check_detail: Vec<String>,
     pub audit: Vec<String>,
+    /// 当前需求的评论（打开面板时经 `comment::list` 读入）。
+    pub comments: Vec<comment::Comment>,
+    /// 评论面板里选中的评论下标。
+    pub comment_sel: usize,
+    /// 新增评论的正文输入。
+    pub input_comment: String,
+    /// 新增评论是否阻塞（未 resolve 即拦截编码）。
+    pub input_blocking: bool,
     last_refresh: Instant,
 }
 
@@ -74,6 +88,10 @@ impl App {
             check_pass: false,
             check_detail: Vec::new(),
             audit: Vec::new(),
+            comments: Vec::new(),
+            comment_sel: 0,
+            input_comment: String::new(),
+            input_blocking: false,
             last_refresh: Instant::now(),
         };
         app.reload();
@@ -298,6 +316,144 @@ impl App {
         self.dialog = Dialog::Audit;
     }
 
+    /// 打开评论面板（读当前需求的评论）。
+    ///
+    /// 与 `open_audit` 同一套路：先经 core 读盘再展示——界面不自己解析评论文件，
+    /// 否则"两个界面看到的评论不一样"这种事迟早发生。
+    pub fn open_comments(&mut self) {
+        self.reload_comments();
+        self.dialog = Dialog::Comments;
+    }
+
+    /// 重新读评论，并把选区夹回合法范围（新增/关闭后调用）。
+    pub fn reload_comments(&mut self) {
+        self.comments = match self.current() {
+            Some(r) => comment::list(&self.root, &r.id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if self.comment_sel >= self.comments.len() {
+            self.comment_sel = self.comments.len().saturating_sub(1);
+        }
+    }
+
+    /// 新增一条评论（不改任何步骤状态——"审核人只评论、不改正文"的原则）。
+    ///
+    /// 锚定当前选中段：`step` 为空的总评在界面上无从表达，而"这句话在说哪一段"
+    /// 恰恰是审核意见最要紧的信息（core 的 CLI 侧另支持 `--quote` 做行号锚定）。
+    pub fn add_comment(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可评论的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let author = self.input_reviewer.trim().to_string();
+        if author.is_empty() {
+            self.message = Some("评论作者不能为空".into());
+            return;
+        }
+        let text = self.input_comment.trim().to_string();
+        if text.is_empty() {
+            self.message = Some("评论内容不能为空".into());
+            return;
+        }
+        let step = self.current_step();
+        let blocking = self.input_blocking;
+        match comment::add(
+            &self.root,
+            &id,
+            comment::NewComment {
+                step,
+                author: &author,
+                text: &text,
+                quote: None,
+                blocking,
+                reply: None,
+            },
+        ) {
+            Ok(c) => {
+                self.input_comment.clear();
+                self.input_reviewer.clear();
+                self.input_blocking = false;
+                self.dialog = Dialog::Comments;
+                // 阻塞评论会改变门禁裁决 → 连同需求状态一起刷新（计数与未解锁标记）。
+                self.reload();
+                self.reload_comments();
+                self.comment_sel = self
+                    .comments
+                    .iter()
+                    .position(|x| x.id == c.id)
+                    .unwrap_or(self.comment_sel);
+                self.message = Some(format!(
+                    "已添加评论 {}{}",
+                    c.id,
+                    if blocking { "（阻塞）" } else { "" }
+                ));
+            }
+            Err(e) => self.message = Some(format!("添加评论失败：{}", e)),
+        }
+    }
+
+    /// 关闭（resolve）选中的评论。
+    ///
+    /// 与批准/打回同样走"界面进程内签发凭据"：`comment::resolve` 内含
+    /// `auth::ensure_human(.., ScopeCheck::Exact("resolve:<需求ID>"))`（审批类动作），
+    /// L3 下必须是范围票据，签发范围必须逐字对上。
+    pub fn resolve_comment(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可操作的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let Some(c) = self.comments.get(self.comment_sel).cloned() else {
+            self.message = Some("请先选中一条评论".into());
+            return;
+        };
+        if c.state == comment::CommentState::Resolved {
+            self.message = Some(format!("{} 已是关闭状态", c.id));
+            return;
+        }
+        let reviewer = self.input_reviewer.trim().to_string();
+        if reviewer.is_empty() {
+            self.message = Some("关闭人不能为空（关闭权归审核人）".into());
+            return;
+        }
+        if !self.prepare_credential(&format!("resolve:{}", id)) {
+            return;
+        }
+        let outcome = comment::resolve(&self.root, &id, &c.id, &reviewer);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(_) => {
+                self.dialog = Dialog::Comments;
+                self.input_reviewer.clear();
+                self.reload();
+                self.reload_comments();
+                self.message = Some(format!("已关闭 {}（解除阻塞）", c.id));
+            }
+            Err(e) => self.message = Some(format!("关闭失败：{}", e)),
+        }
+    }
+
+    /// 正文被 AI 改过之后重算行号锚点：命中的刷新 `line`，找不到原文的标 `stale`。
+    pub fn refresh_comment_anchors(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可操作的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        match comment::refresh_anchors(&self.root, &id) {
+            Ok(stale) => {
+                self.reload_comments();
+                self.message = Some(if stale == 0 {
+                    "行号锚点已重算：全部命中".to_string()
+                } else {
+                    format!("行号锚点已重算：{} 条找不到原文（已标 stale）", stale)
+                });
+            }
+            Err(e) => self.message = Some(format!("重算锚点失败：{}", e)),
+        }
+    }
+
     /// 切换项目根目录（rfd 文件对话框）。
     pub fn pick_root(&mut self) {
         if let Some(dir) = rfd::FileDialog::new()
@@ -307,6 +463,8 @@ impl App {
             self.root = dir;
             self.selected = 0;
             self.step = 0;
+            self.comments.clear();
+            self.comment_sel = 0;
             self.reload();
             self.message = Some(format!("已切换到 {}", self.root.display()));
         }
@@ -396,6 +554,32 @@ fn render_bottom(parent: &mut egui::Ui, app: &mut App) {
             if ui.button("审计日志").clicked() {
                 app.open_audit();
             }
+            // 评论入口放在操作条上：审核人"只评论不改正文"，这是他最高频的动作之一。
+            {
+                let (open, blocking) = match app.current() {
+                    Some(r) => (r.open_comments, r.blocking_comments),
+                    None => (0, 0),
+                };
+                let label = if blocking > 0 {
+                    format!("评论 {open}（阻塞 {blocking}）")
+                } else {
+                    format!("评论 {open}")
+                };
+                if ui
+                    .add_enabled(
+                        app.current().is_some(),
+                        egui::Button::new(if blocking > 0 {
+                            egui::RichText::new(label).color(egui::Color32::RED)
+                        } else {
+                            egui::RichText::new(label)
+                        }),
+                    )
+                    .on_hover_text("查看 / 新增 / 关闭（resolve）审核评论")
+                    .clicked()
+                {
+                    app.open_comments();
+                }
+            }
             if let Some(m) = &app.message {
                 ui.separator();
                 ui.colored_label(egui::Color32::YELLOW, m);
@@ -452,12 +636,17 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
             };
             ui.colored_label(color, text);
         });
-        ui.label(format!(
-            "进度 {}/3 已通过 · 评论 {} 条（阻塞 {}）",
-            req.approved_count(),
-            req.open_comments,
-            req.blocking_comments
-        ));
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "进度 {}/3 已通过 · 评论 {} 条（阻塞 {}）",
+                req.approved_count(),
+                req.open_comments,
+                req.blocking_comments
+            ));
+            if req.open_comments > 0 && ui.link("查看评论").clicked() {
+                app.open_comments();
+            }
+        });
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -548,28 +737,164 @@ fn add_raw_text(ui: &mut egui::Ui, text: &mut String) {
         });
 }
 
+/// 评论面板：列表 + 选中详情 + 动作条（新增 / 关闭 / 重算锚点 / 刷新）。
+///
+/// 全部经 `comment::*` 读写，界面只做展示与收集输入——与 CLI、TUI 同一套语义。
+///
+/// ⚠ `ScrollArea` 都给了显式 `id_salt`、每条评论包在 `push_id` 里：
+/// egui 的控件 id 由父 id 派生，同一层里出现两个同名 `ScrollArea`、或循环里反复建
+/// `TextEdit`，就会撞成同一个 id（表现为 "Second use of widget ID" + 框线画飞）。
+fn render_comments(app: &mut App, ui: &mut egui::Ui) {
+    let open = app
+        .comments
+        .iter()
+        .filter(|c| c.state == comment::CommentState::Open)
+        .count();
+    let blocking = app.comments.iter().filter(|c| c.is_blocking_open()).count();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!(
+            "共 {} 条 · 未解决 {} · 阻塞 {}",
+            app.comments.len(),
+            open,
+            blocking
+        ));
+        if blocking > 0 {
+            ui.colored_label(egui::Color32::RED, "有未关闭的阻塞评论 → AI 不得编码");
+        }
+    });
+    ui.separator();
+
+    if app.comments.is_empty() {
+        ui.label("（还没有评论。审核人只评论、不改正文；打回会自动留一条阻塞评论。）");
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("comment_list")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                for (i, c) in app.comments.clone().iter().enumerate() {
+                    let selected = i == app.comment_sel;
+                    ui.push_id(i, |ui| {
+                        let (mark, color) = match c.state {
+                            comment::CommentState::Open => ("●", egui::Color32::YELLOW),
+                            comment::CommentState::Resolved => ("✓", egui::Color32::GREEN),
+                        };
+                        let mut head = format!(
+                            "{} [{}] {}{} · {} · {}",
+                            mark,
+                            c.id,
+                            match c.step.as_deref() {
+                                Some(s) => requirement::step_label(s),
+                                None => "总评",
+                            },
+                            if c.blocking { " · 阻塞" } else { "" },
+                            c.author,
+                            c.ts
+                        );
+                        if let Some(n) = c.line {
+                            head.push_str(&format!(" · L{}", n));
+                        }
+                        if c.stale {
+                            head.push_str(" · ⚠锚点失效");
+                        }
+                        if let Some(r) = &c.reply {
+                            head.push_str(&format!(" · 回复 {}", r));
+                        }
+                        let mut rt = egui::RichText::new(head).color(color);
+                        if selected {
+                            rt = rt.strong();
+                        }
+                        if ui.selectable_label(selected, rt).clicked() {
+                            app.comment_sel = i;
+                        }
+                        // 只展开选中项的正文：列表一屏放得下，读起来像"目录 + 详情"。
+                        if selected {
+                            if let Some(q) = &c.quote {
+                                ui.label(egui::RichText::new(format!("引用：{}", q)).italics());
+                            }
+                            let mut body = c.body.clone();
+                            // 高度按正文长度估（约 50 字一行），否则短评论也占一大块空白。
+                            let rows = (body.chars().count() / 50 + 1).clamp(1, 8) as f32;
+                            egui::ScrollArea::vertical()
+                                .id_salt("comment_body")
+                                .max_height(24.0 * rows + 8.0)
+                                .show(ui, |ui| {
+                                    ui.add_sized(
+                                        [ui.available_width(), 20.0 * rows],
+                                        egui::TextEdit::multiline(&mut body)
+                                            .desired_width(f32::MAX)
+                                            .interactive(false),
+                                    );
+                                });
+                        }
+                    });
+                }
+            });
+    }
+
+    ui.separator();
+    // 动作条用 `horizontal_wrapped`：窗口窄时按钮换行续排，
+    // 而不是被藏进横向滚动条里（"关闭评论"这种按钮被藏起来等于没有）。
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("新增普通评论").clicked() {
+            app.input_blocking = false;
+            app.input_comment.clear();
+            app.input_reviewer.clear();
+            app.dialog = Dialog::NewComment;
+        }
+        if ui.button("新增阻塞评论").clicked() {
+            app.input_blocking = true;
+            app.input_comment.clear();
+            app.input_reviewer.clear();
+            app.dialog = Dialog::NewComment;
+        }
+        if ui
+            .add_enabled(
+                app.comments
+                    .get(app.comment_sel)
+                    .is_some_and(|c| c.state == comment::CommentState::Open),
+                egui::Button::new("关闭选中（resolve）"),
+            )
+            .on_hover_text("关闭权归审核人：AI 只能回复、不能关闭（关闭会解除阻塞）")
+            .clicked()
+        {
+            app.input_reviewer.clear();
+            app.dialog = Dialog::ResolveComment;
+        }
+        if ui.button("重算行号锚点").clicked() {
+            app.refresh_comment_anchors();
+        }
+        if ui.button("刷新").clicked() {
+            app.reload_comments();
+        }
+        if ui.button("关闭面板").clicked() {
+            app.dialog = Dialog::None;
+        }
+    });
+}
+
 fn render_dialogs(ctx: &egui::Context, app: &mut App) {
     let mut open = app.dialog != Dialog::None;
     if !open {
         return;
     }
 
-    let (title, body): (&str, fn(&mut App, &mut egui::Ui)) = match app.dialog {
-        Dialog::NewReq => ("创建需求", |app, ui| {
+    // 标题允许动态（评论面板要带上需求 ID），故用 String 而非 &'static str。
+    let (title, body): (String, fn(&mut App, &mut egui::Ui)) = match app.dialog {
+        Dialog::NewReq => ("创建需求".into(), |app, ui| {
             ui.label("标题：");
             ui.text_edit_singleline(&mut app.input_title);
             if ui.button("创建").clicked() {
                 app.create_req();
             }
         }),
-        Dialog::Approve => ("批准当前段", |app, ui| {
+        Dialog::Approve => ("批准当前段".into(), |app, ui| {
             ui.label("审核人（必填）：");
             ui.text_edit_singleline(&mut app.input_reviewer);
             if ui.button("确认批准").clicked() {
                 app.approve();
             }
         }),
-        Dialog::Reject => ("打回当前段", |app, ui| {
+        Dialog::Reject => ("打回当前段".into(), |app, ui| {
             ui.label("审核人（必填）：");
             ui.text_edit_singleline(&mut app.input_reviewer);
             ui.label("原因（必填，将同时写入阻塞性评论）：");
@@ -578,7 +903,7 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
                 app.reject();
             }
         }),
-        Dialog::Bypass => ("应急绕过", |app, ui| {
+        Dialog::Bypass => ("应急绕过".into(), |app, ui| {
             ui.label("原因（必填，用于审计追溯）：");
             ui.text_edit_singleline(&mut app.input_reason);
             ui.label("默认时效 60 分钟，到期自动恢复硬拦截。");
@@ -586,20 +911,23 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
                 app.do_bypass();
             }
         }),
-        Dialog::Audit => ("审计日志（最近 200 行，倒序）", |app, ui| {
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    if app.audit.is_empty() {
-                        ui.label("（暂无审计记录）");
-                    } else {
-                        for line in app.audit.iter().rev() {
-                            ui.monospace(line);
+        Dialog::Audit => (
+            "审计日志（最近 200 行，倒序）".into(),
+            |app, ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        if app.audit.is_empty() {
+                            ui.label("（暂无审计记录）");
+                        } else {
+                            for line in app.audit.iter().rev() {
+                                ui.monospace(line);
+                            }
                         }
-                    }
-                });
-        }),
-        Dialog::CheckResult => ("门禁检查结果", |app, ui| {
+                    });
+            },
+        ),
+        Dialog::CheckResult => ("门禁检查结果".into(), |app, ui| {
             let (text, color) = if app.check_pass {
                 ("放行 ✅", egui::Color32::GREEN)
             } else {
@@ -611,6 +939,86 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
                 ui.label(line);
             }
         }),
+        Dialog::Comments => (
+            format!(
+                "审核评论 · {}",
+                app.current().map(|r| r.id.as_str()).unwrap_or("（无需求）")
+            ),
+            |app, ui| render_comments(app, ui),
+        ),
+        Dialog::NewComment => (
+            format!(
+                "新增{}评论 · 锚定第 {} 段",
+                if app.input_blocking {
+                    "阻塞"
+                } else {
+                    "普通"
+                },
+                app.current_step()
+                    .map(requirement::step_label)
+                    .unwrap_or("—")
+            ),
+            |app, ui| {
+                ui.label("作者（必填，填「ai」表示 AI 回复——AI 不得新开评论）：");
+                ui.text_edit_singleline(&mut app.input_reviewer);
+                ui.label("内容（必填）：");
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 120.0],
+                            egui::TextEdit::multiline(&mut app.input_comment)
+                                .desired_width(f32::MAX)
+                                .hint_text("例：回滚方案需补充 DB 迁移回退"),
+                        );
+                    });
+                ui.checkbox(
+                    &mut app.input_blocking,
+                    "阻塞性：未关闭（resolve）即拦截 AI 编码",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("提交").clicked() {
+                        app.add_comment();
+                    }
+                    if ui.button("取消").clicked() {
+                        app.dialog = Dialog::Comments;
+                    }
+                });
+            },
+        ),
+        Dialog::ResolveComment => (
+            format!(
+                "关闭评论 · {}",
+                app.comments
+                    .get(app.comment_sel)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_else(|| "（未选中）".into())
+            ),
+            |app, ui| {
+                let body = app
+                    .comments
+                    .get(app.comment_sel)
+                    .map(|c| c.body.clone())
+                    .unwrap_or_default();
+                ui.label("将要关闭：");
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(body).italics());
+                    });
+                ui.label("关闭人（必填；只能填人类姓名，填 ai 会被 core 拒绝）：");
+                ui.text_edit_singleline(&mut app.input_reviewer);
+                ui.label("关闭会解除阻塞并入审计/台账，不可撤销（确需重开请新增一条评论）。");
+                ui.horizontal(|ui| {
+                    if ui.button("确认关闭").clicked() {
+                        app.resolve_comment();
+                    }
+                    if ui.button("取消").clicked() {
+                        app.dialog = Dialog::Comments;
+                    }
+                });
+            },
+        ),
         Dialog::None => return,
     };
 
@@ -622,5 +1030,193 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
 
     if !open {
         app.dialog = Dialog::None;
+    }
+}
+
+// ===================== 状态机单测（不需要窗口） =====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "req-guard-gui-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("创建临时目录");
+        p
+    }
+
+    /// 建一条评论（走 core，界面只负责读）。
+    fn add_comment(root: &Path, blocking: bool, text: &str) {
+        comment::add(
+            root,
+            "REQ-001",
+            comment::NewComment {
+                step: Some("solution"),
+                author: "寇工",
+                text,
+                quote: None,
+                blocking,
+                reply: None,
+            },
+        )
+        .expect("添加评论");
+    }
+
+    #[test]
+    fn 打开面板读出评论与阻塞计数() {
+        let root = temp_root("open");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, true, "回滚方案需补充 DB 迁移回退");
+        let mut app = App::new(&root);
+
+        app.open_comments();
+        assert_eq!(app.dialog, Dialog::Comments);
+        assert_eq!(app.comments.len(), 1);
+        assert!(app.comments[0].is_blocking_open());
+        assert_eq!(app.comment_sel, 0, "默认选中第一条");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 新增评论经core落盘且锚定当前段() {
+        let root = temp_root("add");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+
+        // 作者 / 内容任一为空都应被拒，且不留下半条评论
+        app.input_reviewer = "  ".into();
+        app.input_comment = "缺少失败锁定".into();
+        app.add_comment();
+        assert!(app.comments.is_empty(), "作者为空不应落盘");
+
+        app.input_reviewer = "寇工".into();
+        app.input_comment = "  ".into();
+        app.add_comment();
+        assert!(app.comments.is_empty(), "内容为空不应落盘");
+
+        app.input_comment = "缺少失败锁定".into();
+        app.input_blocking = true;
+        app.add_comment();
+
+        let list = comment::list(&root, "REQ-001").expect("读评论");
+        assert_eq!(list.len(), 1);
+        assert!(list[0].is_blocking_open(), "勾了阻塞就应阻塞");
+        assert_eq!(list[0].author, "寇工");
+        assert_eq!(
+            list[0].step.as_deref(),
+            Some("decomposition"),
+            "锚定当前选中段"
+        );
+        // 面板回到列表视图，且需求计数已刷新（阻塞评论会改变门禁裁决）
+        assert_eq!(app.dialog, Dialog::Comments);
+        assert_eq!(app.comments.len(), 1);
+        assert!(app.current().expect("应有需求").blocking_comments == 1);
+        assert!(app.input_comment.is_empty(), "提交后清空输入");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 关闭评论需审核人且改为resolved() {
+        let root = temp_root("resolve");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, true, "回滚方案需补充 DB 迁移回退");
+        let mut app = App::new(&root);
+        app.open_comments();
+
+        // 关闭人为空：应拒绝，且评论仍是 open
+        app.resolve_comment();
+        assert_eq!(
+            comment::list(&root, "REQ-001").unwrap()[0].state,
+            comment::CommentState::Open,
+            "关闭人为空不应关闭"
+        );
+
+        app.input_reviewer = "寇工".into();
+        app.resolve_comment();
+        let list = comment::list(&root, "REQ-001").unwrap();
+        assert_eq!(list[0].state, comment::CommentState::Resolved);
+        assert!(!list[0].is_blocking_open(), "关闭后不再阻塞");
+        assert_eq!(app.comments[0].state, comment::CommentState::Resolved);
+        assert_eq!(
+            app.current().expect("应有需求").blocking_comments,
+            0,
+            "阻塞计数应随关闭归零"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 重复关闭已关闭评论会被挡下() {
+        let root = temp_root("resolve-twice");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, false, "普通意见");
+        let mut app = App::new(&root);
+        app.open_comments();
+        app.input_reviewer = "寇工".into();
+        app.resolve_comment();
+        // 面板已刷新成 resolved，再关一次应被挡（而不是把审计写重复）
+        app.input_reviewer = "寇工".into();
+        app.resolve_comment();
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已是关闭"),
+            "应提示已关闭：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 重算锚点把找不到原文的标记为stale() {
+        let root = temp_root("anchors");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        comment::add(
+            &root,
+            "REQ-001",
+            comment::NewComment {
+                step: None,
+                author: "寇工",
+                text: "带锚点的意见",
+                quote: Some("这段引用在正文中并不存在"),
+                blocking: false,
+                reply: None,
+            },
+        )
+        .expect("添加评论");
+        let mut app = App::new(&root);
+        app.open_comments();
+
+        app.refresh_comment_anchors();
+        assert!(app.comments[0].stale, "找不到原文应标 stale");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("stale"),
+            "应说明有几条失效：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 切换目录清空旧需求的评论() {
+        let root = temp_root("switch");
+        requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, false, "意见");
+        let mut app = App::new(&root);
+        app.open_comments();
+        assert_eq!(app.comments.len(), 1);
+
+        let other = temp_root("switch-other");
+        app.root = other.clone();
+        app.comments.clear();
+        app.reload_comments();
+        assert!(app.comments.is_empty(), "换项目后不应残留上一个需求的评论");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

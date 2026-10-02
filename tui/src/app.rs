@@ -38,6 +38,12 @@ pub enum Prompt {
     RejectReason,
     /// 应急绕过：输入原因。
     BypassReason,
+    /// 新增评论：输入作者。
+    CommentAuthor,
+    /// 新增评论：输入内容（`blocking` 决定是否阻塞编码）。
+    CommentText { blocking: bool },
+    /// 关闭（resolve）评论：输入审核人。
+    ResolveAuthor,
 }
 
 impl Prompt {
@@ -49,6 +55,15 @@ impl Prompt {
             Prompt::RejectReviewer => "打回当前段 — 输入审核人",
             Prompt::RejectReason => "打回当前段 — 输入原因（必填）",
             Prompt::BypassReason => "应急绕过 — 输入原因（必填，默认 60 分钟）",
+            Prompt::CommentAuthor => "新增评论 — 输入作者（人类姓名；AI 只能回复，不能新开）",
+            Prompt::CommentText { blocking } => {
+                if blocking {
+                    "新增**阻塞**评论 — 输入内容（必填，未关闭即拦截 AI 编码）"
+                } else {
+                    "新增普通评论 — 输入内容（必填）"
+                }
+            }
+            Prompt::ResolveAuthor => "关闭（resolve）评论 — 输入审核人（只能人类）",
         }
     }
 }
@@ -59,6 +74,8 @@ pub enum Overlay {
     None,
     Help,
     Audit,
+    /// 评论面板（唯一的**可交互**覆盖层：其余覆盖层任意键即关）。
+    Comments,
 }
 
 /// 焦点环的顺序（也是界面上面板的排布顺序）：
@@ -91,6 +108,13 @@ pub struct App {
     pub overlay: Overlay,
     /// 审计日志行（打开 `L` 时加载）。
     pub audit: Vec<String>,
+    /// 当前需求的评论（打开 `m` 时经 core 读入）。
+    pub comments: Vec<comment::Comment>,
+    /// 评论面板里的选中项与滚动位置。
+    pub comment_sel: usize,
+    pub comment_scroll: u16,
+    /// 新增评论是否阻塞（由 `n` / `N` 决定，跨两个输入弹窗传递）。
+    pending_blocking: bool,
     /// 进行中的弹窗与输入缓冲。
     pub prompt: Option<Prompt>,
     pub input: String,
@@ -115,6 +139,10 @@ impl App {
             body_scroll: 0,
             overlay: Overlay::None,
             audit: Vec::new(),
+            comments: Vec::new(),
+            comment_sel: 0,
+            comment_scroll: 0,
+            pending_blocking: false,
             prompt: None,
             input: String::new(),
             message: None,
@@ -165,6 +193,10 @@ impl App {
         if unchanged {
             self.body_scroll = scroll;
         }
+        // 评论面板开着时同步刷新：AI 在另一个终端回复了评论，3s 内就该看到。
+        if self.overlay == Overlay::Comments {
+            self.reload_comments();
+        }
         self.last_refresh = Instant::now();
     }
 
@@ -212,8 +244,12 @@ impl App {
             self.on_prompt_key(key);
             return;
         }
+        if self.overlay == Overlay::Comments {
+            self.on_comments_key(key);
+            return;
+        }
         if self.overlay != Overlay::None {
-            // 任意键关闭覆盖层。
+            // 其余覆盖层是只读的，任意键关闭。
             self.overlay = Overlay::None;
             return;
         }
@@ -262,6 +298,8 @@ impl App {
             KeyCode::Char('n') => self.open_prompt(Prompt::NewTitle),
             KeyCode::Char('g') => self.run_check(),
             KeyCode::Char('b') => self.open_prompt(Prompt::BypassReason),
+            // 审核人最高频的动作之一就是"留一条意见"，必须一步可达。
+            KeyCode::Char('m') => self.open_comments(),
             _ => {}
         }
     }
@@ -291,6 +329,9 @@ impl App {
             self.selected = next as usize;
             self.step = 0;
             self.load_body();
+            self.comments.clear();
+            self.comment_sel = 0;
+            self.comment_scroll = 0;
         }
     }
 
@@ -342,6 +383,208 @@ impl App {
             return;
         }
         self.open_prompt(Prompt::RejectReviewer);
+    }
+
+    /// 打开评论面板（读当前需求的评论）。
+    pub fn open_comments(&mut self) {
+        if self.current().is_none() {
+            self.message = Some("没有可评论的需求，先按 n 新建".into());
+            return;
+        }
+        self.reload_comments();
+        self.overlay = Overlay::Comments;
+    }
+
+    /// 重新读评论，并把选中项夹回合法范围。
+    pub fn reload_comments(&mut self) {
+        self.comments = match self.current() {
+            Some(r) => comment::list(&self.root, &r.id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if self.comment_sel >= self.comments.len() {
+            self.comment_sel = self.comments.len().saturating_sub(1);
+        }
+        self.clamp_comment_scroll();
+    }
+
+    /// 新增一条评论（不改步骤状态——"审核人只评论、不改正文"）。
+    ///
+    /// 锚定**当前选中段**：界面上无法表达"不锚定任何段"的总评，而"这句话在说哪一段"
+    /// 恰恰是审核意见最要紧的信息（CLI 侧另支持 `--quote` 做行号锚定）。
+    pub fn add_comment(&mut self, blocking: bool) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可评论的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let author = self.pending_reviewer.clone();
+        if author.trim().is_empty() {
+            self.message = Some("评论作者不能为空".into());
+            return;
+        }
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            self.message = Some("评论内容不能为空".into());
+            return;
+        }
+        let step = self.current_step();
+        match comment::add(
+            &self.root,
+            &id,
+            comment::NewComment {
+                step,
+                author: &author,
+                text: &text,
+                quote: None,
+                blocking,
+                reply: None,
+            },
+        ) {
+            Ok(c) => {
+                self.prompt = None;
+                self.input.clear();
+                self.pending_reviewer.clear();
+                self.reload();
+                self.reload_comments();
+                if let Some(i) = self.comments.iter().position(|x| x.id == c.id) {
+                    self.comment_sel = i;
+                    // 新加的多半在末尾：直接把它滚进视野。
+                    self.move_comment(0);
+                }
+                self.message = Some(format!(
+                    "已添加{}评论 {}",
+                    if blocking { "阻塞" } else { "普通" },
+                    c.id
+                ));
+            }
+            Err(e) => self.message = Some(format!("添加评论失败：{}", e)),
+        }
+    }
+
+    /// 关闭（resolve）选中的评论。
+    ///
+    /// 走"界面进程内签发凭据"：`comment::resolve` 内含
+    /// `auth::ensure_human(.., ScopeCheck::Exact("resolve:<需求ID>"))`，
+    /// L3 下必须是范围票据，签发范围要逐字对上。
+    pub fn resolve_comment(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可操作的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let Some(c) = self.comments.get(self.comment_sel).cloned() else {
+            self.message = Some("没有可关闭的评论".into());
+            return;
+        };
+        if c.state == comment::CommentState::Resolved {
+            self.message = Some(format!("{} 已是关闭状态", c.id));
+            return;
+        }
+        let reviewer = self.pending_reviewer.clone();
+        if reviewer.trim().is_empty() {
+            self.message = Some("关闭人不能为空（关闭权归审核人）".into());
+            return;
+        }
+        if !self.prepare_credential(&format!("resolve:{}", id)) {
+            return;
+        }
+        let outcome = comment::resolve(&self.root, &id, &c.id, &reviewer);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(_) => {
+                self.prompt = None;
+                self.input.clear();
+                self.pending_reviewer.clear();
+                self.reload();
+                self.reload_comments();
+                self.message = Some(format!("已关闭 {}（解除阻塞）", c.id));
+            }
+            Err(e) => self.message = Some(format!("关闭失败：{}", e)),
+        }
+    }
+
+    /// 正文被 AI 改过之后重算行号锚点（命中的刷新行号，找不到原文的标 `stale`）。
+    pub fn refresh_comment_anchors(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可操作的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        match comment::refresh_anchors(&self.root, &id) {
+            Ok(0) => {
+                self.reload_comments();
+                self.message = Some("行号锚点已重算：全部命中".into());
+            }
+            Ok(stale) => {
+                self.reload_comments();
+                self.message = Some(format!(
+                    "行号锚点已重算：{} 条找不到原文（已标 stale）",
+                    stale
+                ));
+            }
+            Err(e) => self.message = Some(format!("重算锚点失败：{}", e)),
+        }
+    }
+
+    /// 评论面板内的按键（唯一可交互的覆盖层，故在此分流而不是"任意键关闭"）。
+    fn on_comments_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => {
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_comment(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_comment(1),
+            KeyCode::PageUp => {
+                self.comment_scroll = self.comment_scroll.saturating_sub(8);
+                self.clamp_comment_scroll();
+            }
+            KeyCode::PageDown => {
+                self.comment_scroll = self.comment_scroll.saturating_add(8);
+                self.clamp_comment_scroll();
+            }
+            // n 普通评论 / N 阻塞评论：区分大小写是因为"阻塞与否"后果完全不同，
+            // 不值得为它再加一层选择弹窗（且误点的代价是门禁直接被拦住）。
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let blocking = key.code == KeyCode::Char('N');
+                if self.current().is_none() {
+                    self.message = Some("没有可评论的需求".into());
+                    return;
+                }
+                self.pending_blocking = blocking;
+                self.open_prompt(Prompt::CommentAuthor);
+            }
+            KeyCode::Char('x') => {
+                if self.comments.is_empty() {
+                    self.message = Some("还没有评论可关闭".into());
+                    return;
+                }
+                self.open_prompt(Prompt::ResolveAuthor);
+            }
+            KeyCode::Char('A') => self.refresh_comment_anchors(),
+            _ => {}
+        }
+    }
+
+    fn move_comment(&mut self, delta: isize) {
+        if self.comments.is_empty() {
+            return;
+        }
+        let len = self.comments.len() as isize;
+        self.comment_sel = (self.comment_sel as isize + delta).clamp(0, len - 1) as usize;
+        // **最小幅度**滚动：只有选中项滚出可视范围才动（每条评论占 2 行）。
+        // 早先把滚动位置直接钉到选中项，短列表反而会把表头与前几条评论顶出视野。
+        let top = comment_top_line(self.comment_sel) as usize;
+        let bottom = top + COMMENT_LINES;
+        if top < self.comment_scroll as usize {
+            self.comment_scroll = top as u16;
+        } else if bottom > self.comment_scroll as usize + COMMENT_PAGE_LINES {
+            self.comment_scroll = (bottom - COMMENT_PAGE_LINES) as u16;
+        }
+    }
+
+    fn clamp_comment_scroll(&mut self) {
+        let max = comment_total_lines(self.comments.len()).saturating_sub(COMMENT_PAGE_LINES);
+        self.comment_scroll = self.comment_scroll.min(max as u16);
     }
 
     fn run_check(&mut self) {
@@ -443,6 +686,33 @@ impl App {
                 self.input = value;
                 self.review(true);
             }
+            Prompt::CommentAuthor => {
+                if value.is_empty() {
+                    self.message = Some("评论作者不能为空".into());
+                    return;
+                }
+                self.pending_reviewer = value;
+                self.input.clear();
+                self.prompt = Some(Prompt::CommentText {
+                    blocking: self.pending_blocking,
+                });
+            }
+            Prompt::CommentText { blocking } => {
+                if value.is_empty() {
+                    self.message = Some("评论内容不能为空".into());
+                    return;
+                }
+                self.input = value;
+                self.add_comment(blocking);
+            }
+            Prompt::ResolveAuthor => {
+                if value.is_empty() {
+                    self.message = Some("关闭人不能为空（关闭权归审核人）".into());
+                    return;
+                }
+                self.pending_reviewer = value;
+                self.resolve_comment();
+            }
             Prompt::BypassReason => {
                 if value.is_empty() {
                     self.message = Some("应急绕过必须填写原因".into());
@@ -521,6 +791,26 @@ impl App {
             Err(e) => self.message = Some(format!("操作失败：{}", e)),
         }
     }
+}
+
+/// 弹窗里能放多少行评论（保守取值：弹窗 24 行 - 边框 2 - 头部 2 - 空行 1 - 键位 2）。
+/// 用于"选中项滚出可视范围时才滚动"，值偏小只会让翻页早一点，不影响正确性。
+const COMMENT_PAGE_LINES: usize = 17;
+
+/// 一条评论在面板里占的行数（1 行头 + 1 行正文）。
+///
+/// 面板**不折行**（正文超长直接截断），所以"第 i 条评论的起始行"就是确定的——
+/// 滚动位置才能用一个整数算准，折行的话这段算术会全废。
+const COMMENT_LINES: usize = 2;
+
+/// 第 `i` 条评论的首行行号。
+fn comment_top_line(i: usize) -> u16 {
+    u16::try_from(i * COMMENT_LINES).unwrap_or(u16::MAX)
+}
+
+/// `n` 条评论共占多少行。
+fn comment_total_lines(n: usize) -> usize {
+    n * COMMENT_LINES
 }
 
 /// 初始化终端并进入事件循环。

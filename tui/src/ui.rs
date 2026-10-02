@@ -6,6 +6,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use req_guard_core::comment::{Comment, CommentState};
+use req_guard_core::requirement;
 use req_guard_core::status::{ReqStatus, StepState};
 
 /// 渲染一帧。
@@ -34,6 +36,7 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.overlay {
         Overlay::Help => render_help(f, area),
         Overlay::Audit => render_audit(f, app, area),
+        Overlay::Comments => render_comments(f, app, area),
         Overlay::None => {}
     }
     if let Some(prompt) = app.prompt {
@@ -223,7 +226,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.message {
         Some(m) => Line::from(Span::styled(m.clone(), Style::default().fg(Color::Yellow))),
         None => Line::from(
-            " a批准 r打回 n新建 g检查 b绕过 L审计 R刷新 ↑↓选择 ←→/Tab 换焦点 ?帮助 q退出 ",
+            " a批准 r打回 m评论 n新建 g检查 b绕过 L审计 R刷新 ↑↓选择 ←→/Tab换焦点 ?帮助 q退出 ",
         ),
     };
     // 折行显示：终端窄时也不至于把「q退出」这类关键提示裁掉。
@@ -248,6 +251,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  操作"),
         Line::from("    a  批准当前段（输入审核人）"),
         Line::from("    r  打回当前段（审核人 + 原因必填）"),
+        Line::from("    m  评论面板：查看 / 新增（n 普通 · N 阻塞）/ 关闭 x / 重算锚点 A"),
         Line::from("    n  新建需求（输入标题）"),
         Line::from("    g  执行门禁检查（与 CLI req-guard check 等价）"),
         Line::from("    b  应急绕过（原因必填，默认 60 分钟，写审计）"),
@@ -278,6 +282,127 @@ fn render_audit(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" 审计日志（最近 200 行，倒序）— 任意键关闭 ");
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// 评论面板：唯一**可交互**的覆盖层（其余覆盖层任意键即关）。
+///
+/// 每条评论固定占 2 行（1 行头 + 1 行正文，**不折行**、超长截断）：
+/// 这样"选中项 → 滚动位置"是确定算术（见 app 里的 `comment_top_line`），
+/// 而折行会让行数依赖终端宽度，滚动就再也算不准。
+fn render_comments(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered(area, 88, 24);
+    f.render_widget(Clear, popup);
+
+    let open = app
+        .comments
+        .iter()
+        .filter(|c| c.state == CommentState::Open)
+        .count();
+    let blocking = app.comments.iter().filter(|c| c.is_blocking_open()).count();
+
+    let mut lines: Vec<Line> = Vec::new();
+    if blocking > 0 {
+        lines.push(Line::from(Span::styled(
+            " ⛔ 有未关闭的阻塞评论 —— AI 不得编写代码（门禁会拦）",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    if app.comments.is_empty() {
+        lines.push(Line::from(
+            " （还没有评论。审核人只评论、不改正文；打回会自动留一条阻塞评论。）",
+        ));
+    }
+    for (i, c) in app.comments.iter().enumerate() {
+        lines.push(comment_header(app, i, c));
+        lines.push(comment_body(c));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " n 新增普通评论  N 新增阻塞评论  x 关闭选中  A 重算行号锚点  ↑↓/jk 选择  Esc/m/q 关闭 ",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    // 计数放在**标题**里而不是正文首行：面板会滚动，首行迟早被顶出去，
+    // 而"还有几条没解决、几条阻塞"是审核人最需要一直看得见的信息。
+    let sel = if app.comments.is_empty() {
+        String::new()
+    } else {
+        format!(" · 选中 {}/{}", app.comment_sel + 1, app.comments.len())
+    };
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " 审核评论 · {} · 共 {} 未解决 {} 阻塞 {}{} ",
+        app.current().map(|r| r.id.as_str()).unwrap_or("（无需求）"),
+        app.comments.len(),
+        open,
+        blocking,
+        sel
+    ));
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((app.comment_scroll, 0)),
+        popup,
+    );
+}
+
+/// 一条评论的头：ID / 段 / 状态 / 阻塞 / 作者 / 时间 / 行号。
+fn comment_header(app: &App, i: usize, c: &Comment) -> Line<'static> {
+    let (state_mark, state_color) = match c.state {
+        CommentState::Open => ("● open", Color::Yellow),
+        CommentState::Resolved => ("✓ resolved", Color::Green),
+    };
+    let mut spans = vec![
+        Span::raw(if i == app.comment_sel { "▶ " } else { "  " }),
+        Span::styled(
+            format!("[{}] ", c.id),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(state_mark.to_string(), Style::default().fg(state_color)),
+        Span::raw(format!(
+            " · {}",
+            c.step.as_deref().map_or("总评", requirement::step_label)
+        )),
+    ];
+    if c.blocking {
+        spans.push(Span::styled(
+            " · 阻塞".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::raw(format!(" · {} · {}", c.author, c.ts)));
+    if let Some(n) = c.line {
+        spans.push(Span::raw(format!(" · L{}", n)));
+    }
+    if c.stale {
+        spans.push(Span::styled(
+            " · ⚠ 锚点失效".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(r) = &c.reply {
+        spans.push(Span::raw(format!(" · 回复 {}", r)));
+    }
+    Line::from(spans)
+}
+
+/// 一条评论的正文（压成单行 + 截断，保证"一条评论 = 2 行"这个不变式）。
+fn comment_body(c: &Comment) -> Line<'static> {
+    let text = c.body.replace('\n', " ");
+    let mut body = text.trim().to_string();
+    if body.chars().count() > 110 {
+        body = body.chars().take(110).collect::<String>() + "…";
+    }
+    let mut spans = vec![Span::raw("    ")];
+    if let Some(q) = &c.quote {
+        spans.push(Span::styled(
+            format!("“{}” ", q),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::raw(body));
+    Line::from(spans)
 }
 
 fn render_prompt(f: &mut Frame, app: &App, prompt: Prompt, area: Rect) {
@@ -589,6 +714,189 @@ mod tests {
         app.reload();
         assert_eq!(app.step, 1, "自动刷新不应重置当前段");
         assert_eq!(app.body_scroll, 2, "自动刷新不应重置滚动位置");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 逐字符输入（模拟真人打字）。
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn enter(app: &mut App) {
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// 建一条评论（走 core，界面只负责读）。
+    fn add_comment(root: &std::path::Path, blocking: bool, text: &str) {
+        req_guard_core::comment::add(
+            root,
+            "REQ-001",
+            req_guard_core::comment::NewComment {
+                step: Some("solution"),
+                author: "寇工",
+                text,
+                quote: None,
+                blocking,
+                reply: None,
+            },
+        )
+        .expect("添加评论");
+    }
+
+    #[test]
+    fn 评论面板列出评论内容与阻塞标记() {
+        let root = temp_dir("comments-view");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, true, "回滚方案需补充 DB 迁移回退");
+        let mut app = App::new(&root);
+
+        press(&mut app, 'm');
+        assert_eq!(app.overlay, Overlay::Comments, "m 应打开评论面板");
+        assert_eq!(app.comments.len(), 1);
+
+        let text = screen(&draw(&app, 120, 34));
+        assert!(text.contains("审核评论"), "面板标题：\n{}", text);
+        assert!(text.contains("C001"), "应显示评论 ID");
+        assert!(
+            text.contains("回滚方案需补充 DB 迁移回退"),
+            "应显示评论正文：\n{}",
+            text
+        );
+        assert!(text.contains("阻塞"), "阻塞评论要有醒目标记");
+        assert!(
+            text.contains("AI 不得编写代码"),
+            "有未关闭阻塞评论时要写明后果：\n{}",
+            text
+        );
+        assert!(text.contains("技术方案"), "应显示锚定的段名：\n{}", text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 面板内新增评论走core并刷新列表() {
+        let root = temp_dir("comments-add");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        let mut app = App::new(&root);
+        press(&mut app, 'm');
+
+        // N = 新增阻塞评论；随后两个弹窗：作者 → 内容
+        press(&mut app, 'N');
+        type_text(&mut app, "寇工");
+        enter(&mut app);
+        type_text(&mut app, "缺少失败锁定");
+        enter(&mut app);
+
+        let list = req_guard_core::comment::list(&root, "REQ-001").expect("读评论");
+        assert_eq!(list.len(), 1, "评论应落盘");
+        assert!(list[0].is_blocking_open(), "N 加的是阻塞评论");
+        assert_eq!(list[0].author, "寇工");
+        assert_eq!(
+            list[0].step.as_deref(),
+            Some("decomposition"),
+            "评论锚定**当前选中段**（此时是第 1 段）"
+        );
+        assert_eq!(app.comments.len(), 1, "面板列表应已刷新");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已添加"),
+            "应给出结果提示：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 面板内关闭评论需审核人且改为resolved() {
+        let root = temp_dir("comments-resolve");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, true, "回滚方案需补充 DB 迁移回退");
+        let mut app = App::new(&root);
+        press(&mut app, 'm');
+        assert_eq!(app.comments.len(), 1);
+
+        // x 打开"关闭人"弹窗；审核人不能为空
+        press(&mut app, 'x');
+        enter(&mut app);
+        assert!(
+            req_guard_core::comment::list(&root, "REQ-001").unwrap()[0].state
+                == req_guard_core::comment::CommentState::Open,
+            "关闭人为空时不应关闭"
+        );
+
+        type_text(&mut app, "寇工");
+        enter(&mut app);
+        let list = req_guard_core::comment::list(&root, "REQ-001").expect("读评论");
+        assert_eq!(
+            list[0].state,
+            req_guard_core::comment::CommentState::Resolved,
+            "审核人署名后应关闭"
+        );
+        assert!(
+            !list[0].is_blocking_open(),
+            "关闭后不再阻塞（门禁据此放行）"
+        );
+        let text = screen(&draw(&app, 120, 34));
+        assert!(
+            text.contains("resolved"),
+            "面板应显示已关闭状态：\n{}",
+            text
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 面板内重算锚点标记失效行号() {
+        let root = temp_dir("comments-anchor");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        // quote 指向正文中并不存在的片段 → 应被标 stale
+        req_guard_core::comment::add(
+            &root,
+            "REQ-001",
+            req_guard_core::comment::NewComment {
+                step: None,
+                author: "寇工",
+                text: "带锚点的意见",
+                quote: Some("这段引用在正文中并不存在"),
+                blocking: false,
+                reply: None,
+            },
+        )
+        .expect("添加评论");
+        let mut app = App::new(&root);
+        press(&mut app, 'm');
+        press(&mut app, 'A');
+        let list = req_guard_core::comment::list(&root, "REQ-001").unwrap();
+        assert!(list[0].stale, "找不到原文的引用应标 stale");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("stale"),
+            "应提示有几条失效：{:?}",
+            app.message
+        );
+        let text = screen(&draw(&app, 120, 34));
+        assert!(text.contains("锚点失效"), "面板应标出失效：\n{}", text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 面板按键不会误触发全局动作() {
+        let root = temp_dir("comments-keys");
+        req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        add_comment(&root, false, "普通意见");
+        let mut app = App::new(&root);
+        press(&mut app, 'm');
+        // 面板开着时 a/r/n/g 不应生效（否则一个字母就误批准/误打回）
+        press(&mut app, 'a');
+        assert_eq!(app.step, 0);
+        assert!(app.prompt.is_none(), "面板内的 a 不该触发批准弹窗");
+        // Esc 关闭面板，且不退出程序
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.should_quit, "Esc 只关面板，不退出");
         let _ = std::fs::remove_dir_all(&root);
     }
 

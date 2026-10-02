@@ -105,10 +105,11 @@ pub struct ReqStatus {
 | --- | --- | --- |
 | 清单 | `req_create(root, id, title) -> Result<Requirement>` | |
 | 清单 | `req_review(root, id, step, reviewer, pass, reason, strict) -> Result<Requirement>` | approve/reject 合一 |
-| 评论 | `comment_add(root, req_id, step, author, text, quote, blocking) -> Result<Comment>` | 审核人留意见 |
-| 评论 | `comment_list(root, req_id) -> Result<Vec<Comment>>` | 含行号锚点与 state |
-| 评论 | `comment_resolve(root, req_id, cid, author) -> Result<()>` | **拒绝 `author=ai`** |
-| 评论 | `comment_refresh_anchors(root, req_id) -> Result<usize>` | 行号漂移重算，返回 stale 数 |
+| 评论 | `comment::add(root, req_id, NewComment) -> Result<Comment>` | 审核人留意见；`author=ai` 必须带 `reply` |
+| 评论 | `comment::list(root, req_id) -> Result<Vec<Comment>>` | 含行号锚点与 state |
+| 评论 | `comment::resolve(root, req_id, cid, author) -> Result<()>` | **拒绝 `author=ai`**；属审批类动作，需界面凭据 |
+| 评论 | `comment::refresh_anchors(root, req_id) -> Result<usize>` | 行号漂移重算，返回 stale 数 |
+| 评论 | `comment::summary(root, req_id) -> Result<(usize, usize)>` | （未解决, 其中阻塞）——`ReqStatus` 里的计数字段即来自它 |
 | 清单 | `req_list(root) -> Result<Vec<ReqStatus>>` | 供列表渲染 |
 | 清单 | `req_get(root, id) -> Result<ReqStatus>` | 供详情渲染 |
 | 门禁 | `gate_install(root, tools) -> Result<Vec<PathBuf>>` | |
