@@ -7,6 +7,7 @@ use eframe::egui;
 use req_guard_core::status::{self, ReqStatus, StepState};
 use req_guard_core::{comment, gate, requirement};
 
+use crate::markdown;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,13 @@ pub struct App {
     pub step: usize,
     /// 当前需求**全文**（只读；按段展示时用 [`requirement::section_of`] 切片）。
     pub body: String,
+    /// 正文是否按 Markdown 渲染（`false` = 原文等宽视图）。
+    ///
+    /// 默认渲染：审核人读的是内容而不是 `- [ ]` / `**`。原文视图保留下来是因为
+    /// 审核人偶尔要逐字核对 GATE 标记行、或整段复制去别处。
+    pub render_md: bool,
+    /// 渲染视图的解析缓存：同一段同一份原文只解析一次（egui 每帧都重画）。
+    md: markdown::Cache,
     pub dialog: Dialog,
     pub input_title: String,
     pub input_reviewer: String,
@@ -56,6 +64,8 @@ impl App {
             selected: 0,
             step: 0,
             body: String::new(),
+            render_md: true,
+            md: markdown::Cache::default(),
             dialog: Dialog::None,
             input_title: String::new(),
             input_reviewer: String::new(),
@@ -94,12 +104,18 @@ impl App {
     }
 
     fn load_body(&mut self) {
-        self.body = match self.current() {
+        let body = match self.current() {
             Some(r) => {
                 std::fs::read_to_string(&r.path).unwrap_or_else(|e| format!("读取正文失败：{}", e))
             }
             None => String::new(),
         };
+        // 只有正文真的变了才作废缓存：3s 轮询每次都清会把每帧解析变成每 3s 解析（能忍，但没必要）。
+        if body != self.body {
+            self.body = body;
+            // 正文变了 → 旧的解析结果作废（否则切需求后会渲染上一份内容）。
+            self.md.clear();
+        }
     }
 
     /// 3s 轻量轮询。
@@ -330,6 +346,23 @@ fn render_top(parent: &mut egui::Ui, app: &mut App) {
             if ui.button("切换目录").clicked() {
                 app.pick_root();
             }
+            ui.separator();
+            // 正文视图切换：默认渲染（可读性优先），原文视图给"逐字核对 / 整段复制"用。
+            ui.label("正文:");
+            if ui
+                .selectable_label(app.render_md, "渲染")
+                .on_hover_text("按 Markdown 渲染（标题/任务勾选框/表格/代码块）")
+                .clicked()
+            {
+                app.render_md = true;
+            }
+            if ui
+                .selectable_label(!app.render_md, "原文")
+                .on_hover_text("等宽显示 Markdown 源，便于逐字核对与复制")
+                .clicked()
+            {
+                app.render_md = false;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, color) = match app.current() {
                     None => ("无需求", egui::Color32::GRAY),
@@ -457,8 +490,13 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                         // 只显示**这一段**（需求分解 / 技术方案 / 测试计划），而不是整篇清单：
                         // 展开哪一段就看到哪一段，审核人不必自己在全文里找对应节，避免看错段点错批准。
                         // 切段规则在 core（与 TUI 同一条规则），定位失败时回退整篇。
-                        let mut text = requirement::section_of(&app.body, i);
-                        add_sized_text_edit(ui, &mut text);
+                        let text = requirement::section_of(&app.body, i);
+                        if app.render_md {
+                            markdown::show(ui, app.md.get(i, &text));
+                        } else {
+                            let mut raw = text;
+                            add_raw_text(ui, &mut raw);
+                        }
                     });
                 if resp.header_response.clicked() {
                     app.step = i;
@@ -495,8 +533,9 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
     });
 }
 
-/// 只读正文框：可滚动、可复制，但**不可编辑**（清单正文由 AI/编辑器维护）。
-fn add_sized_text_edit(ui: &mut egui::Ui, text: &mut String) {
+/// 原文视图：只读、可滚动、可复制，等宽逐字呈现 Markdown 源（**不可编辑**：
+/// 清单正文由 AI/编辑器维护，界面只做审核决策）。
+fn add_raw_text(ui: &mut egui::Ui, text: &mut String) {
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .show(ui, |ui| {

@@ -6,11 +6,13 @@
 //!
 //! 刻意取舍：
 //! - 正文**只读**（与 TUI 一致）：清单正文由 AI/编辑器维护，界面只做审核决策；
+//!   但默认按 Markdown **渲染**展示（见 [`markdown`]），并保留"原文"视图可切；
 //! - 中文字体必须**内嵌**：egui 默认字体不含 CJK，不内嵌就是满屏豆腐块；
 //! - 启动失败要能优雅降级（由 cli 回退到 TUI，见 `core::ui_mode`）。
 
 pub mod app;
 pub mod fonts;
+pub mod markdown;
 
 pub use app::App;
 
