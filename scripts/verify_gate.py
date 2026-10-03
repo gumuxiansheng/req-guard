@@ -225,6 +225,61 @@ CASES = [
     ),
 ]
 
+def verify_section_gate() -> bool:
+    """27–28 段落实质性场景（REQ-003）。
+
+    判定在 core（`req-guard ac check`），这里只验「二进制在 PATH 时接线正确」。
+    规则的细粒度覆盖在 `cargo test -p req-guard-core section` 里。
+    """
+    if not BIN.exists():
+        print("SKIP  27-28_段落实质性: 未构建 req-guard 二进制")
+        return True
+
+    ok = True
+    for name, fill, expect in [
+        ("27_三段全空报EmptySection", False, 1),
+        ("28_三段有实质正文则放行", True, 0),
+    ]:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{name}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        r = subprocess.run(
+            [str(BIN), "init", "-p", ".", "--tool", "none"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        if r.returncode != 0:
+            print(f"FAIL  {name}: init 失败: {r.stderr[:200]}")
+            ok = False
+            continue
+        subprocess.run(
+            [str(BIN), "create", "-p", ".", "-t", "段落实质性"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        docs = sorted((work / REQ_DIR).glob("REQ-*.md"))
+        if not docs:
+            print(f"FAIL  {name}: 未生成清单")
+            ok = False
+            continue
+        doc = docs[0]
+        content = doc.read_text(encoding="utf-8")
+        if fill:
+            # 三段各填一行：跨行注释与标题都不算，实质行才算
+            for heading in ("## 1. 需求分解", "## 2. 技术方案", "## 3. 测试计划"):
+                content = content.replace(
+                    heading + "\n", heading + "\n\n- 实质内容一行。\n", 1
+                )
+            doc.write_text(content, encoding="utf-8")
+        r = subprocess.run(
+            [str(BIN), "ac", "check", "-p", "."],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        good = r.returncode == expect
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {name}: exit={r.returncode} (期望 {expect})")
+        if not good:
+            print(f"      ↳ {(r.stdout + r.stderr)[:300]}")
+    return ok
+
+
 def verify_touch_gate() -> bool:
     """19–25 变更范围契约场景（设计文档 §6.4）。
 
@@ -379,6 +434,7 @@ def verify_pre_commit_fail_closed() -> bool:
 
 ok = ok and verify_pre_commit_fail_closed()
 ok = ok and verify_touch_gate()
+ok = ok and verify_section_gate()
 
 
 def verify_deny_wrapper() -> bool:

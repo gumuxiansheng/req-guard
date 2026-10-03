@@ -31,6 +31,12 @@
 //! （为保证审核人界面不白屏）。拿回退整篇去判 AC，标题写坏的文档会拿全文去判，
 //! "第 3 段恰好有一条 AC"这种巧合就能蒙混过关 —— 那是最坏的失效模式（看着在拦、其实没拦）。
 //!
+//! ## 覆盖面
+//!
+//! [`check`] 除了第 3 段的 A1–A12，还汇总 `crate::section` 的**三段实质正文**判定
+//! （REQ-003）。两者刻意交叉：GATE 块内的条目不计入实质正文，于是「空 AC 骨架」
+//! 会同时命中 A8 与 `EmptySection` —— 两条独立路径指向同一结论。
+//!
 //! ## 判定唯一性
 //!
 //! 本模块是 AC 格式的**唯一判定处**。刻意不提供脚本实现：判定散到第二处的那一刻起
@@ -96,6 +102,8 @@ pub enum AcIssueKind {
     InlineEntry,
     /// 第 3 段二级标题定位失败。
     SectionNotFound,
+    /// 某段实质正文为 0（`crate::section` 的判定，见 REQ-003）。
+    EmptySection,
 }
 
 /// 一条 AC 问题。`message` 自含上下文（编号 + 行号 + 修复指引），可直接展示。
@@ -128,6 +136,7 @@ impl AcIssueKind {
             AcIssueKind::StrayHeading => "StrayHeading",
             AcIssueKind::InlineEntry => "InlineEntry",
             AcIssueKind::SectionNotFound => "SectionNotFound",
+            AcIssueKind::EmptySection => "EmptySection",
         }
     }
 }
@@ -235,12 +244,26 @@ pub fn check(root: &Path, target: &AcTarget<'_>) -> Result<Vec<AcIssue>> {
         };
         out.extend(issues.into_iter().map(|mut i| {
             i.message = format!("{} {}", r.id, i.message);
-            let _ = &name;
             i
         }));
+        let _ = name;
+        // 段落实质性（REQ-003）：三段逐段独立判定。段定位失败时**不**报空段 ——
+        // 那已由 SectionNotFound 说过一遍，重复报等于噪音掩盖真问题。
+        let ph = requirement::template_placeholder_texts();
+        for step in 0..STEPS_LEN {
+            if crate::section::is_section_empty(&content, step, &ph) == Some(true) {
+                out.push(AcIssue::err(
+                    AcIssueKind::EmptySection,
+                    crate::section::empty_section_message(&r.id, step),
+                ));
+            }
+        }
     }
     Ok(out)
 }
+
+/// 三段步骤数（与 [`requirement::STEPS`] 一致；避免在 core 内部再引一次常量数组）。
+const STEPS_LEN: usize = 3;
 
 /// 校验一段正文（**纯函数**）：`first_line` 是该段首行在原文件中的 1-based 行号，
 /// 报错时用于给出可跳转的行号。
@@ -942,20 +965,29 @@ mod tests {
         let root = temp_dir("ac-nofind");
         crate::gate::install(&root, &["none".to_string()], false).unwrap();
         crate::requirement::create(&root, None, "坏标题").unwrap();
+        // 先把三段填成有实质正文，再破坏第 3 段标题 ——
+        // 否则段落实质性门禁会额外报 EmptySection，掩盖本用例要验的那条。
+        crate::testutil::fill_sections(&root, "REQ-001");
         let r = crate::requirement::find(&root, "REQ-001").unwrap();
         let c = std::fs::read_to_string(&r.path).unwrap();
         // 把第 3 段标题改成非法形式：换成不参与编号的形式
         let broken = c.replace("## 3. 测试计划", "### 三、测试计划");
         std::fs::write(&r.path, broken).unwrap();
 
+        // 各规则各管各的：只对 SectionNotFound 那条断言，不要求其它规则闭嘴
         let issues = check(&root, &AcTarget::All).unwrap();
+        let nf: Vec<&AcIssue> = issues
+            .iter()
+            .filter(|i| i.kind == AcIssueKind::SectionNotFound)
+            .collect();
+        assert_eq!(1, nf.len(), "标题写坏必须报且只报一次定位失败：{issues:?}");
         assert!(
-            kinds(&issues).contains(&AcIssueKind::SectionNotFound),
-            "标题写坏必须报定位失败，issues={issues:?}"
+            nf[0].message.contains("不回退整篇"),
+            "错误文案要说明为什么不回退：{issues:?}"
         );
         assert!(
-            issues.iter().all(|i| i.message.contains("不回退整篇")),
-            "错误文案要说明为什么不回退：{issues:?}"
+            !issues.iter().any(|i| i.kind == AcIssueKind::EmptySection),
+            "标题写坏不应连带报空段（那是另一条规则，且会掩盖真问题）：{issues:?}"
         );
         cleanup(&root);
     }
@@ -966,6 +998,8 @@ mod tests {
         let root = temp_dir("ac-ok");
         crate::gate::install(&root, &["none".to_string()], false).unwrap();
         crate::requirement::create(&root, None, "合规").unwrap();
+        // 三段都要有实质正文（段落实质性门禁），只填第 3 段的 AC 不够
+        crate::testutil::fill_sections(&root, "REQ-001");
         let r = crate::requirement::find(&root, "REQ-001").unwrap();
         let c = std::fs::read_to_string(&r.path).unwrap();
         std::fs::write(

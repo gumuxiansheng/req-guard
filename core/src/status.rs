@@ -251,11 +251,12 @@ fn dash_to_none(v: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{cleanup, temp_dir};
+    use crate::testutil::{cleanup, fill_sections, temp_dir};
 
     fn setup(tag: &str) -> PathBuf {
         let root = temp_dir(tag);
         crate::requirement::create(&root, None, "状态快照").unwrap();
+        fill_sections(&root, "REQ-001");
         root
     }
 

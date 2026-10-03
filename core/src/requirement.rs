@@ -346,6 +346,29 @@ fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
     Err(GateError::Validation(msg))
 }
 
+/// 三段模板正文（`create` 实际写出的内容），供占位文案派生。
+///
+/// **刻意暴露而不是让调用方各自持有**：占位文案若在判定侧另写一份，
+/// 模板一改判定就认不出来（漂移的起点）。`crate::section` 据此派生，
+/// 并用 `防漂移_真实模板每条占位都被识别` 锁住。
+pub fn template_bodies() -> [&'static str; 3] {
+    [DECOMPOSITION_BODY, SOLUTION_BODY, TESTPLAN_BODY]
+}
+
+/// 模板占位文案集合（由 [`template_bodies`] 派生）。
+pub fn template_placeholder_texts() -> Vec<String> {
+    crate::section::placeholder_texts(&template_bodies())
+}
+
+/// 渲染某一段的机读标记名（供错误文案指路，避免调用方硬编码字符串）。
+pub fn render_marker(step: &str) -> &'static str {
+    match step {
+        "testplan" => crate::ac::BEGIN,
+        "solution" => crate::touch::BEGIN,
+        _ => "-",
+    }
+}
+
 /// 技术方案批准前的**变更范围门禁 + `source_refs` 单向派生**（设计文档 §3.8）。
 ///
 /// 返回**可能已被改写**的正文：frontmatter 的 `source_refs` 由第 2 段的
@@ -556,6 +579,24 @@ pub fn review(
                     s.1,
                     if st.is_empty() { "pending" } else { &st }
                 )));
+            }
+        }
+    }
+
+    // 段落实质性（声明侧）：**被批准的那一段**必须有实质正文。
+    //
+    // 为什么放在 AC / TOUCH 校验之前：整段空模板是更根本的失败 ——
+    // 「第 3 段 0 行实质正文」比「第 3 段缺 AC 块」更可执行，前者指方向、后者指格式。
+    //
+    // 为什么任何等级都拒绝（不像 TOUCH 那样 L0 放行）：内容为空不是"管理严格度"问题。
+    // 唯一的例外是段定位失败（标题被改坏），那由 `ac::check` 报 SectionNotFound。
+    if pass {
+        if let Some(step) = STEPS.iter().position(|(k, _)| *k == step) {
+            let ph = template_placeholder_texts();
+            if crate::section::is_section_empty(&content, step, &ph) == Some(true) {
+                return Err(GateError::Validation(
+                    crate::section::empty_section_message(&r.id, step),
+                ));
             }
         }
     }
@@ -1398,7 +1439,7 @@ const TESTPLAN_BODY: &str = "\
 #[allow(non_snake_case)] // 与既有中文测试命名一致
 mod tests {
     use super::*;
-    use crate::testutil::{cleanup, temp_dir};
+    use crate::testutil::{cleanup, fill_sections, temp_dir};
 
     /// 基于真实模板造出指定三段状态的清单正文。
     fn content_with(states: [&str; 3]) -> String {
@@ -1518,6 +1559,7 @@ mod tests {
         let root = temp_dir("req-review");
         create(&root, None, "顺序校验").unwrap();
 
+        fill_sections(&root, "REQ-001");
         let e = review(&root, "REQ-001", "solution", "寇工", true, "", true).unwrap_err();
         assert!(
             e.to_string().contains("审核顺序未满足"),
@@ -1552,6 +1594,7 @@ mod tests {
         // 取值依赖运行机的 git 全局身份，CI 上不可控。
         let root = temp_dir("req-review-id");
         create(&root, None, "身份绑定").unwrap();
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
 
         let r = find(&root, "REQ-001").unwrap();
@@ -1602,6 +1645,7 @@ mod tests {
 
         // L0：放行但告警（存量项目不卡死）
         set_auth_level(&root, 0);
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
         assert!(
             review(&root, "REQ-001", "solution", "寇工", true, "", false).is_ok(),
@@ -1690,6 +1734,7 @@ mod tests {
         create(&root, None, "派生").unwrap();
         let p = find(&root, "REQ-001").unwrap().path;
 
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
         review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
 
@@ -1725,6 +1770,7 @@ mod tests {
         // 拒绝一个方案不需要先声明改动范围——门禁只作用于 approve
         let root = temp_dir("req-refs-reject");
         create(&root, None, "声明契约").unwrap();
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
         assert!(
             review(
@@ -1794,6 +1840,7 @@ mod tests {
         crate::testutil::disable_auth(&root);
         create(&root, None, "已完成").unwrap();
         for s in ["decomposition", "solution", "testplan"] {
+            fill_sections(&root, "REQ-001");
             review(&root, "REQ-001", s, "寇工", true, "", true).unwrap();
         }
         assert!(crate::gate::gate_check(&root).unwrap().is_pass());
@@ -2076,6 +2123,7 @@ mod tests {
         create(&root, None, "AC 门禁").unwrap();
         let p = find(&root, "REQ-001").unwrap().path;
 
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
         review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
 
@@ -2130,6 +2178,7 @@ mod tests {
         crate::gate::install(&root, &["none".to_string()], false).unwrap();
         disable_auth(&root);
         create(&root, None, "AC 门禁打回").unwrap();
+        fill_sections(&root, "REQ-001");
         review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
         assert!(
             review(

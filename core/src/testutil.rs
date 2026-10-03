@@ -51,3 +51,24 @@ pub fn set_auth_level(root: &std::path::Path, level: u8) {
     s.push_str(&format!("\nauth:\n  level: {}\n", level));
     fs::write(&y, s).expect("写入测试 yaml 失败");
 }
+
+/// 给清单三段各填一行实质正文。
+///
+/// 段落实质性门禁（`core/src/section.rs`）之后，"刚 `create` 出来、还没填内容的
+/// 清单"不再能通过 `approve` —— 这是设计意图。于是凡是用 `create` + `approve`
+/// 夹具来测**别的东西**（审核顺序、归档、身份绑定、审计）的用例，都得先填一段。
+/// 统一走这个助手，避免每个用例各写一份填充逻辑、哪天又漏一处。
+pub fn fill_sections(root: &std::path::Path, id: &str) {
+    let p = crate::requirement::find(root, id).expect("清单应存在").path;
+    let mut c = std::fs::read_to_string(&p).expect("清单应可读");
+    for (heading, line) in [
+        ("## 1. 需求分解", "- 背景与问题：本用例的测试夹具。"),
+        ("## 2. 技术方案", "- 总体思路：本用例的测试夹具。"),
+        ("## 3. 测试计划", "- 测试计划：本用例的测试夹具。"),
+    ] {
+        let needle = format!("{heading}\n");
+        assert!(c.contains(&needle), "模板结构变了：找不到 {heading}");
+        c = c.replacen(&needle, &format!("{needle}\n{line}\n"), 1);
+    }
+    std::fs::write(&p, c).expect("清单应可写");
+}

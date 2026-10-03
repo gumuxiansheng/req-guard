@@ -711,16 +711,27 @@ fn run_ac(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
 
     let errors: Vec<&ac::AcIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
     let warns: Vec<&ac::AcIssue> = issues.iter().filter(|i| !i.severity.is_error()).collect();
+    // 按设计文档 §2.4 的输出格式渲染：`{标记} [{严重级}] [{Kind}] {message}`。
+    // **Kind 必须打出来**：文案只有自然语言时，人无法判断命中的是哪条规则，
+    // 也没法据此去查规则表（同一段正文可能同时命中 A1 与 EmptySection）。
     for i in errors.iter().chain(warns.iter()) {
         let mark = if i.severity.is_error() {
             "✗"
         } else {
             "⚠️"
         };
-        println!("{} [{}] {}", mark, i.severity.as_str(), i.message);
+        println!(
+            "{} [{}] [{}] {}",
+            mark,
+            i.severity.as_str(),
+            i.kind_as_str(),
+            i.message
+        );
     }
     if issues.is_empty() {
-        println!("✅ 验收标准合规：第 3 段的 AC 编号连续、Given/When/Then 齐备且可度量");
+        println!(
+            "✅ 清单内容合规：第 3 段 AC 编号连续、Given/When/Then 齐备且可度量，三段均有实质正文"
+        );
     }
     if !errors.is_empty() {
         eprintln!(
@@ -759,7 +770,12 @@ fn run_touch_check(root: &Path, a: &cli::Args) -> Result<()> {
     let issues = touch::check(root, scope, only.as_deref(), &src)?;
     let errs: Vec<&touch::TouchIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
     for i in &errs {
-        println!("✗ [{}] {}", i.severity.as_str(), i.message);
+        println!(
+            "✗ [{}] [{}] {}",
+            i.severity.as_str(),
+            i.kind.as_str(),
+            i.message
+        );
     }
     if issues.is_empty() {
         println!("✅ 变更范围合规：本次改动都在技术方案段的 GATE:TOUCH 声明范围内");

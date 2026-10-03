@@ -19,6 +19,7 @@ pub mod issue;
 /// AI 工具 hook payload 解析（PreToolUse 的 stdin JSON）。
 pub mod json;
 pub mod requirement;
+pub mod section;
 pub mod specmeta;
 pub mod status;
 pub mod token;

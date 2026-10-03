@@ -2111,6 +2111,8 @@ exit 0
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::fill_sections;
+
     /// `PRE_COMMIT_BLOCK`（新装时整块追加）与 `PRE_COMMIT_TOUCH_BLOCK`
     /// （给「已装旧版主门禁」的老仓库单独补的那段）**必须逐字一致**。
     ///
@@ -2711,6 +2713,7 @@ mod tests {
         assert!(c.contains("BYPASS-OPEN actor=寇工"), "{}", c);
 
         let req = crate::requirement::create(&root, None, "台账测试").unwrap();
+        fill_sections(&root, "REQ-001");
         crate::requirement::review(&root, &req.id, "decomposition", "寇工", true, "", true)
             .unwrap();
         let c = fs::read_to_string(root.join(LEDGER_REL)).unwrap();
