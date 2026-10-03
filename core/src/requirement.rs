@@ -346,29 +346,161 @@ fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
     Err(GateError::Validation(msg))
 }
 
-/// 技术方案批准前的声明侧门禁：`source_refs` 必须非空。
+/// 技术方案批准前的**变更范围门禁 + `source_refs` 单向派生**（设计文档 §3.8）。
 ///
-/// 判级与身份绑定一致（L1+ fail-closed / L0 放行）——理由相同：AI 也能调 approve，
-/// 把「不许留空」放在 L0 等于没有门禁；但 L0 仍必须放行，否则所有存量项目
-/// （清单创建于本版本之前、根本没有 frontmatter）会一步卡死在 approve 上。
-fn ensure_source_refs(root: &Path, content: &str) -> Result<()> {
-    let meta = crate::specmeta::extract(content).unwrap_or_default();
-    if meta.has_source_refs() {
-        return Ok(());
+/// 返回**可能已被改写**的正文：frontmatter 的 `source_refs` 由第 2 段的
+/// `GATE:TOUCH` 块派生，不要求也不允许人工维护第二份。
+///
+/// 为什么这样收口：两处都要求人写同一份文件清单，必然漂移；而漂移的声明等于
+/// 没有声明。`GATE:TOUCH` 在第 2 段（人读的位置、且已是"涉及的文件与模块清单"
+/// 那一节的自然落点），`source_refs` 在文件最前（`doc-guard` 的
+/// `matter::extract` 要求首个非空行是 `---`，位置改不了）。
+///
+/// 判级沿用 L0 放行 / L1+ 拒绝：存量清单创建于 `GATE:TOUCH` 之前，
+/// 一律拒绝会把它们**永久卡死**在 approve 上（与 `ensure_source_refs` 同理）。
+/// 但**派生照做** —— 有声明就派生，没有就不写。
+fn ensure_touch_declared(root: &Path, id: &str, content: &str) -> Result<String> {
+    let reject = |msg: String| -> Result<String> {
+        let level = crate::auth::effective_level(root);
+        if level >= 1 {
+            return Err(GateError::Validation(format!(
+                "需求 {id} 的变更范围声明不合规，拒绝批准技术方案：\n\n{msg}"
+            )));
+        }
+        eprintln!("⚠️ 警告（L{level}）：{msg}");
+        Ok(content.to_string())
+    };
+
+    let Some((start, end)) = section_span(content, 1) else {
+        return reject(
+            "「## 2. 技术方案」二级标题定位失败，无法校验变更范围声明。\n\
+             请把该段标题改回 `## 2. 技术方案`。"
+                .to_string(),
+        );
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let section = lines[start - 1..end].join("\n");
+
+    let paths: Vec<String> = match crate::touch::block_state(&section) {
+        crate::touch::BlockState::Missing => {
+            return reject(format!(
+                "技术方案段没有 {} 标记块 —— 「方案没说改哪儿」就无法核对改动范围。\n\
+                 请在「## 2. 技术方案」下加入：\n\
+                 {}\ncore/src/**\n{}",
+                crate::touch::BEGIN,
+                crate::touch::BEGIN,
+                crate::touch::END
+            ));
+        }
+        crate::touch::BlockState::Unclosed => {
+            return reject(format!(
+                "技术方案段的声明块有 {} 但没有 {}。",
+                crate::touch::BEGIN,
+                crate::touch::END
+            ));
+        }
+        crate::touch::BlockState::Found => {
+            let (paths, bad, _) = crate::touch::declared(&section, start);
+            if !bad.is_empty() {
+                return reject(format!(
+                    "变更范围声明里这些行无法归一（不得含 `..` 或以 `/` 开头）：\n  - {}",
+                    bad.iter()
+                        .map(|(r, l)| format!("第 {l} 行 {r:?}"))
+                        .collect::<Vec<_>>()
+                        .join("\n  - ")
+                ));
+            }
+            paths
+        }
+    };
+    if paths.is_empty() {
+        return reject(format!(
+            "{} 块里没有任何有效声明条目。\n\
+             请逐行写出本次要改的文件或 glob（`#` 后为注释，空行忽略）。",
+            crate::touch::BEGIN
+        ));
     }
-    let hint = meta.missing_source_refs_hint();
-    let level = crate::auth::effective_level(root);
-    if level >= 1 {
-        return Err(GateError::Validation(format!(
-            "技术方案缺少 source_refs 声明，无法把规格与代码绑定，故拒绝批准。\n\n{}",
-            hint
-        )));
+
+    // 派生 → 写 frontmatter（有 frontmatter 才写；存量清单不动它）
+    let (derived, dropped) = crate::touch::to_source_refs(&paths);
+    for d in &dropped {
+        // 静默丢弃 = 人以为已声明。用告警说清：这类 glob 的目录语义是整个仓库，
+        // 而 source_refs 的元素是「目录前缀」，表达不出「仓库根」。
+        eprintln!(
+            "⚠️ 需求 {id} 的声明条目 {d:?} 无法写进 frontmatter 的 source_refs：\n\
+             它的目录语义是整个仓库，而 source_refs 的元素是「目录前缀 + 向下递归」。\n\
+             请把它改写成具体的顶层目录（如 `backend/`、`frontend/`），否则 doc-guard\n\
+             侧无从判断这批改动是否需要同步规格。"
+        );
     }
-    eprintln!(
-        "⚠️ 警告（L{}）：技术方案缺少 source_refs 声明，已放行。{}",
-        level, hint
-    );
-    Ok(())
+    let old = crate::specmeta::extract(content)
+        .map(|m| m.source_refs)
+        .unwrap_or_default();
+    if old != derived {
+        match set_frontmatter_list(content, "source_refs", &derived) {
+            Some(next) => {
+                let event = format!(
+                    "DERIVE_SOURCE_REFS {} {} -> {}",
+                    id,
+                    if old.is_empty() {
+                        "-".to_string()
+                    } else {
+                        old.join(",")
+                    },
+                    derived.join(",")
+                );
+                crate::gate::audit(root, &event);
+                crate::gate::audit_ledger(root, &event);
+                return Ok(next);
+            }
+            None => {
+                // 无 frontmatter 的存量清单：无法安全插入（doc-guard 要求它在文件最前，
+                // 而 create 已经决定要不要生成）。不写，也不报错。
+                eprintln!(
+                    "⚠️ 需求 {id} 没有 frontmatter，source_refs 无法派生写入（该清单早于本功能）。\n\
+                     其变更范围仍受 GATE:TOUCH 与 touch-check 约束；\
+                     如需 doc-guard 侧也复核，请 req-guard archive 后新建清单。"
+                );
+            }
+        }
+    }
+    Ok(content.to_string())
+}
+
+/// 改写 frontmatter 里的行内数组字段；无 frontmatter 或无解时返回 `None`。
+///
+/// **只改值、不动其它行**：frontmatter 必须保持在文件最前（`doc-guard` 的
+/// `matter::extract` 要求首个非空行是 `---`），插入位置错一个字节就会让
+/// 整份清单失去 frontmatter。
+fn set_frontmatter_list(content: &str, key: &str, values: &[String]) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| !l.trim().is_empty() && l.trim().trim_start_matches('\u{feff}') == "---")?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim() == "---")
+        .map(|i| start + 1 + i)?;
+    let rendered = format!("{}: [{}]", key, values.join(", "));
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut done = false;
+    for (i, l) in lines.iter().enumerate() {
+        if i > start && i < end && !done {
+            let t = l.trim();
+            if let Some((k, _)) = t.split_once(':') {
+                if k.trim() == key {
+                    out.push(rendered.clone());
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        if i == end && !done {
+            out.push(rendered.clone());
+        }
+        out.push(l.to_string());
+    }
+    Some(out.join("\n"))
 }
 
 /// 审核某一阶段：`pass=true` 通过，`pass=false` 打回。
@@ -395,7 +527,7 @@ pub fn review(
     )?;
     validate_step(step)?;
     let r = find(root, id)?;
-    let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
+    let mut content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
         source: e,
     })?;
@@ -438,7 +570,8 @@ pub fn review(
         ensure_ac_compliant(&r.id, &content)?;
     }
 
-    // 规格时效契约（声明侧）：**技术方案**批准前必须已声明 source_refs。
+    // 变更范围契约（声明侧）：**技术方案**批准前 `GATE:TOUCH` 必须有有效条目，
+    // 且由它**单向派生**写入 frontmatter 的 `source_refs`（设计文档 §3.8）。
     //
     // 为什么卡在第二段而不是第一段：需求分解阶段还在澄清背景与目标，往往还不知道
     // 要改哪些文件；等到「涉及的文件与模块清单」这一步，声明范围才成为可核对的契约。
@@ -449,7 +582,7 @@ pub fn review(
     // 于是「声明为空」这条路径在 doc-guard 侧完全静默——规格看似接入时效治理，
     // 实则永远不会被判过期。故声明侧的门禁只能放在批准动作上。
     if pass && step == "solution" {
-        ensure_source_refs(root, &content)?;
+        content = ensure_touch_declared(root, &r.id, &content)?;
     }
 
     let new_status = if pass { "approved" } else { "rejected" };
@@ -1478,72 +1611,112 @@ mod tests {
         cleanup(&root);
     }
 
-    /// 直接测 [`ensure_source_refs`]：走 `review()` 会先被审批锁拦下
+    /// 直接测 [`ensure_touch_declared`]：走 `review()` 会先被审批锁拦下
     /// （L1+ 要求 TTY 在场证明，单测环境是非交互管道），那部分另有测试覆盖。
+    ///
+    /// 判级矩阵与被替换掉的 `ensure_source_refs` 一致（L0 放行 / L1+ 拒绝）——
+    /// 存量清单创建于 `GATE:TOUCH` 之前，一律拒绝会把它永久卡死。
     #[test]
-    fn ensure_source_refs_判级矩阵() {
+    fn touch_门禁判级矩阵() {
         use crate::testutil::set_auth_level;
-        let root = temp_dir("req-refs-l1");
+        let root = temp_dir("req-touch-l1");
         create(&root, None, "声明契约").unwrap();
         let r = find(&root, "REQ-001").unwrap();
         let template = fs::read_to_string(&r.path).unwrap();
         assert!(
-            !crate::specmeta::extract(&template)
-                .unwrap()
-                .has_source_refs(),
-            "模板必须给出空 source_refs 骨架（待填），而非已声明"
+            template.contains(crate::touch::BEGIN),
+            "模板必须带 GATE:TOUCH 骨架"
         );
-
-        // 存量清单：完全没有 frontmatter → 同样算未声明
-        let legacy = "# REQ-001\n\n正文".to_string();
-
-        // L0：放行（存量项目不卡死）
-        set_auth_level(&root, 0);
-        assert!(ensure_source_refs(&root, &template).is_ok(), "L0 应放行");
-        assert!(
-            ensure_source_refs(&root, &legacy).is_ok(),
-            "L0 无 frontmatter 也放行"
-        );
-
-        // L1+：拒绝，且文案可执行
-        for level in [1u8, 2, 3] {
-            set_auth_level(&root, level);
-            for (tag, body) in [("空数组", &template), ("无 frontmatter", &legacy)] {
-                let e = ensure_source_refs(&root, body)
-                    .expect_err(&format!("L{} {} 必须拒绝", level, tag));
-                let msg = e.to_string();
-                assert!(msg.contains("source_refs"), "L{} {}: {}", level, tag, msg);
-                assert!(
-                    msg.contains("backend/src/main/java/com/x"),
-                    "L{} {} 须给写法示例: {}",
-                    level,
-                    tag,
-                    msg
-                );
-                assert!(
-                    msg.contains("不支持 glob"),
-                    "L{} {} 须说明目录语义: {}",
-                    level,
-                    tag,
-                    msg
-                );
-            }
-        }
-
-        // 已声明 → 各等级均放行
-        let filled = template.replace(
-            "source_refs: []",
-            "source_refs: [backend/src/main/java/com/x]",
-        );
-        for level in [0u8, 3] {
+        // 模板自带的声明是 core/src/** → 非空 → 各等级都放行
+        for level in [0u8, 1, 3] {
             set_auth_level(&root, level);
             assert!(
-                ensure_source_refs(&root, &filled).is_ok(),
-                "L{} 已声明后应放行",
-                level
+                ensure_touch_declared(&root, "REQ-001", &template).is_ok(),
+                "L{level} 模板自带声明应放行"
             );
         }
 
+        // 无 TOUCH 块 → L0 放行、L1+ 拒绝，且文案指向 GATE:TOUCH
+        let no_block = template
+            .replace(crate::touch::BEGIN, "")
+            .replace(crate::touch::END, "");
+        set_auth_level(&root, 0);
+        assert!(
+            ensure_touch_declared(&root, "REQ-001", &no_block).is_ok(),
+            "L0 放行"
+        );
+        for level in [1u8, 2, 3] {
+            set_auth_level(&root, level);
+            let e = ensure_touch_declared(&root, "REQ-001", &no_block)
+                .expect_err(&format!("L{level} 无声明块必须拒绝"));
+            let m = e.to_string();
+            assert!(m.contains("GATE:TOUCH"), "L{level} 须点名标记: {m}");
+            assert!(m.contains("技术方案"), "L{level} 须指明是哪一段: {m}");
+        }
+
+        // 空块（标记在、里面没条目）→ 同样拒绝，且理由是"没写"而不是"没有块"
+        let empty_block = template
+            .lines()
+            .filter(|l| !l.starts_with("core/src/**"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        set_auth_level(&root, 3);
+        let e = ensure_touch_declared(&root, "REQ-001", &empty_block).expect_err("空块必须拒绝");
+        assert!(e.to_string().contains("没有任何有效声明条目"), "{}", e);
+
+        // `..` 逃逸条目 → 拒绝并点名行号
+        let bad_path = template.replace("core/src/**", "../outside/**");
+        let e = ensure_touch_declared(&root, "REQ-001", &bad_path).expect_err("BadPath 必须拒绝");
+        let m = e.to_string();
+        assert!(m.contains("无法归一"), "{m}");
+        assert!(m.contains("../outside/**"), "须点名条目: {m}");
+
+        // 标题写坏 → 拒绝（不回退整篇）
+        let broken = template.replace("## 2. 技术方案", "### 二、技术方案");
+        let e = ensure_touch_declared(&root, "REQ-001", &broken).expect_err("标题写坏必须拒绝");
+        assert!(e.to_string().contains("定位失败"), "{}", e);
+
+        cleanup(&root);
+    }
+
+    /// 派生写侧：`source_refs` 由 `GATE:TOUCH` 单向生成，手改值会被覆盖并留审计。
+    #[test]
+    fn touch_派生source_refs并覆盖手改值() {
+        use crate::testutil::{disable_auth, set_auth_level};
+        let root = temp_dir("req-derive");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_auth_level(&root, 0);
+        create(&root, None, "派生").unwrap();
+        let p = find(&root, "REQ-001").unwrap().path;
+
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
+
+        let c = fs::read_to_string(&p).unwrap();
+        let refs = crate::specmeta::extract(&c).unwrap().source_refs;
+        assert_eq!(
+            vec!["core/src".to_string()],
+            refs,
+            "core/src/** 应派生成 core/src（source_refs 是目录语义、不支持 glob）"
+        );
+
+        // 手改 frontmatter → 重新 approve 时被覆盖回去，并留 DERIVE_SOURCE_REFS 审计
+        let tampered = c.replace("source_refs: [core/src]", "source_refs: [docs]");
+        fs::write(&p, tampered).unwrap();
+        review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            vec!["core/src".to_string()],
+            crate::specmeta::extract(&after).unwrap().source_refs,
+            "手改值必须被派生值覆盖回去（声明源唯一性）"
+        );
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(
+            ledger.contains("DERIVE_SOURCE_REFS") && ledger.contains("docs -> core/src"),
+            "覆盖必须入台账（谁改了声明范围要在 PR diff 里可复核）:\n{}",
+            ledger
+        );
         cleanup(&root);
     }
 

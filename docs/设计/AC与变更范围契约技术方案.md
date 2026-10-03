@@ -400,10 +400,15 @@ req-guard touch --declare <glob>... [--reason <原因>]
 
 1. 读第 2 段的 `GATE:TOUCH` 块（§3.3 的 `declared()`）。
 2. 归一每条路径（反斜杠 → `/`、去 `./`），去重、**保序**（顺序影响 diff 稳定性）。
-3. **glob → 前缀降级**（因 `source_refs` 不支持 glob）：
-   - `core/src/**` → `core/src`
+3. **一律降级为目录前缀**（`source_refs` 不支持 glob，且**元素按「目录 + 向下递归」理解**
+   —— 此点已与 `doc-guard` 侧确认，FRS004 对文件路径元素同样按目录处理）：
+   - `core/src/**` → `core/src`（截到通配符前）
    - `core/src/*.rs` → `core/src`
-   - `cli/src/cli.rs` → `cli/src/cli.rs`（无通配符的条目**原样保留**）
+   - `cli/src/cli.rs` → **`cli/src`**（取所在目录）
+   - `docs/README.md` → `docs`
+   - `Makefile`（根级文件）→ 保留原样：无父目录可退，退成仓库根等于声明「整个仓库」
+   - `**/*.rs`（通配符在首段）→ **丢弃并告警**：它的目录语义是整个仓库，
+     而 `source_refs` 表达不出「仓库根」；静默丢弃会让人以为已声明
 4. 写入 frontmatter `source_refs: [a, b, c]`（行内数组，与 `specmeta` 的解析子集一致）。
 5. 派生结果与 frontmatter 现值不同 → **覆盖**，并写审计事件
    `DERIVE_SOURCE_REFS changed=<old> → <new>`（PR diff 里可直接复核谁改了声明范围）。
@@ -417,10 +422,12 @@ req-guard touch --declare <glob>... [--reason <原因>]
 这是**有意偏保守**：误差方向是「多报规格腐化」而非「漏报」。多报是安全侧失效（吵但不出事），
 漏报是危险侧失效（看起来配好了、实际永远不判过期）。
 
-**开放问题（需与 `doc-guard` 侧确认，本仓库无法验证）**：`source_refs` 的元素若为
-一个**恰好存在的文件路径**（而非目录），FRS004 是按精确文件匹配，还是仍按"目录 + 向下递归"处理？
-两种答案下派生规则不同：前者可原样保留文件路径（无损），后者必须降级为目录（有损）。
-**确认之前一律按后者（有损、偏保守）实现**，并把该问题记入 §7 风险表。
+**已确认（2026-10-04，与 `doc-guard` 侧）**：FRS004 对 `source_refs` 的元素**一律**按
+「目录前缀 + 向下递归」理解，文件路径元素不按精确匹配。
+
+这条确认改变了一处实现：原先打算「无通配符的条目原样保留」是**错的** ——
+`cli/src/cli.rs` 原样写进去，FRS004 会去找以 `cli/src/cli.rs/` 为前缀的改动，
+**永远匹配不到**，等于一份静默失效的声明。故降级改为无条件。
 
 #### 与 P0 的叠加
 
@@ -498,7 +505,7 @@ req-guard touch --declare <glob>... [--reason <原因>]
 | `touch-check [--base <ref>]` 与 `touch --declare --glob <p>` | ✅ 已落地 |
 | 独立脚本 `.gates/hooks/req-guard-touch-check.sh` + `PRE_COMMIT_BLOCK` 两段 + `verify_install` 三项缺口 | ✅ 已落地 |
 | `verify_gate.py` 场景 19–26 + CI 模板 `--base` 一步 | ✅ 已落地 |
-| **`source_refs` 派生回写 frontmatter**（§3.8 的写侧；`to_source_refs` 已就绪，`review` 未接线） | 待建 |
+| **`source_refs` 派生回写 frontmatter**（§3.8 写侧：`ensure_touch_declared` + `set_frontmatter_list`；`ensure_source_refs` 已被取代并删除） | ✅ 已落地 |
 
 ### 5bis.3 判定分层（决定可测性）
 
@@ -606,7 +613,7 @@ Given 外部指代（`NonSelfContained`）；块内混入分组标题（`StrayHe
 | 强度依赖 `auth.level`：`touch --declare` 走 `ensure_human`，L0（无审批锁）下 AI 可自行扩范围 | 与 `core/src/auth.rs` 的信任模型同源，文档写明，不额外兜底 |
 | 存量清单迁移 | 先落 P1 的 `ac init`，再开 P2 的 Error |
 | 追溯矩阵仍是零 | 本次只把 join key（AC 编号 + 文件 glob）落到文档里；矩阵本体不存在，别在需求描述里当已有能力 |
-| **`source_refs` 派生的精度损失**（§3.8） | `source_refs` 不支持 glob，带 glob 的 TOUCH 条目只能降级成目录 → 声明范围变宽 → FRS004 多报。有意偏保守（误差在安全侧）。**开放问题**：元素为恰好存在的文件路径时 FRS004 是精确匹配还是仍按目录递归 —— 本仓库无法验证，确认前按"仍按目录"实现 |
+| **`source_refs` 派生的精度损失**（§3.8） | 元素按「目录 + 向下递归」理解（**已与 doc-guard 侧确认**），故 glob 与文件路径一律降级成目录 → 声明范围变宽 → FRS004 多报。有意偏保守（误差在安全侧）。无法表达的声明（`**/*.rs` 这类通配符在首段的）**丢弃并告警**，不静默丢 |
 | **并发改动的合流风险** | `specmeta` 那条线正在改 `review()` / `gate.rs`，本方案的 P0-1 与派生逻辑也要改同一批文件。**必须同一人合并完成**，否则易只改一处、把 `contains("GATE:STEP")` 的子串匹配漏洞留下 |
 | 单行式废除后仍可能有历史残留 | A12 `InlineEntry` 会把残留判为 Error；存量清单升级前需先跑一遍迁移（与 §2.7 的 `ac init` 同一时机） |
 

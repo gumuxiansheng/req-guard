@@ -646,39 +646,57 @@ pub fn declare(
     Ok(added)
 }
 
-/// glob → `source_refs` 的**前缀降级**（§3.8）。
+/// glob / 路径 → `source_refs` 的**目录降级**（§3.8）。
 ///
-/// `source_refs` 是目录前缀 + 向下递归、不支持 glob，故带通配符的条目只能降级成
-/// 目录：`core/src/**` → `core/src`。这是**有意偏保守** —— 声明范围变宽，
-/// doc-guard 的 FRS004 会多报规格腐化（吵但不出事），而不是漏报
-/// （看起来配好了、实际永远不判过期）。
+/// **已确认的 doc-guard 语义（FRS004）**：元素一律按「目录前缀 + 向下递归」理解。
+/// 由此得出两条实现规则：
 ///
-/// 无通配符的条目**原样保留**（不降级）：是否真的无损取决于 doc-guard 侧对
-/// "恰好存在的文件路径"如何处理，那是跨 crate 的开放问题，确认前按原样保留最直白。
-pub fn to_source_refs(paths: &[String]) -> Vec<String> {
+/// 1. **带通配符的条目截到通配符之前**：`core/src/**` → `core/src`、`core/src/*.rs` → `core/src`。
+/// 2. **不带通配符的文件条目取其所在目录**：`cli/src/cli.rs` → `cli/src`。
+///    这一条容易被忽略：若把文件路径原样写进 `source_refs`，FRS004 会去找
+///    以 `cli/src/cli.rs/` 为前缀的改动 —— **永远匹配不到**，等于静默没声明。
+///    「看起来绑定了、实际永不触发」正是本项目最坏的失效模式。
+///
+/// **误差方向是有意的**：降级让声明范围变宽，doc-guard 会**多报**规格腐化（吵但不出事）；
+/// 反过来漏报才是危险侧（看起来配好了、实际永远不判过期）。
+///
+/// **无法表达的声明**（通配符出现在第一段，如 `**/*.rs`）：其目录语义是整个仓库，
+/// 而 `source_refs` 的元素是「目录前缀」，写不出「仓库根」这个概念。
+/// 这类条目**丢弃并在返回值里报出**，由调用方告警 —— 静默丢弃等于让人以为
+/// 已经声明了整个仓库的 .rs 改动。
+///
+/// 返回 `(派生结果, 被丢弃的条目)`。
+pub fn to_source_refs(paths: &[String]) -> (Vec<String>, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     for p in paths {
         let lowered = if p.contains('*') || p.contains('?') {
+            // 截到第一个通配符，再去尾部 '/'（`core/*.rs` → `core`）
             let cut = p.find('*').or_else(|| p.find('?')).unwrap_or(p.len());
             let mut base = &p[..cut];
             while base.ends_with('/') {
                 base = &base[..base.len() - 1];
             }
-            // `core/*.rs` → cut 落在 `*`，base = "core/" → "core"
             base.to_string()
         } else {
-            p.clone()
+            // 无通配符：取所在目录（文件路径当元素永不命中，见文档）
+            match p.rfind('/') {
+                Some(i) => p[..i].to_string(),
+                // 根级文件（`Makefile`）：没有父目录可退。
+                // 保留原样而不是退成仓库根 —— 退成根等于声明「整个仓库」，
+                // 那不是声明，是把 FRS004 变成噪声源。
+                None => p.clone(),
+            }
         };
-        let v = if lowered.is_empty() {
-            p.clone()
-        } else {
-            lowered
-        };
-        if !out.contains(&v) {
-            out.push(v);
+        if lowered.is_empty() {
+            dropped.push(p.clone());
+            continue;
+        }
+        if !out.contains(&lowered) {
+            out.push(lowered);
         }
     }
-    out
+    (out, dropped)
 }
 
 #[cfg(test)]
@@ -862,8 +880,11 @@ mod tests {
     // ---------- to_source_refs：§3.8 派生 ----------
 
     #[test]
-    fn source_refs_派生降级glob并去重() {
-        let got = to_source_refs(&[
+    fn source_refs_派生降级为目录并去重() {
+        // doc-guard 的 FRS004 按「目录+向下递归」理解元素，所以**文件路径也必须降级**：
+        // `cli/src/cli.rs` 原样写进去，FRS004 会去找 `cli/src/cli.rs/` 前缀的改动，
+        // 永远匹配不到 —— 静默没声明。
+        let (got, dropped) = to_source_refs(&[
             "core/src/**".into(),
             "core/src/*.rs".into(),
             "cli/src/cli.rs".into(),
@@ -873,13 +894,13 @@ mod tests {
         assert_eq!(
             vec![
                 "core/src".to_string(),
-                "cli/src/cli.rs".to_string(),
-                "docs".to_string(),
-                "docs/README.md".to_string()
+                "cli/src".to_string(),
+                "docs".to_string()
             ],
             got,
-            "带 glob 降级成目录并去重；无通配符的原样保留"
+            "glob 与文件路径都降级成目录；同目录去重"
         );
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert!(
             got.iter().all(|p| !p.contains('*') && !p.contains('?')),
             "派生结果不得残留 glob（source_refs 不支持）"
@@ -887,9 +908,26 @@ mod tests {
     }
 
     #[test]
+    fn source_refs_通配符在首段时丢弃并报出() {
+        // `**/*.rs` 的目录语义是整个仓库，而 source_refs 表达不出「仓库根」。
+        // 静默丢弃会让人以为已声明 —— 必须报出。
+        let (got, dropped) = to_source_refs(&["**/*.rs".into(), "core/**".into()]);
+        assert_eq!(vec!["core".to_string()], got);
+        assert_eq!(vec!["**/*.rs".to_string()], dropped);
+    }
+
+    #[test]
+    fn source_refs_根级文件不降级成仓库根() {
+        // 退成仓库根等于声明「整个仓库」，那不是声明，是把 FRS004 变成噪声源。
+        let (got, dropped) = to_source_refs(&["Makefile".into(), "docs/a.md".into()]);
+        assert_eq!(vec!["Makefile".to_string(), "docs".to_string()], got);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
     fn source_refs_派生保序() {
-        let got = to_source_refs(&["z/a.rs".into(), "b/**".into(), "a/**".into()]);
-        assert_eq!(vec!["z/a.rs", "b", "a"], got);
+        let (got, _) = to_source_refs(&["z/a.rs".into(), "b/**".into(), "a/**".into()]);
+        assert_eq!(vec!["z", "b", "a"], got);
     }
 
     // ---------- 枚举覆盖门槛 ----------

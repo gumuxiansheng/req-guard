@@ -373,12 +373,12 @@ packaging/CHANGELOG.md
 ### AC-047
 - Given: 某清单第 2 段 TOUCH 块声明 core/src/** 与 cli/src/cli.rs
 - When: 执行 approve REQ-001 --step solution
-- Then: frontmatter 的 source_refs 被写入 2 个条目 [core/src, cli/src/cli.rs]，TOUCH 块本身逐字不变
+- Then: frontmatter 的 source_refs 被写入 2 个条目 [core/src, cli/src]，TOUCH 块本身逐字不变
 
 ### AC-048
 - Given: TOUCH 块含 core/src/** 与 core/src/*.rs 两条指向同目录的条目
 - When: 执行 approve REQ-001 --step solution
-- Then: source_refs 中该目录只出现 1 次（去重），glob 标记不残留在 frontmatter
+- Then: source_refs 中该目录只出现 1 次（去重），glob 与文件路径均不残留在 frontmatter
 
 ### AC-049
 - Given: frontmatter 的 source_refs 现值为 [docs]
@@ -398,7 +398,12 @@ packaging/CHANGELOG.md
 ### AC-052
 - Given: 变更范围声明经派生后精度降级（core/src/ac.rs 归约为 core/src）
 - When: doc-guard 的 FRS004 复核该清单
-- Then: 误差方向为多报规格腐化而非漏报，且该偏差以 1 条记录进风险表待与 doc-guard 侧确认
+- Then: 误差方向为多报规格腐化而非漏报，且该偏差以 1 条记录进风险表
+
+### AC-053
+- Given: 某清单 TOUCH 块声明 **/*.rs 与 core/** 两条
+- When: 执行 approve REQ-001 --step solution
+- Then: source_refs 只写入 1 项 core，且 stderr 有告警点名 **/*.rs 无法表达，不得静默丢弃
 
 <!-- /GATE:AC -->
 
