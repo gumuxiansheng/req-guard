@@ -1305,6 +1305,55 @@ fn append_gitignore(
 
 // ===================== 时间工具 =====================
 
+/// 当前日期 `YYYY-MM-DD`（best-effort：Unix `date` → PowerShell → `-`）。
+///
+/// 单独提供而不是从 [`now_str`] 截取：`now_str` 产出 `YYYY-MM-DD HH:MM:SS`，
+/// 其日期部分在不同平台回退分支里格式并不统一（PowerShell 分支用本地化格式），
+/// 而 frontmatter 的 `verified_at` 必须严格是 `YYYY-MM-DD`——doc-guard 的
+/// `matter::parse_date` 解析失败时会**静默跳过** FRS003（不报「落后 HEAD」），
+/// 那是"看起来配好了、实际不生效"的静默失效，必须避免。
+pub fn today_str() -> String {
+    if let Ok(o) = Command::new("date").arg("+%Y-%m-%d").output() {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if is_iso_date(&s) {
+                return s;
+            }
+        }
+    }
+    if let Ok(o) = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-Date -Format yyyy-MM-dd"])
+        .output()
+    {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if is_iso_date(&s) {
+                return s;
+            }
+        }
+    }
+    // 回退：从 now_str 的前 10 个字符取（该分支格式由 now_str 保证）
+    let n = now_str();
+    if n.len() >= 10 {
+        let head = n[..10].to_string();
+        if is_iso_date(&head) {
+            return head;
+        }
+    }
+    "-".to_string()
+}
+
+/// 是否形如 `YYYY-MM-DD`（只做形状校验，不解析真实日期）。
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[8..10].iter().all(|c| c.is_ascii_digit())
+}
+
 /// 当前时间字符串（best-effort：`date` → PowerShell → `-`）。
 pub fn now_str() -> String {
     if let Ok(o) = Command::new("date").arg("+%Y-%m-%d %H:%M:%S").output() {

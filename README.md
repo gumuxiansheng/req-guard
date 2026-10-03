@@ -145,6 +145,15 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
   ⚠️ `sig` 是**公开可复算的派生值**（无密钥），本项保证"审批记录归属到某个 git 身份"，
   **不保证"审批不可伪造"**——AI 仍可 `git config user.name` 伪造身份。它与方案 D 叠加而非替代，
   真正兜底仍是服务端 required 检查 + 事后复核
+- **规格绑定代码（SDD 契约）**：清单 frontmatter 声明
+  `review_policy = codebound` + `source_refs`（本次要改的文件/模块目录），
+  字段名与 doc-guard 的 FRS 族**逐字对齐**，同一份清单可被它的
+  FRS001/003/004/005/007 与 DRF001 直接接管——「代码改了规格没同步」会被报出来
+- **技术方案批准前必须声明 `source_refs`**（`auth.level ≥ 1` 拒绝，L0 放行并告警）。
+  卡第二段而非第一段：需求分解阶段还不知道要改哪些文件，逼迫 AI 填占位值比不填更糟。
+  **这条只能放在批准动作上**：FRS001 只检查 `source_refs` 这个键是否存在，
+  `source_refs: []` 一律通过、FRS004 也无从匹配——声明侧留空在 doc-guard 侧完全静默，
+  规格看似接入时效治理、实则永远不会被判过期
 - **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见 [`docs/规范/AI工具合规保证规范.md`](docs/规范/AI工具合规保证规范.md)。

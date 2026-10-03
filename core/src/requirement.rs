@@ -284,6 +284,31 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 技术方案批准前的声明侧门禁：`source_refs` 必须非空。
+///
+/// 判级与身份绑定一致（L1+ fail-closed / L0 放行）——理由相同：AI 也能调 approve，
+/// 把「不许留空」放在 L0 等于没有门禁；但 L0 仍必须放行，否则所有存量项目
+/// （清单创建于本版本之前、根本没有 frontmatter）会一步卡死在 approve 上。
+fn ensure_source_refs(root: &Path, content: &str) -> Result<()> {
+    let meta = crate::specmeta::extract(content).unwrap_or_default();
+    if meta.has_source_refs() {
+        return Ok(());
+    }
+    let hint = meta.missing_source_refs_hint();
+    let level = crate::auth::effective_level(root);
+    if level >= 1 {
+        return Err(GateError::Validation(format!(
+            "技术方案缺少 source_refs 声明，无法把规格与代码绑定，故拒绝批准。\n\n{}",
+            hint
+        )));
+    }
+    eprintln!(
+        "⚠️ 警告（L{}）：技术方案缺少 source_refs 声明，已放行。{}",
+        level, hint
+    );
+    Ok(())
+}
+
 /// 审核某一阶段：`pass=true` 通过，`pass=false` 打回。
 ///
 /// - `strict=true` 时强制顺序：审核后一步前，其前置步骤必须已 `approved`；
@@ -339,6 +364,20 @@ pub fn review(
                 )));
             }
         }
+    }
+
+    // 规格时效契约（声明侧）：**技术方案**批准前必须已声明 source_refs。
+    //
+    // 为什么卡在第二段而不是第一段：需求分解阶段还在澄清背景与目标，往往还不知道
+    // 要改哪些文件；等到「涉及的文件与模块清单」这一步，声明范围才成为可核对的契约。
+    // 卡第一段只会把 AI 卡在"还不知道要改什么"的时刻，逼迫它填占位值——那比不填更糟。
+    //
+    // 为什么必须在这里拦（doc-guard 拦不住）：FRS001 只检查 `source_refs` 这个**键
+    // 是否存在**，`source_refs: []` 一律通过；FRS004 需要非空列表才能匹配变更集。
+    // 于是「声明为空」这条路径在 doc-guard 侧完全静默——规格看似接入时效治理，
+    // 实则永远不会被判过期。故声明侧的门禁只能放在批准动作上。
+    if pass && step == "solution" {
+        ensure_source_refs(root, &content)?;
     }
 
     let new_status = if pass { "approved" } else { "rejected" };
@@ -970,7 +1009,24 @@ fn ascii_slug(title: &str) -> String {
 
 fn render(id: &str, title: &str) -> String {
     let ts = safe_field(&crate::gate::now_str());
+    let today = crate::gate::today_str();
     let mut s = String::new();
+    // frontmatter 必须在**文件最前**（doc-guard 的 matter::extract 要求首个非空行是 `---`）。
+    // 字段名与取值枚举刻意与 doc-guard 的 FRS 族对齐，使本文件能被 doc-guard 的
+    // FRS001/003/004/005/007 与 DRF001 直接接管，无需任何映射层：
+    //   doc_type      ∈ reference/guide/decision/runbook/proposal → 需求规格取 proposal
+    //   tier          ∈ critical/standard
+    //   review_policy = codebound → doc-guard 追加要求 verified_at + source_refs
+    // 「规格绑定代码」正是 SDD 里 spec/plan 与实现之间的契约，doc-guard 已有
+    // 一等公民语义（codebound），不该由 req-guard 另造一套。
+    s.push_str("---\n");
+    s.push_str("doc_type: proposal\n");
+    s.push_str("tier: standard\n");
+    s.push_str("owner: -\n");
+    s.push_str("review_policy: codebound\n");
+    s.push_str(&format!("verified_at: {}\n", today));
+    s.push_str("source_refs: []\n");
+    s.push_str("---\n\n");
     s.push_str(&format!("# {} {}\n\n", id, title));
     s.push_str("> **AI 需求门禁清单**：三段步骤全部 `approved` 后，AI 才被允许编写代码。\n");
     s.push_str("> 本文件是硬拦截依据——`.gates/hooks/req-guard-check.{sh,ps1}` 只解析下列 `GATE` 标记行；\n");
@@ -1010,6 +1066,10 @@ const SOLUTION_BODY: &str = "\
 - [ ] 涉及的文件与模块清单
 - [ ] 兼容性、性能与安全影响
 - [ ] 风险点与回滚方案
+
+<!-- 技术方案批准前必须在上方 frontmatter 的 source_refs 声明本次要改的文件/模块，
+     否则 doc-guard 的 FRS004（源已改而规格未同步）无法发现规格腐化。
+     格式为行内数组，元素可用目录（向下递归）：source_refs: [backend/src/main/java/com/x] -->
 ";
 
 const TESTPLAN_BODY: &str = "\
@@ -1205,6 +1265,126 @@ mod tests {
             ledger.contains("email=") && ledger.contains("sig="),
             "台账须留身份戳: {}",
             ledger
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn review_技术方案批准前须声明source_refs() {
+        use crate::testutil::set_auth_level;
+        let root = temp_dir("req-refs");
+        create(&root, None, "声明契约").unwrap();
+
+        // 模板给出的 source_refs 是空数组 → 未声明
+        let r = find(&root, "REQ-001").unwrap();
+        let content = fs::read_to_string(&r.path).unwrap();
+        assert!(
+            content.contains("source_refs: []"),
+            "模板须给出待填的 source_refs 骨架：{}",
+            content
+        );
+        assert!(!crate::specmeta::extract(&content)
+            .unwrap()
+            .has_source_refs());
+
+        // L0：放行但告警（存量项目不卡死）
+        set_auth_level(&root, 0);
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        assert!(
+            review(&root, "REQ-001", "solution", "寇工", true, "", false).is_ok(),
+            "L0 不打断存量项目"
+        );
+
+        cleanup(&root);
+    }
+
+    /// 直接测 [`ensure_source_refs`]：走 `review()` 会先被审批锁拦下
+    /// （L1+ 要求 TTY 在场证明，单测环境是非交互管道），那部分另有测试覆盖。
+    #[test]
+    fn ensure_source_refs_判级矩阵() {
+        use crate::testutil::set_auth_level;
+        let root = temp_dir("req-refs-l1");
+        create(&root, None, "声明契约").unwrap();
+        let r = find(&root, "REQ-001").unwrap();
+        let template = fs::read_to_string(&r.path).unwrap();
+        assert!(
+            !crate::specmeta::extract(&template)
+                .unwrap()
+                .has_source_refs(),
+            "模板必须给出空 source_refs 骨架（待填），而非已声明"
+        );
+
+        // 存量清单：完全没有 frontmatter → 同样算未声明
+        let legacy = "# REQ-001\n\n正文".to_string();
+
+        // L0：放行（存量项目不卡死）
+        set_auth_level(&root, 0);
+        assert!(ensure_source_refs(&root, &template).is_ok(), "L0 应放行");
+        assert!(
+            ensure_source_refs(&root, &legacy).is_ok(),
+            "L0 无 frontmatter 也放行"
+        );
+
+        // L1+：拒绝，且文案可执行
+        for level in [1u8, 2, 3] {
+            set_auth_level(&root, level);
+            for (tag, body) in [("空数组", &template), ("无 frontmatter", &legacy)] {
+                let e = ensure_source_refs(&root, body)
+                    .expect_err(&format!("L{} {} 必须拒绝", level, tag));
+                let msg = e.to_string();
+                assert!(msg.contains("source_refs"), "L{} {}: {}", level, tag, msg);
+                assert!(
+                    msg.contains("backend/src/main/java/com/x"),
+                    "L{} {} 须给写法示例: {}",
+                    level,
+                    tag,
+                    msg
+                );
+                assert!(
+                    msg.contains("不支持 glob"),
+                    "L{} {} 须说明目录语义: {}",
+                    level,
+                    tag,
+                    msg
+                );
+            }
+        }
+
+        // 已声明 → 各等级均放行
+        let filled = template.replace(
+            "source_refs: []",
+            "source_refs: [backend/src/main/java/com/x]",
+        );
+        for level in [0u8, 3] {
+            set_auth_level(&root, level);
+            assert!(
+                ensure_source_refs(&root, &filled).is_ok(),
+                "L{} 已声明后应放行",
+                level
+            );
+        }
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn review_打回方案不受source_refs门禁约束() {
+        // 拒绝一个方案不需要先声明改动范围——门禁只作用于 approve
+        let root = temp_dir("req-refs-reject");
+        create(&root, None, "声明契约").unwrap();
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        assert!(
+            review(
+                &root,
+                "REQ-001",
+                "solution",
+                "寇工",
+                false,
+                "范围没写",
+                false
+            )
+            .is_ok(),
+            "reject 不该被声明门禁拦住"
         );
         cleanup(&root);
     }
