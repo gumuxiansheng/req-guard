@@ -10,9 +10,13 @@
 //! - 中文字体必须**内嵌**：egui 默认字体不含 CJK，不内嵌就是满屏豆腐块；
 //! - 启动失败要能优雅降级（由 cli 回退到 TUI，见 `core::ui_mode`）。
 
+//! - 提示文字的颜色走 [`palette`] 的语义色调（浅色 / 深色主题两套取值，均满足 WCAG AA），
+//!   不要再直接写 `Color32::RED / GREEN / YELLOW` 这类不达标的纯色。
+
 pub mod app;
 pub mod fonts;
 pub mod markdown;
+pub mod palette;
 
 pub use app::App;
 

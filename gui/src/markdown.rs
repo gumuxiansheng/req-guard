@@ -21,6 +21,7 @@
 //! 分层：解析（[`parse`] / [`parse_inlines`]，纯函数、不碰 egui、可单测）与渲染
 //! （[`show`]）分离，测试断言的是"解析出的结构"，不需要跑窗口。
 
+use crate::palette;
 use eframe::egui;
 use std::sync::Arc;
 
@@ -842,7 +843,7 @@ fn cell_galley(
         ..Default::default()
     };
     for i in content.map(Vec::as_slice).unwrap_or_default() {
-        let rt = rt_of(i);
+        let rt = rt_of(ui, i);
         let rt = if header { rt.strong() } else { rt };
         rt.append_to(
             &mut job,
@@ -886,7 +887,7 @@ fn inline_label(ui: &mut egui::Ui, v: &[Inline]) {
     let style = ui.style().clone();
     let mut job = egui::text::LayoutJob::default();
     for i in v {
-        rt_of(i).append_to(
+        rt_of(ui, i).append_to(
             &mut job,
             &style,
             egui::FontSelection::Default,
@@ -897,7 +898,7 @@ fn inline_label(ui: &mut egui::Ui, v: &[Inline]) {
 }
 
 /// 单个行内元素 → `RichText`；`Link` / `Image` 一律降级成**不可点**的纯文本（见模块注释）。
-fn rt_of(i: &Inline) -> egui::RichText {
+fn rt_of(ui: &egui::Ui, i: &Inline) -> egui::RichText {
     match i {
         Inline::Text(t) => egui::RichText::new(t.clone()),
         Inline::Code(t) => egui::RichText::new(t.clone()).code(),
@@ -905,9 +906,7 @@ fn rt_of(i: &Inline) -> egui::RichText {
         Inline::Emphasis(c) => joined(c).italics(),
         Inline::Strikethrough(c) => joined(c).strikethrough(),
         // 链接：加下划线让人一眼看出"这里原本是链接"，但**没有点击行为**。
-        Inline::Link { text, .. } => joined(text)
-            .color(egui::Color32::from_rgb(110, 170, 255))
-            .underline(),
+        Inline::Link { text, .. } => joined(text).color(palette::link(ui)).underline(),
         Inline::Image { alt, .. } => egui::RichText::new(format!("\u{1F5BC} {}", alt)).italics(),
     }
 }

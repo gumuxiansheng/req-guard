@@ -8,6 +8,7 @@ use req_guard_core::status::{self, ReqStatus, StepState};
 use req_guard_core::{comment, gate, requirement};
 
 use crate::markdown;
+use crate::palette::Tone;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,11 @@ pub struct App {
     pub input_reason: String,
     /// 底部状态提示。
     pub message: Option<String>,
+    /// 底部状态提示的色调（红=失败 / 绿=成功 / 琥珀=提示；见 [`set_msg`]）。
+    ///
+    /// 与 `message` 成对写入：单独留 `message` 是历史包袱——所有提示都渲染成黄色，
+    /// 于是"创建失败"和"已创建"长得一样，颜色完全没起到区分作用。
+    pub msg_tone: Tone,
     /// 最近一次门禁检查结果。
     pub check_pass: bool,
     pub check_detail: Vec<String>,
@@ -85,6 +91,7 @@ impl App {
             input_reviewer: String::new(),
             input_reason: String::new(),
             message: None,
+            msg_tone: Tone::Warning,
             check_pass: false,
             check_detail: Vec::new(),
             audit: Vec::new(),
@@ -106,6 +113,16 @@ impl App {
         self.current()?.steps.get(self.step).map(|s| s.key)
     }
 
+    /// 写一条底部提示。
+    ///
+    /// 色调按语义给：**失败/被拒 → `Tone::Danger`（红）**、**成功 → `Tone::Success`（绿）**、
+    /// **校验不通过这类"还差点什么"→ `Tone::Warning`（琥珀，默认）**。
+    /// 颜色之外再配一个图标（见 [`Tone::rich`]），色弱用户不看颜色也分得出级别。
+    fn set_msg(&mut self, tone: Tone, text: impl Into<String>) {
+        self.message = Some(text.into());
+        self.msg_tone = tone;
+    }
+
     /// 重新读取需求与正文。
     pub fn reload(&mut self) {
         match status::req_list(&self.root) {
@@ -115,7 +132,7 @@ impl App {
                     self.selected = self.reqs.len().saturating_sub(1);
                 }
             }
-            Err(e) => self.message = Some(format!("读取需求失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("读取需求失败：{}", e)),
         }
         self.load_body();
         self.last_refresh = Instant::now();
@@ -148,7 +165,7 @@ impl App {
     pub fn create_req(&mut self) {
         let title = self.input_title.trim().to_string();
         if title.is_empty() {
-            self.message = Some("标题不能为空".into());
+            self.set_msg(Tone::Warning, "标题不能为空");
             return;
         }
         match requirement::create(&self.root, None, &title) {
@@ -156,9 +173,9 @@ impl App {
                 self.dialog = Dialog::None;
                 self.input_title.clear();
                 self.reload();
-                self.message = Some(format!("已创建 {}", r.id));
+                self.set_msg(Tone::Success, format!("已创建 {}", r.id));
             }
-            Err(e) => self.message = Some(format!("创建失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("创建失败：{}", e)),
         }
     }
 
@@ -166,13 +183,13 @@ impl App {
         let (id, step) = match (self.current(), self.current_step()) {
             (Some(r), Some(s)) => (r.id.clone(), s),
             _ => {
-                self.message = Some("没有可审核的需求".into());
+                self.set_msg(Tone::Warning, "没有可审核的需求");
                 return;
             }
         };
         let reviewer = self.input_reviewer.trim().to_string();
         if reviewer.is_empty() {
-            self.message = Some("审核人不能为空".into());
+            self.set_msg(Tone::Warning, "审核人不能为空");
             return;
         }
         let strict = gate::strict_order(&self.root);
@@ -191,9 +208,12 @@ impl App {
                 // 自动前进到第一个未通过的段：批准完阶段 1 后界面应立即可审阶段 2，
                 // 否则光标停在已通过的旧段，后续段永远无法进入审核。
                 self.jump_to_reviewable();
-                self.message = Some(format!("已批准 {} / {}", id, requirement::step_label(step)));
+                self.set_msg(
+                    Tone::Success,
+                    format!("已批准 {} / {}", id, requirement::step_label(step)),
+                );
             }
-            Err(e) => self.message = Some(format!("批准失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("批准失败：{}", e)),
         }
     }
 
@@ -208,7 +228,7 @@ impl App {
         match req_guard_core::auth::ui_issue_credential(&self.root, scope) {
             Ok(_) => true,
             Err(e) => {
-                self.message = Some(format!("签发界面凭据失败：{}", e));
+                self.set_msg(Tone::Danger, format!("签发界面凭据失败：{}", e));
                 false
             }
         }
@@ -227,18 +247,18 @@ impl App {
         let (id, step) = match (self.current(), self.current_step()) {
             (Some(r), Some(s)) => (r.id.clone(), s),
             _ => {
-                self.message = Some("没有可审核的需求".into());
+                self.set_msg(Tone::Warning, "没有可审核的需求");
                 return;
             }
         };
         let reviewer = self.input_reviewer.trim().to_string();
         let reason = self.input_reason.trim().to_string();
         if reviewer.is_empty() {
-            self.message = Some("审核人不能为空".into());
+            self.set_msg(Tone::Warning, "审核人不能为空");
             return;
         }
         if reason.is_empty() {
-            self.message = Some("打回必须填写原因".into());
+            self.set_msg(Tone::Warning, "打回必须填写原因");
             return;
         }
         let strict = gate::strict_order(&self.root);
@@ -267,16 +287,19 @@ impl App {
                 self.input_reviewer.clear();
                 self.input_reason.clear();
                 self.reload();
-                self.message = Some(format!("已打回 {} / {}", id, requirement::step_label(step)));
+                self.set_msg(
+                    Tone::Success,
+                    format!("已打回 {} / {}", id, requirement::step_label(step)),
+                );
             }
-            Err(e) => self.message = Some(format!("打回失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("打回失败：{}", e)),
         }
     }
 
     pub fn do_bypass(&mut self) {
         let reason = self.input_reason.trim().to_string();
         if reason.is_empty() {
-            self.message = Some("应急绕过必须填写原因".into());
+            self.set_msg(Tone::Warning, "应急绕过必须填写原因");
             return;
         }
         if !self.prepare_credential("bypass") {
@@ -288,9 +311,9 @@ impl App {
             Ok(_) => {
                 self.dialog = Dialog::None;
                 self.input_reason.clear();
-                self.message = Some("已开启应急绕过 60 分钟（已记审计）".into());
+                self.set_msg(Tone::Success, "已开启应急绕过 60 分钟（已记审计）");
             }
-            Err(e) => self.message = Some(format!("绕过失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("绕过失败：{}", e)),
         }
     }
 
@@ -307,7 +330,7 @@ impl App {
                 self.check_detail = lines;
                 self.dialog = Dialog::CheckResult;
             }
-            Err(e) => self.message = Some(format!("检查失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("检查失败：{}", e)),
         }
     }
 
@@ -342,18 +365,18 @@ impl App {
     /// 恰恰是审核意见最要紧的信息（core 的 CLI 侧另支持 `--quote` 做行号锚定）。
     pub fn add_comment(&mut self) {
         let Some(r) = self.current() else {
-            self.message = Some("没有可评论的需求".into());
+            self.set_msg(Tone::Warning, "没有可评论的需求");
             return;
         };
         let id = r.id.clone();
         let author = self.input_reviewer.trim().to_string();
         if author.is_empty() {
-            self.message = Some("评论作者不能为空".into());
+            self.set_msg(Tone::Warning, "评论作者不能为空");
             return;
         }
         let text = self.input_comment.trim().to_string();
         if text.is_empty() {
-            self.message = Some("评论内容不能为空".into());
+            self.set_msg(Tone::Warning, "评论内容不能为空");
             return;
         }
         let step = self.current_step();
@@ -383,13 +406,16 @@ impl App {
                     .iter()
                     .position(|x| x.id == c.id)
                     .unwrap_or(self.comment_sel);
-                self.message = Some(format!(
-                    "已添加评论 {}{}",
-                    c.id,
-                    if blocking { "（阻塞）" } else { "" }
-                ));
+                self.set_msg(
+                    Tone::Success,
+                    format!(
+                        "已添加评论 {}{}",
+                        c.id,
+                        if blocking { "（阻塞）" } else { "" }
+                    ),
+                );
             }
-            Err(e) => self.message = Some(format!("添加评论失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("添加评论失败：{}", e)),
         }
     }
 
@@ -400,21 +426,21 @@ impl App {
     /// L3 下必须是范围票据，签发范围必须逐字对上。
     pub fn resolve_comment(&mut self) {
         let Some(r) = self.current() else {
-            self.message = Some("没有可操作的需求".into());
+            self.set_msg(Tone::Warning, "没有可操作的需求");
             return;
         };
         let id = r.id.clone();
         let Some(c) = self.comments.get(self.comment_sel).cloned() else {
-            self.message = Some("请先选中一条评论".into());
+            self.set_msg(Tone::Warning, "请先选中一条评论");
             return;
         };
         if c.state == comment::CommentState::Resolved {
-            self.message = Some(format!("{} 已是关闭状态", c.id));
+            self.set_msg(Tone::Warning, format!("{} 已是关闭状态", c.id));
             return;
         }
         let reviewer = self.input_reviewer.trim().to_string();
         if reviewer.is_empty() {
-            self.message = Some("关闭人不能为空（关闭权归审核人）".into());
+            self.set_msg(Tone::Warning, "关闭人不能为空（关闭权归审核人）");
             return;
         }
         if !self.prepare_credential(&format!("resolve:{}", id)) {
@@ -428,29 +454,38 @@ impl App {
                 self.input_reviewer.clear();
                 self.reload();
                 self.reload_comments();
-                self.message = Some(format!("已关闭 {}（解除阻塞）", c.id));
+                self.set_msg(Tone::Success, format!("已关闭 {}（解除阻塞）", c.id));
             }
-            Err(e) => self.message = Some(format!("关闭失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("关闭失败：{}", e)),
         }
     }
 
     /// 正文被 AI 改过之后重算行号锚点：命中的刷新 `line`，找不到原文的标 `stale`。
     pub fn refresh_comment_anchors(&mut self) {
         let Some(r) = self.current() else {
-            self.message = Some("没有可操作的需求".into());
+            self.set_msg(Tone::Warning, "没有可操作的需求");
             return;
         };
         let id = r.id.clone();
         match comment::refresh_anchors(&self.root, &id) {
             Ok(stale) => {
                 self.reload_comments();
-                self.message = Some(if stale == 0 {
-                    "行号锚点已重算：全部命中".to_string()
-                } else {
-                    format!("行号锚点已重算：{} 条找不到原文（已标 stale）", stale)
-                });
+                // 全部命中算成功（绿），有失效算提醒（琥珀）——两种结果给两种颜色，
+                // 免得"有 3 条失效"和"全部命中"看起来是同一件事。
+                self.set_msg(
+                    if stale == 0 {
+                        Tone::Success
+                    } else {
+                        Tone::Warning
+                    },
+                    if stale == 0 {
+                        "行号锚点已重算：全部命中".to_string()
+                    } else {
+                        format!("行号锚点已重算：{} 条找不到原文（已标 stale）", stale)
+                    },
+                );
             }
-            Err(e) => self.message = Some(format!("重算锚点失败：{}", e)),
+            Err(e) => self.set_msg(Tone::Danger, format!("重算锚点失败：{}", e)),
         }
     }
 
@@ -466,7 +501,7 @@ impl App {
             self.comments.clear();
             self.comment_sel = 0;
             self.reload();
-            self.message = Some(format!("已切换到 {}", self.root.display()));
+            self.set_msg(Tone::Success, format!("已切换到 {}", self.root.display()));
         }
     }
 }
@@ -522,12 +557,18 @@ fn render_top(parent: &mut egui::Ui, app: &mut App) {
                 app.render_md = false;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (text, color) = match app.current() {
-                    None => ("无需求", egui::Color32::GRAY),
-                    Some(r) if r.is_blocked() => ("未解锁", egui::Color32::RED),
-                    Some(_) => ("已解锁", egui::Color32::GREEN),
+                // 颜色走语义色板（`palette::Tone`），图标是颜色之外的第二条线索。
+                let tone = match app.current() {
+                    None => Tone::Muted,
+                    Some(r) if r.is_blocked() => Tone::Danger,
+                    Some(_) => Tone::Success,
                 };
-                ui.colored_label(color, text);
+                let text = match app.current() {
+                    None => "无需求",
+                    Some(r) if r.is_blocked() => "未解锁",
+                    Some(_) => "已解锁",
+                };
+                ui.label(tone.rich(ui, text));
             });
         });
     });
@@ -542,7 +583,7 @@ fn render_bottom(parent: &mut egui::Ui, app: &mut App) {
             }
             if ui.button("刷新").clicked() {
                 app.reload();
-                app.message = Some("已刷新".into());
+                app.set_msg(Tone::Success, "已刷新");
             }
             if ui.button("执行门禁检查").clicked() {
                 app.run_check();
@@ -569,7 +610,8 @@ fn render_bottom(parent: &mut egui::Ui, app: &mut App) {
                     .add_enabled(
                         app.current().is_some(),
                         egui::Button::new(if blocking > 0 {
-                            egui::RichText::new(label).color(egui::Color32::RED)
+                            // 有阻塞评论 → 红色（文案里已经写了"阻塞"，颜色只是加强）。
+                            egui::RichText::new(label).color(Tone::Danger.color(ui))
                         } else {
                             egui::RichText::new(label)
                         }),
@@ -580,9 +622,13 @@ fn render_bottom(parent: &mut egui::Ui, app: &mut App) {
                     app.open_comments();
                 }
             }
+            // 提示的颜色由 `msg_tone` 决定：失败红 / 成功绿 / 提示琥珀，
+            // 并带一个同语义的图标，色弱用户不靠颜色也分得出级别。
+            let tone = app.msg_tone;
             if let Some(m) = &app.message {
+                let rt = tone.rich(ui, m.clone());
                 ui.separator();
-                ui.colored_label(egui::Color32::YELLOW, m);
+                ui.label(rt);
             }
         });
     });
@@ -601,12 +647,14 @@ fn render_left(parent: &mut egui::Ui, app: &mut App) {
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, r) in app.reqs.clone().iter().enumerate() {
-                    let color = if r.is_blocked() {
-                        egui::Color32::RED
+                    // 图标也跟着状态换：原来两种状态都是「●」，色弱用户只能靠颜色分辨。
+                    let (glyph, tone) = if r.is_blocked() {
+                        ("⛔", Tone::Danger)
                     } else {
-                        egui::Color32::GREEN
+                        ("✓", Tone::Success)
                     };
-                    let line = egui::RichText::new(format!("● {} {}", r.id, r.title)).color(color);
+                    let line = egui::RichText::new(format!("{} {} {}", glyph, r.id, r.title))
+                        .color(tone.color(ui));
                     if ui.selectable_label(i == app.selected, line).clicked() {
                         app.selected = i;
                         app.step = 0;
@@ -629,12 +677,12 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("{} {}", req.id, req.title)).strong());
             ui.separator();
-            let (text, color) = if req.is_blocked() {
-                ("未解锁 — AI 不得编写/修改源码", egui::Color32::RED)
+            let (text, tone) = if req.is_blocked() {
+                ("未解锁 — AI 不得编写/修改源码", Tone::Danger)
             } else {
-                ("已解锁 — AI 可以开始编写代码", egui::Color32::GREEN)
+                ("已解锁 — AI 可以开始编写代码", Tone::Success)
             };
-            ui.colored_label(color, text);
+            ui.label(tone.rich(ui, text));
         });
         ui.horizontal(|ui| {
             ui.label(format!(
@@ -651,10 +699,10 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, s) in req.steps.iter().enumerate() {
-                let (mark, color) = match s.state {
-                    StepState::Approved => ("✓", egui::Color32::GREEN),
-                    StepState::Rejected => ("✗", egui::Color32::RED),
-                    StepState::Pending => ("○", egui::Color32::GRAY),
+                let (mark, tone) = match s.state {
+                    StepState::Approved => ("✓", Tone::Success),
+                    StepState::Rejected => ("✗", Tone::Danger),
+                    StepState::Pending => ("○", Tone::Muted),
                 };
                 let who = s
                     .reviewer
@@ -669,7 +717,7 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                     s.state.label(),
                     who
                 ))
-                .color(color);
+                .color(tone.color(ui));
 
                 // open(Some(..)) 会每帧强制开合状态：折叠交互本身展不开非选中段，
                 // 所以这里把"点击标题"接管为"选中该段"，选中段下一帧即被展开。
@@ -683,8 +731,7 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                         if app.render_md {
                             markdown::show(ui, app.md.get(i, &text));
                         } else {
-                            let mut raw = text;
-                            add_raw_text(ui, &mut raw);
+                            add_raw_text(ui, &text);
                         }
                     });
                 if resp.header_response.clicked() {
@@ -722,19 +769,113 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
     });
 }
 
-/// 原文视图：只读、可滚动、可复制，等宽逐字呈现 Markdown 源（**不可编辑**：
-/// 清单正文由 AI/编辑器维护，界面只做审核决策）。
-fn add_raw_text(ui: &mut egui::Ui, text: &mut String) {
+/// 原文视图：只读、可滚动、**可框选 / 可复制**，等宽逐字呈现 Markdown 源。
+///
+/// ## 为什么不再用 `TextEdit::multiline(..).interactive(false)`
+///
+/// `interactive(false)` 会把 sense 降成 `Sense::hover()`（egui 0.36 源码
+/// `text_edit/builder.rs` 里 `let sense = if interactive { .. } else { Sense::hover() }`）：
+/// 鼠标按下 / 拖拽不参与命中测试 → **选不中文字**；不参与事件分发 → **收不到
+/// `Event::Copy`，Ctrl+C 无效**；没有 response 也就挂不上右键菜单。
+/// 而"原文"视图存在的唯一理由就是**逐字核对与整段复制**，等于整个功能被废掉。
+///
+/// ## 现在的做法：把 `&str` 当 `TextBuffer` 喂进去
+///
+/// egui 给 `&str` 实现了 `TextBuffer`，其中 `is_mutable()` 返回 `false`、
+/// `insert_text` / `delete_char_range` 都是**空实现**。于是：
+/// - 交互全开：能点选、能拖选、能 Ctrl+C、能挂右键菜单；
+/// - 内容改不动：键盘输入与粘贴被空实现吃掉（不靠"下一帧覆盖回去"，所以不会闪）；
+/// - 看着仍是只读：`is_mutable() == false` 时不画文本光标（源码同文件的
+///   `if text.is_mutable() && interactive { ..绘制光标.. }`）。
+///
+/// 正文真值仍然只有 `app.body` 一份，界面改不动它——与"清单正文由 AI / 编辑器维护，
+/// 界面只做审核决策"的原则一致。
+fn add_raw_text(ui: &mut egui::Ui, text: &str) {
+    // 「一键复制全文」：原文视图最高频的动作就是整段带走，给个显式按钮比让人拖选更快；
+    // 顺手写清可复制的方式，免得再有人以为这里只能看。
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("复制全文")
+            .on_hover_text("把本段 Markdown 源整段复制到剪贴板")
+            .clicked()
+        {
+            ui.ctx().copy_text(text.to_string());
+        }
+        ui.label(
+            egui::RichText::new("可选中文字；Ctrl+C 或右键菜单复制")
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+    });
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .show(ui, |ui| {
-            ui.add_sized(
+            read_only_text(
+                ui,
+                "raw_md",
                 [ui.available_width(), 200.0],
-                egui::TextEdit::multiline(text)
-                    .font(egui::TextStyle::Monospace)
-                    .interactive(false),
+                egui::TextStyle::Monospace,
+                text,
             );
         });
+}
+
+/// 只读但**可框选、可复制**的文本框（[`add_raw_text`] 与评论正文共用）。
+///
+/// 关键在 `let mut buf: &str = text;`——传进去的是不可变 `TextBuffer`，
+/// 交互开着而内容改不动，详见 [`add_raw_text`] 的说明。
+fn read_only_text(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    size: [f32; 2],
+    font: egui::TextStyle,
+    text: &str,
+) -> egui::Response {
+    let mut buf: &str = text;
+    let resp = ui.add_sized(
+        size,
+        egui::TextEdit::multiline(&mut buf)
+            .font(font)
+            .id_salt(id_salt),
+    );
+    // 右键菜单：复制选中 / 全选 / 复制全文。
+    // 菜单要读 TextEdit 的选区状态，所以挂在 response 上（id 从 `resp.id` 取，
+    // 不用自己另造一个，免得两处 id 不同步）。
+    let id = resp.id;
+    resp.context_menu(|ui| {
+        if ui.button("复制选中").clicked() {
+            if let Some(sel) = selected_text(ui.ctx(), id, text) {
+                ui.ctx().copy_text(sel);
+            }
+            ui.close();
+        }
+        if ui.button("全选").clicked() {
+            let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(text.chars().count()),
+                )));
+            egui::TextEdit::store_state(ui.ctx(), id, state);
+            ui.close();
+        }
+        if ui.button("复制全文").clicked() {
+            ui.ctx().copy_text(text.to_string());
+            ui.close();
+        }
+    });
+    resp
+}
+
+/// 取只读文本框里当前选中的文字（没选就返回 `None`）。
+fn selected_text(ctx: &egui::Context, id: egui::Id, text: &str) -> Option<String> {
+    let state = egui::TextEdit::load_state(ctx, id)?;
+    let range = state.cursor.char_range()?;
+    if range.is_empty() {
+        return None;
+    }
+    Some(range.slice_str(text).to_string())
 }
 
 /// 评论面板：列表 + 选中详情 + 动作条（新增 / 关闭 / 重算锚点 / 刷新）。
@@ -759,7 +900,7 @@ fn render_comments(app: &mut App, ui: &mut egui::Ui) {
             blocking
         ));
         if blocking > 0 {
-            ui.colored_label(egui::Color32::RED, "有未关闭的阻塞评论 → AI 不得编码");
+            ui.label(Tone::Danger.rich(ui, "有未关闭的阻塞评论 → AI 不得编码"));
         }
     });
     ui.separator();
@@ -774,9 +915,12 @@ fn render_comments(app: &mut App, ui: &mut egui::Ui) {
                 for (i, c) in app.comments.clone().iter().enumerate() {
                     let selected = i == app.comment_sel;
                     ui.push_id(i, |ui| {
-                        let (mark, color) = match c.state {
-                            comment::CommentState::Open => ("●", egui::Color32::YELLOW),
-                            comment::CommentState::Resolved => ("✓", egui::Color32::GREEN),
+                        // 未解决用琥珀（提示：还差一步），已解决用绿；图标也不同。
+                        let (mark, tone) = match c.state {
+                            comment::CommentState::Open => (Tone::Warning.glyph(), Tone::Warning),
+                            comment::CommentState::Resolved => {
+                                (Tone::Success.glyph(), Tone::Success)
+                            }
                         };
                         let mut head = format!(
                             "{} [{}] {}{} · {} · {}",
@@ -799,7 +943,7 @@ fn render_comments(app: &mut App, ui: &mut egui::Ui) {
                         if let Some(r) = &c.reply {
                             head.push_str(&format!(" · 回复 {}", r));
                         }
-                        let mut rt = egui::RichText::new(head).color(color);
+                        let mut rt = egui::RichText::new(head).color(tone.color(ui));
                         if selected {
                             rt = rt.strong();
                         }
@@ -811,18 +955,20 @@ fn render_comments(app: &mut App, ui: &mut egui::Ui) {
                             if let Some(q) = &c.quote {
                                 ui.label(egui::RichText::new(format!("引用：{}", q)).italics());
                             }
-                            let mut body = c.body.clone();
+                            let body = c.body.clone();
                             // 高度按正文长度估（约 50 字一行），否则短评论也占一大块空白。
                             let rows = (body.chars().count() / 50 + 1).clamp(1, 8) as f32;
                             egui::ScrollArea::vertical()
                                 .id_salt("comment_body")
                                 .max_height(24.0 * rows + 8.0)
                                 .show(ui, |ui| {
-                                    ui.add_sized(
+                                    // 同样是"只读但可复制"：审核意见经常要被摘进回信/PR 里。
+                                    read_only_text(
+                                        ui,
+                                        "comment_body_text",
                                         [ui.available_width(), 20.0 * rows],
-                                        egui::TextEdit::multiline(&mut body)
-                                            .desired_width(f32::MAX)
-                                            .interactive(false),
+                                        egui::TextStyle::Body,
+                                        &body,
                                     );
                                 });
                         }
@@ -928,12 +1074,13 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
             },
         ),
         Dialog::CheckResult => ("门禁检查结果".into(), |app, ui| {
-            let (text, color) = if app.check_pass {
-                ("放行 ✅", egui::Color32::GREEN)
+            // 图标（✅ / ⛔）本身就区分得开，这里只统一颜色取值，不再额外叠一层图标。
+            let (text, tone) = if app.check_pass {
+                ("放行 ✅", Tone::Success)
             } else {
-                ("拦截 ⛔", egui::Color32::RED)
+                ("拦截 ⛔", Tone::Danger)
             };
-            ui.colored_label(color, egui::RichText::new(text).strong());
+            ui.label(egui::RichText::new(text).color(tone.color(ui)));
             ui.separator();
             for line in app.check_detail.iter() {
                 ui.label(line);
@@ -1218,5 +1365,207 @@ mod tests {
         assert!(app.comments.is_empty(), "换项目后不应残留上一个需求的评论");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&other);
+    }
+
+    // ===================== 原文视图：只读，但能选中 / 能复制 =====================
+
+    /// 只读的**机制**来自 egui 给 `&str` 的 `TextBuffer` 实现：`is_mutable()` 为 false，
+    /// 且写入动作（插入 / 删除 / 清空 / 整体替换）全是空实现。
+    ///
+    /// 这条依赖必须钉死——哪天 egui 把 `&str` 改成可写，原文视图会**悄悄**变成能改，
+    /// 那时这个测试会先红，而不是等审核人发现清单被改了。
+    #[test]
+    fn 只读靠不可变的文本缓冲区实现() {
+        use egui::TextBuffer;
+
+        let src = "## 1. 需求分解\n";
+        let mut buf: &str = src;
+        assert!(!TextBuffer::is_mutable(&buf), "&str 必须是只读 buffer");
+
+        TextBuffer::insert_text(&mut buf, "注入", egui::text::CharIndex(0));
+        TextBuffer::delete_char_range(&mut buf, egui::text::CharIndex(0)..egui::text::CharIndex(2));
+        TextBuffer::clear(&mut buf);
+        TextBuffer::replace_with(&mut buf, "篡改");
+        assert_eq!(buf, src, "只读 buffer 的写入动作必须全部是空实现");
+    }
+
+    /// 测试用的原文（两行，够拖出一段选区）。
+    const RAW_SRC: &str = "## 1. 需求分解\n- [ ] 背景与问题\n";
+
+    /// 左键按下 / 松开事件。
+    fn click_at(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn raw_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, 260.0))
+    }
+
+    /// 跑一帧「原文文本框」，返回本帧输出与控件 `Response`。
+    ///
+    /// 离屏跑帧没有渲染器来消费纹理增量，必须手动 clear（否则 epaint 在 Drop 时 panic）。
+    fn raw_frame(
+        ctx: &egui::Context,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Response) {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut resp = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            resp = Some(read_only_text(
+                ui,
+                "raw_md_test",
+                [400.0, 200.0],
+                egui::TextStyle::Monospace,
+                RAW_SRC,
+            ));
+        });
+        out.textures_delta.clear();
+        (out, resp.expect("read_only_text 应返回 response"))
+    }
+
+    /// 从输出里捞所有写进剪贴板的内容。
+    fn copied_texts(out: &egui::FullOutput) -> Vec<String> {
+        out.platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 只读文本框必须**参与指针交互**。
+    ///
+    /// `interactive(false)` 的老写法会把 sense 降成 `Sense::hover()`：点不中、拖不动、
+    /// 也拿不到焦点——这正是原来"选不中、复制不了"的根因。这里把这两条钉住。
+    #[test]
+    fn 只读文本框参与指针交互() {
+        let ctx = egui::Context::default();
+        let screen = raw_screen();
+        let (_, r) = raw_frame(&ctx, screen, vec![]);
+        let id = r.id;
+        let p = egui::pos2(8.0, 6.0);
+
+        let (_, r) = raw_frame(&ctx, screen, vec![egui::Event::PointerMoved(p)]);
+        assert!(r.hovered(), "指针移到正文上应算 hover");
+
+        // 按下即拿焦点：旧写法（sense = hover）这一步必然失败。
+        let _ = raw_frame(&ctx, screen, vec![click_at(p, true)]);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(id),
+            "在只读正文上按下应让文本框获得焦点"
+        );
+
+        // 按住并移动 → 进入拖拽态（鼠标框选的前提）。
+        let _ = raw_frame(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(egui::pos2(80.0, 6.0))],
+        );
+        let (_, r) = raw_frame(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(egui::pos2(200.0, 6.0))],
+        );
+        assert!(r.dragged(), "按住并移动后应进入拖拽态，否则框选无从谈起");
+    }
+
+    /// 「选中 → 复制」两个出口：右键菜单的「复制选中」与 Ctrl+C。
+    ///
+    /// 选区直接写进 TextEdit 状态（菜单里的「全选」也是这么写），再分别验两个出口。
+    /// 不模拟鼠标拖选的原因见 [`只读文本框参与指针交互`]：离屏帧没有真实窗口几何，
+    /// `Galley::cursor_from_pos` 一律返回第 0 个字符（可编辑的 TextEdit 同样如此，已实测），
+    /// 选区内容只能在状态层面验。
+    #[test]
+    fn 选中内容可经右键菜单与快捷键复制() {
+        let ctx = egui::Context::default();
+        let screen = raw_screen();
+        let p = egui::pos2(8.0, 6.0);
+        let _ = raw_frame(&ctx, screen, vec![]);
+        let _ = raw_frame(&ctx, screen, vec![egui::Event::PointerMoved(p)]);
+        let (_, r) = raw_frame(&ctx, screen, vec![click_at(p, true)]);
+        let id = r.id;
+
+        let want = "## 1. 需求分解";
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(want.chars().count()),
+            )));
+        egui::TextEdit::store_state(&ctx, id, state);
+
+        // 出口一：右键菜单「复制选中」走的就是它。
+        assert_eq!(
+            selected_text(&ctx, id, RAW_SRC).as_deref(),
+            Some(want),
+            "「复制选中」应取出当前选区"
+        );
+
+        // 出口二：Ctrl+C。真实窗口里 egui-winit 就是把 Ctrl+C 翻成 `Event::Copy`。
+        //
+        // ⚠ 这里只断言"选区的文字确实进了剪贴板"，不比对完整内容：
+        // 离屏帧里 galley 的几何是退化的（量出来 `Galley::rect` 是 0×0），
+        // `clamp_cursor` 会把选区夹短（实测 0..9 被夹成 0..2，且**换成可编辑的
+        // `String` buffer 也一样**，属测试环境限制而非本改动引入）。选区的取值本身
+        // 由上面 `selected_text` 那条断言负责——它不走 galley。
+        let (out, _) = raw_frame(&ctx, screen, vec![egui::Event::Copy]);
+        let copied = copied_texts(&out);
+        assert_eq!(
+            copied.len(),
+            1,
+            "Ctrl+C 应产生一条复制命令；实际输出：{:?}",
+            out.platform_output.commands
+        );
+        assert!(!copied[0].is_empty(), "Ctrl+C 复制出来的内容不应为空");
+        assert!(
+            RAW_SRC.starts_with(copied[0].as_str()),
+            "复制出来的应是原文的一段，实际：{:?}",
+            copied[0]
+        );
+    }
+
+    /// 「一键复制全文」按钮：点一下就整段进剪贴板（不依赖选中状态）。
+    #[test]
+    fn 原文视图的一键复制全文按钮可用() {
+        let ctx = egui::Context::default();
+        let screen = raw_screen();
+        let run = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| add_raw_text(ui, RAW_SRC));
+            out.textures_delta.clear();
+            out
+        };
+
+        // 按钮在 `add_raw_text` 顶部那一行的最左端。
+        let btn = egui::pos2(12.0, 8.0);
+        let _ = run(vec![]);
+        let _ = run(vec![egui::Event::PointerMoved(btn), click_at(btn, true)]);
+        let out = run(vec![egui::Event::PointerMoved(btn), click_at(btn, false)]);
+
+        let copied = copied_texts(&out);
+        assert_eq!(
+            copied,
+            vec![RAW_SRC.to_string()],
+            "点「复制全文」应把整段原文放进剪贴板；实际输出：{:?}",
+            out.platform_output.commands
+        );
     }
 }
