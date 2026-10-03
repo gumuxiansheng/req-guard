@@ -7,12 +7,14 @@ mod cli;
 mod render;
 
 use cli::Action;
+use req_guard_core::ac;
 use req_guard_core::comment;
 use req_guard_core::error::{GateError, Result};
 use req_guard_core::gate;
 use req_guard_core::idcheck;
 use req_guard_core::requirement;
 use req_guard_core::status;
+use req_guard_core::touch;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -430,6 +432,9 @@ fn run(a: &cli::Args) -> Result<()> {
             );
         }
         Action::Token { ref sub } => run_token(root, a, sub)?,
+        Action::Ac { ref sub } => run_ac(root, a, sub)?,
+        Action::TouchCheck => run_touch_check(root, a)?,
+        Action::Touch { ref sub } => run_touch(root, a, sub)?,
         Action::Ui => run_ui(root, a)?,
     }
     Ok(())
@@ -678,4 +683,152 @@ fn resolve_identity(
          或配置 git 身份（git config user.name \"你的名字\"）后由 req-guard 自动取用",
         label, flag
     )))
+}
+
+/// `req-guard ac check`：验收标准机械校验。
+///
+/// 判定全在 core（`ac::check` → `ac::lint`），这里只做参数翻译、渲染与退出码 ——
+/// 与 `ids --check` 同一套房屋风格（`{标记} [{严重级}] {message}`）。
+/// **Error 全部排在 Warn 之前**：门禁唯一的静默降级口是「仅 Warn 也放行」，
+/// 排序固定才能保证降级发生时人先看到硬伤。
+fn run_ac(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
+    match sub {
+        "check" => {}
+        other => {
+            return Err(GateError::Validation(format!(
+                "未知 ac 子命令: {}（可选 check）",
+                other
+            )))
+        }
+    }
+    let target = match (a.id.as_deref(), a.archived) {
+        (Some(id), _) => ac::AcTarget::Id(id),
+        // `--all` 走 `--archived` 旗标复用：语义都是"含归档区，只读"
+        (None, true) => ac::AcTarget::IncludingArchived,
+        (None, false) => ac::AcTarget::All,
+    };
+    let issues = ac::check(root, &target)?;
+
+    let errors: Vec<&ac::AcIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
+    let warns: Vec<&ac::AcIssue> = issues.iter().filter(|i| !i.severity.is_error()).collect();
+    for i in errors.iter().chain(warns.iter()) {
+        let mark = if i.severity.is_error() {
+            "✗"
+        } else {
+            "⚠️"
+        };
+        println!("{} [{}] {}", mark, i.severity.as_str(), i.message);
+    }
+    if issues.is_empty() {
+        println!("✅ 验收标准合规：第 3 段的 AC 编号连续、Given/When/Then 齐备且可度量");
+    }
+    if !errors.is_empty() {
+        eprintln!(
+            "共 {} 项硬伤 / {} 项告警；修复硬伤后重跑 req-guard ac check",
+            errors.len(),
+            warns.len()
+        );
+        std::process::exit(1);
+    } else if !warns.is_empty() {
+        println!("共 {} 项告警（不阻断）", warns.len());
+    }
+    Ok(())
+}
+
+/// `req-guard touch-check`：变更范围契约判定（判定全在 [`touch::check`]）。
+///
+/// 两个变更集来源：
+/// - 默认：读 `HOOK_STAGED_FILES`，未设则回落 `git diff --cached`（pre-commit 路径）
+/// - `--base <ref>`：`git diff --name-only <ref>...HEAD`（CI / L3 路径）
+///
+/// `--base` 不是可选装饰：没有它，`git commit --no-verify` 就完全绕过了这道墙
+/// （见设计文档 §3.6）。
+fn run_touch_check(root: &Path, a: &cli::Args) -> Result<()> {
+    let scope = if gate::touch_scope_strict(root) {
+        touch::TouchScope::Strict
+    } else {
+        touch::TouchScope::Union
+    };
+    let src = match a.base.as_deref() {
+        Some(b) => touch::Changed::Range(b.to_string()),
+        None => touch::Changed::Staged(touch::staged_files(root)?),
+    };
+    let only = std::env::var("HOOK_REQ")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let issues = touch::check(root, scope, only.as_deref(), &src)?;
+    let errs: Vec<&touch::TouchIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
+    for i in &errs {
+        println!("✗ [{}] {}", i.severity.as_str(), i.message);
+    }
+    if issues.is_empty() {
+        println!("✅ 变更范围合规：本次改动都在技术方案段的 GATE:TOUCH 声明范围内");
+    } else {
+        eprintln!(
+            "共 {} 项硬伤；处置见上方三条出路（改方案 / touch --declare / --no-verify）",
+            errs.len()
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `req-guard touch --declare <glob>...`：向清单追加变更范围声明。
+fn run_touch(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
+    if sub != "--declare" {
+        return Err(GateError::Validation(format!(
+            "未知 touch 子命令: {}（可选 --declare）",
+            sub
+        )));
+    }
+    if a.globs.is_empty() {
+        return Err(GateError::Validation(
+            "用法：req-guard touch --declare --glob <路径> [--glob <glob>...] [--reason <原因>]"
+                .into(),
+        ));
+    }
+    let id = match a.id.as_deref() {
+        Some(i) => i.to_string(),
+        None => {
+            // 缺省取"最新活跃需求"（与 HOOK_SH 第 2 段同规则）
+            let reqs = requirement::list(root)?;
+            let mut live: Vec<requirement::Requirement> = Vec::new();
+            for r in reqs {
+                let c = std::fs::read_to_string(&r.path).unwrap_or_default();
+                if requirement::head_status(&c) != "done" {
+                    live.push(r);
+                }
+            }
+            live.sort_by(|x, y| y.path.file_name().cmp(&x.path.file_name()));
+            match live.first() {
+                Some(r) => r.id.clone(),
+                None => {
+                    return Err(GateError::Validation(
+                        "没有未归档的需求清单可追加声明；请先 req-guard create".into(),
+                    ))
+                }
+            }
+        }
+    };
+    let actor = resolve_identity(a.author.as_deref(), "操作人", "--author", root)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let added = touch::declare(
+        root,
+        &id,
+        &a.globs,
+        a.reason.as_deref().unwrap_or(""),
+        &actor,
+    )?;
+    if added.is_empty() {
+        println!("声明未变化：{id} 的 GATE:TOUCH 已包含全部给定条目");
+        return Ok(());
+    }
+    println!("✅ 已向 {id} 的 GATE:TOUCH 追加 {} 条声明：", added.len());
+    for p in &added {
+        println!("   + {p}");
+    }
+    if gate::touch_reapprove(root) {
+        println!("   技术方案已打回 pending —— 范围扩张须重新过审（req-guard approve {id} --step solution）");
+    }
+    Ok(())
 }

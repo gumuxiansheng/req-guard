@@ -71,6 +71,28 @@ pub fn step_label(step: &str) -> &'static str {
 /// 放在 core 而不是各前端：TUI 与 GUI 必须按同一条规则切段，否则"两个界面看到的
 /// 不是同一份东西"，对门禁工具而言是不可接受的（与"判定唯一真相在 core"同源）。
 pub fn section_of(content: &str, step: usize) -> String {
+    // 定位失败仍回退整篇（见本函数文档：宁可多显示也不能让界面白屏）。
+    let Some((start, end)) = section_span(content, step) else {
+        return content.to_string();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = lines[start - 1..end].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// 第 `step` 段的行区间 `[start, end)`（**1-based、左闭右开**），定位失败返回 `None`。
+///
+/// 与 [`section_of`] 的区别只有一处，但至关重要：**它不猜**。
+/// `section_of` 定位失败时回退整篇（为保证审核人界面不白屏），
+/// 而机械校验（[`crate::ac`] 的 AC 校验、变更范围校验）**绝不能用那份回退整篇**：
+/// 标题被改坏的文档会拿全文去判，"第 3 段恰好有一条 AC"这种巧合就能蒙混过关 ——
+/// 那正是本工具最坏的失效模式（看着在拦、其实没拦）。
+///
+/// 故判定类调用一律走这里，拿到 `None` 就如实报「第 N 段定位失败」。
+pub fn section_span(content: &str, step: usize) -> Option<(usize, usize)> {
     /// 二级标题的行号（`## …` 一律算边界）。
     fn is_heading(line: &str) -> bool {
         line.trim_start().starts_with("## ")
@@ -83,18 +105,12 @@ pub fn section_of(content: &str, step: usize) -> String {
     }
 
     let lines: Vec<&str> = content.lines().collect();
-    let Some(start) = lines.iter().position(|l| heading_no(l) == Some(step + 1)) else {
-        return content.to_string();
-    };
+    let start = lines.iter().position(|l| heading_no(l) == Some(step + 1))?;
     let end = lines[start + 1..]
         .iter()
         .position(|l| is_heading(l))
         .map_or(lines.len(), |i| start + 1 + i);
-    let mut out = lines[start..end].join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
+    Some((start + 1, end))
 }
 
 /// 校验步骤键合法。
@@ -284,6 +300,52 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 测试计划批准前的 AC 格式门禁：有 Error 即拒绝批准。
+///
+/// 复用 [`crate::ac`] 的判定（唯一真相在 core），此处只负责"把问题转成拒绝理由 +
+/// 附上可粘贴的骨架"。判级不做 L0/L1 分档 —— 与 `ensure_source_refs` 不同，
+/// 这里**任何等级都拒绝**：AC 格式不合规不是"管理严格度"问题，而是清单根本不可判定，
+/// 放过去等于让门禁失去意义。
+fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
+    let Some((start, end)) = section_span(content, 2) else {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 的「## 3. 测试计划」二级标题定位失败，无法校验验收标准。\n\
+             请把该段标题改回 `## 3. 测试计划`（机械校验不回退整篇 —— \
+             回退会让标题写坏的文档靠巧合蒙混过关）。"
+        )));
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let section = lines[start - 1..end].join("\n");
+    let issues = crate::ac::lint(&section, start);
+    let errs: Vec<&crate::ac::AcIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
+    if errs.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "需求 {id} 的验收标准不合规（{} 项硬伤），拒绝批准测试计划：\n",
+        errs.len()
+    );
+    for i in &errs {
+        msg.push_str(&format!("  ✗ [{}] {}\n", i.kind_as_str(), i.message));
+    }
+    let warns = issues.len() - errs.len();
+    if warns > 0 {
+        msg.push_str(&format!("（另有 {warns} 项告警不阻断）\n"));
+    }
+    msg.push_str(&format!(
+        "\n每条 AC 的形态（编号独占一行 + 三个子句列表项）：\n\
+         <!-- GATE:AC -->\n\
+         ### AC-001\n\
+         - Given: <可复现的前置状态，写具体>\n\
+         - When: <一次可触发的操作，写出具体命令>\n\
+         - Then: <可观测结果，含退出码 / 字面量 / 数值>\n\
+         <!-- /GATE:AC -->\n\
+         完整规则见 docs/设计/AC与变更范围契约技术方案.md §2；\
+         校验命令：req-guard ac check {id}"
+    ));
+    Err(GateError::Validation(msg))
+}
+
 /// 技术方案批准前的声明侧门禁：`source_refs` 必须非空。
 ///
 /// 判级与身份绑定一致（L1+ fail-closed / L0 放行）——理由相同：AI 也能调 approve，
@@ -366,6 +428,16 @@ pub fn review(
         }
     }
 
+    // 验收标准机械校验（声明侧）：**测试计划**批准前 AC 必须格式合规。
+    //
+    // 为什么挂在审批上而不是只给 `ac check` 命令：审批是唯一能解锁编码的动作，
+    // 把校验挂在钥匙上，"第三段写成三段空话"就**物理上无法通过** ——
+    // 不依赖任何人记得跑检查命令。`ac check` 只是把同一判据提前暴露给 AI 与 CI，
+    // 用于早失败。两者共用 `ac::lint`，不存在两份判定。
+    if pass && step == "testplan" {
+        ensure_ac_compliant(&r.id, &content)?;
+    }
+
     // 规格时效契约（声明侧）：**技术方案**批准前必须已声明 source_refs。
     //
     // 为什么卡在第二段而不是第一段：需求分解阶段还在澄清背景与目标，往往还不知道
@@ -391,7 +463,7 @@ pub fn review(
 
     let mut out = String::new();
     for line in content.lines() {
-        if line.contains("GATE:STEP") && token(line, "name") == step {
+        if is_marker_line(line) && line.contains("GATE:STEP") && token(line, "name") == step {
             let label = token(line, "label");
             out.push_str(&format!(
                 "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} -->\n",
@@ -789,14 +861,90 @@ pub fn token(line: &str, key: &str) -> String {
     String::new()
 }
 
+/// 该行是否为**机读标记行**（`<!-- GATE:… -->` 或 `<!-- /GATE:… -->`）。
+///
+/// **为什么不能按字面量 `contains` 判定**：正文里合法地提到 `GATE:STEP` 是常态 ——
+/// 写验收标准（"执行 approve 后 status 变为 approved"）、写方案、写注释都会提到它。
+/// 子串匹配把散文当标记行，后果双向：
+/// - [`review`] 的改写循环会**原地替换**那一行 → 静默毁掉正文，并在正文中间
+///   注入一条 `label=` 为空的机器标记行（`safe_field` 的 `-` 约定也被破坏）；
+/// - [`crate::gate::doc_write_guard`] 把它计入"状态行集合" → AI 正常改动这类正文
+///   反被判成自批而**拦截**。即"正文合法提到 `GATE:STEP` ⇒ 这份清单此后再也写不动"。
+///
+/// 标记行的语法就是"以 `<!-- GATE:` 开头"，而合法 Markdown 正文不可能以此开头
+/// （`<!--` 本身就是注释起始）。故按**语法前缀**判定，不按字面量出现判定。
+///
+/// 放在 core 的 `requirement` 而非各前端：GATE 标记是**文件格式约定**，
+/// 格式约定的唯一解释处在这里（与 `section_of` 同一原则）。
+/// 把某一步打回 `pending`（`touch --declare` 扩张变更范围后用）。
+///
+/// **为什么需要它**：变更范围扩张若不触发重新过审，就等于 AI 可以自己把方案改宽 ——
+/// 那 `GATE:TOUCH` 就从"契约"退化成"建议"。打回 `pending` 后 `recompute_head`
+/// 会把整体状态拉回 `changes_requested`，必须重新 `approve` 才能继续。
+///
+/// 走与 `review` 相同的标记行判据（[`is_marker_line`]），因此正文里提到
+/// `GATE:STEP name=<step>` 的散文不会被改写。
+pub fn reopen_step(root: &Path, id: &str, step: &str) -> Result<()> {
+    validate_step(step)?;
+    let r = find(root, id)?;
+    let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })?;
+    if head_status(&content) == "done" {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 已归档（done），不再变更范围声明"
+        )));
+    }
+    let mut out = String::new();
+    let mut hit = false;
+    for line in content.lines() {
+        if is_marker_line(line) && line.contains("GATE:STEP") && token(line, "name") == step {
+            hit = true;
+            let label = token(line, "label");
+            out.push_str(&format!(
+                "<!-- GATE:STEP name={} label={} status=pending reviewer=- email=- sig=- updated={} -->\n",
+                step,
+                label,
+                safe_field(&crate::gate::now_str())
+            ));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !hit {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 的 GATE:STEP 标记行里找不到 name={step}，无法打回"
+        )));
+    }
+    let out = set_head_status(&out, &recompute_head(&out), None);
+    fs::write(&r.path, out).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })
+}
+
+/// 供审计事件使用：空白转下划线、空串转 `-`（GATE/台账的字段约定）。
+pub fn safe_field_for_audit(s: &str) -> String {
+    safe_field(s)
+}
+
+pub fn is_marker_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("<!-- GATE:") || t.starts_with("<!-- /GATE:")
+}
+
 fn head_line(content: &str) -> Option<&str> {
-    content.lines().find(|l| l.contains("GATE:HEAD"))
+    content
+        .lines()
+        .find(|l| is_marker_line(l) && l.contains("GATE:HEAD"))
 }
 
 fn step_line<'a>(content: &'a str, step: &str) -> Option<&'a str> {
     content
         .lines()
-        .find(|l| l.contains("GATE:STEP") && token(l, "name") == step)
+        .find(|l| is_marker_line(l) && l.contains("GATE:STEP") && token(l, "name") == step)
 }
 
 /// 清单整体状态。
@@ -842,7 +990,7 @@ pub fn step_updated(content: &str, step: &str) -> String {
 fn set_head_status(content: &str, status: &str, done_ts: Option<&str>) -> String {
     let mut out = String::new();
     for line in content.lines() {
-        if line.contains("GATE:HEAD") {
+        if is_marker_line(line) && line.contains("GATE:HEAD") {
             let id = token(line, "id");
             let created = token(line, "created");
             let done = match done_ts {
@@ -1069,7 +1217,23 @@ const SOLUTION_BODY: &str = "\
 
 <!-- 技术方案批准前必须在上方 frontmatter 的 source_refs 声明本次要改的文件/模块，
      否则 doc-guard 的 FRS004（源已改而规格未同步）无法发现规格腐化。
-     格式为行内数组，元素可用目录（向下递归）：source_refs: [backend/src/main/java/com/x] -->
+     格式为行内数组，元素可用目录（向下递归）：source_refs: [backend/src/main/java/com/x]
+     注意：source_refs 不支持 glob，且它是 req-guard 从下方 GATE:TOUCH 块**单向派生**的
+     （见 docs/设计/AC与变更范围契约技术方案.md §3.8）——**不要手改 frontmatter，
+     改了会在下次 approve 时被覆盖回去。要改声明范围，改下面的块。 -->
+
+<!-- 变更范围契约：GATE:TOUCH 是本清单唯一的「要改哪些文件」人工声明源。
+     req-guard touch-check 用它与 git 实际改动集比对（pre-commit + CI），
+     并在 approve 时单向派生出 frontmatter 的 source_refs。
+     语法：每行一条相对仓库根的路径或 glob，# 后为注释，空行忽略。
+       core/src/**      跨层级
+       core/src/*.rs    单层
+       cli/src/cli.rs   精确文件
+     要求：反斜杠会被归一为 /；不接受 .. 逃出仓库根的条目。
+     块为空 → 技术方案批准被拒（连同 source_refs 一并不写，保持 fail-closed）。 -->
+<!-- GATE:TOUCH -->
+core/src/**
+<!-- /GATE:TOUCH -->
 ";
 
 const TESTPLAN_BODY: &str = "\
@@ -1077,12 +1241,28 @@ const TESTPLAN_BODY: &str = "\
 - [ ] 端到端用例（编号 + 执行步骤）
 - [ ] 边界 / 异常 / 并发场景
 - [ ] 回归范围与影响面
-- [ ] 覆盖率要求与验收门槛
+- [ ] 验收门槛（可机械判定）
+
+<!-- 验收标准：req-guard ac check 机械校验（规则见 docs/设计/AC与变更范围契约技术方案.md §2）。
+     条目形态唯一：三行式 —— 编号独占一行，其下恰好三个子句列表项。
+     硬约束：编号形如 `AC-<3位数字>`，须连续、无重复、无跳号；三个子句顺序固定
+     Given → When → Then；子句不得少于 4 个非空白字符；Given 必须自包含（不得写
+     「与上一条相同」这类外部指代，引用违规样例一律用行内代码标记包起来）；
+     Then 必须可度量（含数字或字面量）。
+     注意：本说明刻意不写出具体编号字面量 —— 块外出现 `AC-` + 3 位数字会被 A7 判违规。
+     标记行只能由 req-guard 维护；块内正文可自由编辑。 -->
+<!-- GATE:AC -->
+### AC-001
+- Given: <可复现的前置状态；写具体，不写「正常情况」这类不可判定的前提>
+- When: <一次可触发的操作；写出具体命令或步骤>
+- Then: <可观测结果；含退出码、字面量或数值>
+<!-- /GATE:AC -->
 ";
 
 // ===================== 单元测试 =====================
 
 #[cfg(test)]
+#[allow(non_snake_case)] // 与既有中文测试命名一致
 mod tests {
     use super::*;
     use crate::testutil::{cleanup, temp_dir};
@@ -1624,5 +1804,173 @@ mod tests {
         assert_eq!(None, year_of("REQ-001.md"));
         assert_eq!(None, year_of("REQ-kd-20261345-A7F3.md")); // 13 月非法
         assert_eq!(None, year_of("REQ-kd-2026093-x.md")); // 不足 8 位数字
+    }
+
+    // ---------- P0：标记行判据必须是语法前缀，不能是字面量 contains ----------
+
+    /// 正文里合法提到 `GATE:STEP name=<step>`（写验收标准时的常态），
+    /// `approve` 不得把它当标记行原地改写，也不得注入第二条标记行。
+    #[test]
+    fn review_正文提及GATE_STEP的散文不被改写() {
+        let root = temp_dir("req-p0-prose");
+        create(&root, None, "散文提及").unwrap();
+        let p = find(&root, "REQ-001").unwrap().path;
+        let mut content = fs::read_to_string(&p).unwrap();
+        let prose = "- Then: 退出码 0，GATE:STEP name=testplan 的 status 变为 approved";
+        content = content.replace(
+            "## 3. 测试计划\n",
+            &format!("## 3. 测试计划\n\n{}\n", prose),
+        );
+        fs::write(&p, content).unwrap();
+
+        // strict=false：本用例只关心"改写循环认不认得标记行"，不关心审核顺序
+        review(&root, "REQ-001", "testplan", "寇工", true, "", false).unwrap();
+
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains(prose),
+            "正文散文被 approve 静默改写：\n{}",
+            after
+        );
+        let markers: Vec<&str> = after
+            .lines()
+            .filter(|l| is_marker_line(l) && l.contains("GATE:STEP"))
+            .collect();
+        assert_eq!(
+            3,
+            markers.len(),
+            "GATE:STEP 标记行应仍只有文件头 3 条，实际 {:?}",
+            markers
+        );
+        assert!(
+            !markers
+                .iter()
+                .any(|l| l.contains("label= status") || l.contains("label=,")),
+            "不得注入 label= 空值的标记行：{:?}",
+            markers
+        );
+        cleanup(&root);
+    }
+
+    /// `set_head_status` 同理：正文提及 `GATE:HEAD` 不得被改写。
+    #[test]
+    fn set_head_status_正文提及GATE_HEAD的散文不被改写() {
+        let mut content = String::from("# REQ-001 x\n");
+        content.push_str("<!-- GATE:HEAD id=REQ-001 status=draft created=2026-01-01 -->\n");
+        content.push_str("\n正文里提到 GATE:HEAD status=approved 只是叙述。\n");
+        let out = set_head_status(&content, "approved", None);
+        assert!(
+            out.contains("正文里提到 GATE:HEAD status=approved 只是叙述。"),
+            "正文散文被 set_head_status 改写：\n{}",
+            out
+        );
+        assert_eq!(1, out.matches("<!-- GATE:HEAD").count());
+    }
+
+    /// `gate_lines` 只收标记行：正文提及 GATE:STEP 的行不进集合，
+    /// 于是 `doc_write_guard` 不会把"正常改正文"误判成自批（见 ac 与 gate 的 E2E）。
+    #[test]
+    fn gate_lines_只收标记行不收正文散文() {
+        let text = "<!-- GATE:HEAD id=REQ-001 status=draft created=2026-01-01 -->\n\
+                    <!-- GATE:STEP name=solution label=技术方案 status=pending -->\n\
+                    正文提到 GATE:STEP 只是叙述，不该被计入。\n\
+                    <!-- GATE:AC -->\n\
+                    <!-- /GATE:AC -->\n";
+        let n = text.lines().filter(|l| is_marker_line(l)).count();
+        assert_eq!(4, n, "HEAD/STEP/AC 三对标记共 4 行标记");
+    }
+
+    #[test]
+    fn is_marker_line_按语法前缀判定() {
+        assert!(is_marker_line("<!-- GATE:HEAD id=X -->"));
+        assert!(is_marker_line("  <!-- GATE:STEP name=X -->"));
+        assert!(is_marker_line("<!-- /GATE:AUDIT -->"));
+        // 正文散文：即便提到 GATE 字面量也不是标记行
+        assert!(!is_marker_line(
+            "- Then: GATE:STEP name=testplan 变为 approved"
+        ));
+        assert!(!is_marker_line("`HOOK_SH` 只 grep 'GATE:STEP' 判状态"));
+    }
+
+    /// 审批挂钩（AC 门禁的"牙齿"）：第 3 段无条目时 `approve --step testplan` 必须被拒，
+    /// 且状态保持 pending —— 审批被拒即未解锁，这是唯一真正的强制点。
+    #[test]
+    fn review_测试计划批准前须AC格式合规() {
+        use crate::testutil::disable_auth;
+        let root = temp_dir("req-ac-gate");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        create(&root, None, "AC 门禁").unwrap();
+        let p = find(&root, "REQ-001").unwrap().path;
+
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
+
+        // 模板骨架里的 Then 是占位符，但**硬伤**不在那儿：先把 GATE:AC 块整段删掉
+        let c = fs::read_to_string(&p).unwrap();
+        let stripped = {
+            let b = c.find(crate::ac::BEGIN).unwrap();
+            let e = c.find(crate::ac::END).unwrap() + crate::ac::END.len();
+            format!("{}{}", &c[..b], &c[e..])
+        };
+        fs::write(&p, stripped).unwrap();
+
+        let err = review(&root, "REQ-001", "testplan", "寇工", true, "", false)
+            .expect_err("无 AC 的测试计划不得批准");
+        let msg = err.to_string();
+        assert!(msg.contains("MissingBlock"), "应报缺块：{msg}");
+        assert!(msg.contains("GATE:AC"), "错误须附可粘贴骨架：{msg}");
+        assert!(msg.contains("req-guard ac check"), "须给出校验命令：{msg}");
+        assert_eq!(
+            "pending",
+            step_status(&fs::read_to_string(&p).unwrap(), "testplan"),
+            "审批被拒则状态不得前进"
+        );
+
+        // 补一条合规 AC 后放行
+        let c = fs::read_to_string(&p).unwrap();
+        // 上一步把 BEGIN..END 整段删掉了，这里**成对**补回
+        let filled = c.replacen(
+            "## 3. 测试计划",
+            &format!(
+                "## 3. 测试计划\n\n{}\n### AC-001\n- Given: 清单已装好且三段齐备\n\
+                 - When: 执行 ac check\n- Then: 退出码 0\n{}",
+                crate::ac::BEGIN,
+                crate::ac::END
+            ),
+            1,
+        );
+        fs::write(&p, filled).unwrap();
+        review(&root, "REQ-001", "testplan", "寇工", true, "", false).unwrap();
+        assert_eq!(
+            "approved",
+            step_status(&fs::read_to_string(&p).unwrap(), "testplan")
+        );
+        cleanup(&root);
+    }
+
+    /// reject 不受 AC 门禁约束：打回不该要求对方先把内容改对。
+    #[test]
+    fn review_打回测试计划不受AC门禁约束() {
+        use crate::testutil::disable_auth;
+        let root = temp_dir("req-ac-reject");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        create(&root, None, "AC 门禁打回").unwrap();
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        assert!(
+            review(
+                &root,
+                "REQ-001",
+                "testplan",
+                "寇工",
+                false,
+                "AC 不合规",
+                false
+            )
+            .is_ok(),
+            "reject 不该被 AC 门禁拦住"
+        );
+        cleanup(&root);
     }
 }

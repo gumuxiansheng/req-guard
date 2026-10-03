@@ -1,0 +1,66 @@
+# req-guard — AI 需求门禁声明
+# 目标：AI 在编写代码前，必须先完成三段清单并经审核人批准；否则硬拦截。
+# 本文件随仓库版本化，改动须走评审（与团队规范同源）。
+version: 1
+enabled: true
+
+# 三段清单（顺序即默认强制审核顺序）
+steps:
+  - name: decomposition
+    label: 需求分解
+  - name: solution
+    label: 技术方案
+  - name: testplan
+    label: 测试计划
+
+# 强制顺序：审核后一步之前，其前置步骤必须已 approved
+strict_order: true
+
+# 拦截点
+enforce:
+  ai_tool_hook: true   # AI 工具 PreToolUse，拦截 Write/Edit —— 最硬的一层
+  pre_commit: true     # git pre-commit 兜底
+  ci: true             # CI 侧拦截：流水线须调用 req-guard check，并设为必需（required）状态检查
+
+# 被拦截的 AI 写操作（matcher 语法随工具而异）
+blocked_tools:
+  - Write
+  - Edit
+  - MultiEdit
+  - NotebookEdit
+
+# 审批严格等级（0–3，逐级包含；判定见 core/src/auth.rs）。
+# 背景：方案 A（AI 会话标记）是白名单注入，未登记的 AI 工具（如 WorkBuddy）
+# 会话内没有标记，"没标记 = 人类"会让审批锁**静默失效**。
+#   0 = 仅方案 A 软标记（不打断存量项目）
+#   1 = 审批"无凭据即拒"；且 token issue/revoke 必须人类在真实终端（TTY 挑战码）
+#       —— 掐死"AI 执行 token issue 自签令牌再自批"
+#   2 = 1 + 审批凭据只认进程内显式传入，不读 REQ_GUARD_TOKEN 环境变量
+#       （环境变量会被同 shell 会话的 AI 子进程继承）；GUI 进程内签发并内存持有
+#   3 = 2 + 凭据升级为一次性范围票据：绑定需求+步骤，用后即废（抗重放）
+# 兼容旧键：仅写 auth.strict: true 而未写 level 时按 1 计。
+auth:
+  level: 3
+
+# 应急绕过（有时效、必填原因、强制审计）
+bypass:
+  enabled: true
+  default_ttl_minutes: 60
+  require_reason: true
+
+# 变更范围契约（GATE:TOUCH）
+touch:
+  exempt:
+    - .gates/**
+    - target/**
+    - dist/**
+    - Cargo.lock
+    - .gitignore
+  scope: union
+  reapprove: true
+
+# 到期自动归档：done 满 N 天后，req-guard done 成功时自动把清单
+# 物理搬入 .gates/requirements/archive/<创建年份>/（无日期段 → misc/）
+# 0 = done 即刻归档；手动补扫：req-guard archive
+archive:
+  after_days: 30

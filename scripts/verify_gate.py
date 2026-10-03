@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "core" / "src" / "gate.rs"
 REQ_DIR = ".gates/requirements"
 HOOK_REL = ".gates/hooks/req-guard-check.sh"
+TOUCH_REL = ".gates/hooks/req-guard-touch-check.sh"
 
 # 模拟 AI 工具 PreToolUse：AI 试图直接改写审核评论文件
 STDIN_AI_WRITE_COMMENTS = (
@@ -94,6 +95,7 @@ def extract_const(name: str) -> str:
 
 
 HOOK = extract_const("HOOK_SH")
+TOUCH_HOOK = extract_const("HOOK_TOUCH_SH")
 DENY_HOOK = extract_const("DENY_SH")
 # Windows CI 的 POSIX shell 由 Git for Windows 提供；缺失时给出可操作提示，
 # 而不是抛一串 FileNotFoundError 让人以为是脚本 bug。
@@ -223,6 +225,121 @@ CASES = [
     ),
 ]
 
+def verify_touch_gate() -> bool:
+    """19–25 变更范围契约场景（设计文档 §6.4）。
+
+    与前 18 个场景不同：判定在 **core**（`req-guard touch-check`），
+    脚本只负责取 staged 文件集并透传退出码。所以这些场景测的是
+    「脚本接线是否正确」+「core 判定在真实 git 索引下是否成立」。
+    判定逻辑本身的细粒度覆盖在 `cargo test -p req-guard-core touch` 里。
+    """
+    if not BIN.exists():
+        print("SKIP  19-25_变更范围契约: 未构建 req-guard 二进制（cargo build）")
+        return True
+
+    ok = True
+    for name, staged, declared, expect in [
+        ("19_staged含未声明文件", ["docs/b.md"], ["src/**"], 1),
+        ("20_staged全为已声明文件", ["src/a.rs"], ["src/**"], 0),
+        ("21_staged含exempt路径", [".gates/requirements/REQ-001.md"], ["src/**"], 0),
+        ("22_staged为空", [], ["src/**"], 0),
+        ("23_无TOUCH块视为未声明", ["src/a.rs"], [], 1),
+    ]:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{name}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=work, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=work, check=True)
+        (work / REQ_DIR).mkdir(parents=True)
+        (work / TOUCH_REL).parent.mkdir(parents=True, exist_ok=True)
+        (work / TOUCH_REL).write_text(TOUCH_HOOK, encoding="utf-8")
+        touch_block = (
+            f"<!-- GATE:TOUCH -->\n"
+            + "".join(f"{d}\n" for d in declared)
+            + "<!-- /GATE:TOUCH -->\n"
+            if declared
+            else ""
+        )
+        # 先造 staged 文件，再写需求文档：场景 21 会把
+        # `.gates/requirements/REQ-001.md` 本身作为"已暂存文件"造出来，
+        # 顺序反了就会用 `"x\n"` **把被测的需求文档覆写掉**，
+        # 于是判定看到的是一份没有 TOUCH 块的残缺文档 —— 测的就不是声明豁免了。
+        for f in staged:
+            p = work / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.name == "REQ-001.md":
+                continue  # 需求文档由下面写入，别用占位内容覆盖
+            p.write_text("x\n", encoding="utf-8")
+
+        # 注意：**不能**靠 str.replace 往 make_req() 的产物里插 `## 2. 技术方案` ——
+        # make_req() 根本没有二级标题，replace 静默什么都不做，于是每个场景都因为
+        # "缺 TOUCH 块"而 exit 1，期望 1 的场景变成假通过。这里显式拼完整三段。
+        (work / REQ_DIR / "REQ-001.md").write_text(
+            make_req("approved")
+            + f"\n## 1. 需求分解\n\n- 背景\n\n## 2. 技术方案\n\n{touch_block}\n"
+            + "## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
+            + "- Given: 清单已批准\n- When: 执行 check\n- Then: 退出码 0\n"
+            + "<!-- /GATE:AC -->\n\n## 审核记录\n\n<!-- GATE:AUDIT -->\n<!-- /GATE:AUDIT -->\n",
+            encoding="utf-8",
+        )
+        if staged:
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        # touch 脚本是 fail-closed 的：req-guard 不在 PATH 就直接拦。
+        # 必须把 BIN_DIR 塞进 PATH，否则**每个场景都会 exit 1**，
+        # 期望 1 的场景就成了假通过（测的是"二进制缺失"而不是"越界"）。
+        env = dict(os.environ)
+        env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
+        r = subprocess.run(
+            [SH, str(work / TOUCH_REL)], cwd=work, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, env=env, **RUN_KW,
+        )
+        good = r.returncode == expect
+        if not good and expect == 0:
+            print(f"      ↳ stderr: {r.stderr.strip()[:300]}")
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {name}: exit={r.returncode} (期望 {expect})")
+
+    # 24_PRE_COMMIT_BLOCK 含 touch 段（正则抽取断言，防"实现了但没接线"）
+    text = SRC.read_text(encoding="utf-8")
+    m = re.search(r"const PRE_COMMIT_BLOCK: &str = r#\"(.*?)\"#;", text, re.S)
+    if not m:
+        print("FAIL  24_pre_commit含touch段: 未能抽取 PRE_COMMIT_BLOCK")
+        ok = False
+    elif "req-guard-touch-check.sh" not in m.group(1):
+        print("FAIL  24_pre_commit含touch段: PRE_COMMIT_BLOCK 里没有 touch 调用")
+        ok = False
+    else:
+        # 25_整块与增量段逐字一致（core 单测同款断言，这里从 Python 侧再锁一次）
+        m2 = re.search(r'const PRE_COMMIT_TOUCH_BLOCK: &str = r#"(.*?)"#;', text, re.S)
+        if not m2 or not m.group(1).endswith(m2.group(1)):
+            print("FAIL  25_整块与增量段一致: PRE_COMMIT_BLOCK 未以 PRE_COMMIT_TOUCH_BLOCK 结尾")
+            ok = False
+        else:
+            print("PASS  24_pre_commit含touch段")
+            print("PASS  25_整块与增量段一致")
+
+    # 26_touch 段脚本缺失即拦截（fail-closed，与主门禁同款）
+    work = Path(tempfile.mkdtemp(prefix="reqguard-26"))
+    (work / ".git" / "hooks").mkdir(parents=True)
+    pc = work / ".git" / "hooks" / "pre-commit"
+    m = re.search(r"const PRE_COMMIT_BLOCK: &str = r#\"(.*?)\"#;", text, re.S)
+    (work / REQ_DIR).mkdir(parents=True)
+    (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+    (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+    (work / REQ_DIR / "REQ-001.md").write_text(make_req("approved"), encoding="utf-8")
+    pc.write_text("#!/bin/sh\n" + m.group(1), encoding="utf-8")
+    # 刻意不创建 TOUCH_REL → 第二段必须拦
+    env = dict(os.environ)
+    env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        [SH, str(pc)], cwd=work, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, env=env, **RUN_KW,
+    )
+    good = r.returncode == 1
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  26_touch脚本缺失即拦截: exit={r.returncode} (期望 1)")
+    return ok
+
+
 ok = True
 for name, req, cmts, bp, stdin_data, expect, extra in CASES:
     rc = run(name, req, cmts, bp, stdin_data, extra)
@@ -261,6 +378,7 @@ def verify_pre_commit_fail_closed() -> bool:
 
 
 ok = ok and verify_pre_commit_fail_closed()
+ok = ok and verify_touch_gate()
 
 
 def verify_deny_wrapper() -> bool:

@@ -21,25 +21,8 @@ use std::path::Path;
 use crate::error::Result;
 use crate::requirement;
 
-/// 问题严重级：`Error` 使 `ids --check` 退出码非 0；`Warn` 仅提示不阻断。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Warn,
-    Error,
-}
-
-impl Severity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Severity::Warn => "警告",
-            Severity::Error => "错误",
-        }
-    }
-
-    pub fn is_error(self) -> bool {
-        matches!(self, Severity::Error)
-    }
-}
+/// 问题严重级：迁到 `crate::issue` 与 AC 校验 / 变更范围校验共用（避免同词不同义）。
+pub use crate::issue::Severity;
 
 /// 问题类别（对应规范 §8 P1 三类检测 + P3 编号 lint）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

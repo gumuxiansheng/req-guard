@@ -160,7 +160,12 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
+`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
+（`ac check [<需求ID>] [--all]` 校验第 3 段验收标准：编号连续 + Given/When/Then 齐备，
+硬伤退出码 1；`approve --step testplan` 时已跑同一判据，这一步是服务端兜底）
+（`touch-check [--base <ref>]` 校验「实际改动 ⊆ 技术方案段 `GATE:TOUCH` 声明并集」；
+`touch --declare --glob <路径>` 扩张声明范围，AI 禁止调用且会打回技术方案重审；
+CI 侧的 `--base` 是服务端对应物，抵消 `--no-verify`）
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；**操作人身份取 git 身份**（`user.name`），
 `--reviewer` / `--author` 可省略，回退顺序为「参数 → `REQ_GUARD_REVIEWER` → git 身份」，

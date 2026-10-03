@@ -14,6 +14,10 @@
 //! req-guard ids [--check]               列出编号；--check 防冲突三类检测
 //! req-guard comments <需求ID> [--refresh-anchors]
 //! req-guard check                       手动执行拦截判定（退出码 0 放行 / 1 拦截）
+//! req-guard ac check [<需求ID>] [--all]  验收标准机械校验（A1–A12，见 core/src/ac.rs）
+//! req-guard touch-check [--base <ref>]     变更范围契约（见 core/src/touch.rs）
+//! req-guard touch --declare <glob>... [--reason <原因>]
+//! req-guard ac check [<需求ID>] [--all]  验收标准机械校验（core/src/ac.rs 的 A1–A12）
 //! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
 //! req-guard bypass   --reason <原因> [--ttl 60]
 //! req-guard audit-digest                 审计日志 SHA-256 摘要写入入库 DIGEST
@@ -53,6 +57,16 @@ pub enum Action {
     Token {
         sub: String,
     },
+    /// 验收标准机械校验：`ac check`（A1–A12，见 core/src/ac.rs）。
+    Ac {
+        sub: String,
+    },
+    /// 变更范围契约：`touch-check`（判定）/ `touch --declare`（扩张范围）。
+    Touch {
+        sub: String,
+    },
+    /// `touch-check`：判定实际改动 ⊆ `GATE:TOUCH` 声明并集。
+    TouchCheck,
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
     /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
@@ -98,6 +112,10 @@ pub struct Args {
     pub archived: bool,
     /// `archive --dry-run`：只列出将归档项，不搬移、不写审计。
     pub dry_run: bool,
+    /// `touch-check --base <ref>`：改用「相对该 ref 的差异」作变更集（L3 / CI 路径）。
+    pub base: Option<String>,
+    /// `touch --declare` 的路径 / glob（可重复；刻意不复用 `--tool`，那个是工具名）。
+    pub globs: Vec<String>,
 }
 
 pub struct Parsed {
@@ -152,6 +170,8 @@ fn default_args(action: Action) -> Args {
         tui: false,
         archived: false,
         dry_run: false,
+        base: None,
+        globs: Vec::new(),
     }
 }
 
@@ -206,6 +226,35 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
                 }
             }
         }
+        "ac" => {
+            // subcommand：ac check
+            let sub = match it.peek() {
+                Some(s) if !s.starts_with('-') => it.next().unwrap().clone(),
+                _ => return Err("ac 需要子命令: check".into()),
+            };
+            match sub.as_str() {
+                "check" => Action::Ac { sub },
+                other => {
+                    return Err(format!("未知 ac 子命令: {}（可选 check）", other));
+                }
+            }
+        }
+        "touch" => {
+            // 与 `token` 不同：`touch` 的子命令本身就是 flag（`--declare`），
+            // 所以不能沿用"只接受不以 `-` 开头的子命令"那条 —— 沿用会导致
+            // `touch --declare` 永远解析不出来。
+            let sub = match it.peek() {
+                Some(_) => it.next().unwrap().clone(),
+                None => return Err("touch 需要子命令: --declare".into()),
+            };
+            match sub.as_str() {
+                "--declare" => Action::Touch { sub },
+                other => {
+                    return Err(format!("未知 touch 子命令: {}（可选 --declare）", other));
+                }
+            }
+        }
+        "touch-check" => Action::TouchCheck,
         "ui" => Action::Ui,
         "hook-check" => Action::HookCheck,
         "-h" | "--help" => return Err(help()),
@@ -232,7 +281,12 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--gui" => a.gui = true,
             "--tui" => a.tui = true,
             "--archived" => a.archived = true,
+            // `ac check --all`：与 --archived 同义（含归档区，只读）。
+            // 单独起个名是因为 CI 模板里读起来更直白，不必知道 --archived 的历史含义。
+            "--all" => a.archived = true,
             "--dry-run" => a.dry_run = true,
+            "--base" => a.base = Some(next(&mut it, "--base")?),
+            "--glob" => a.globs.push(next(&mut it, "--glob")?),
             "--tool" => {
                 let v = next(&mut it, "--tool")?;
                 for p in v.split(',') {
@@ -353,6 +407,11 @@ fn help() -> String {
                              （同 id 多文件 / 自动编号污染 / 前缀歧义；硬伤退出码 1，CI 可挂）\n\
   comments <需求ID> [--refresh-anchors]         查看评论 / 重算行号锚点\n\
   check                      手动拦截判定（退出码 0 放行 / 1 拦截）\n\
+  ac check [<需求ID>]        验收标准机械校验（A1–A12；硬伤退出码 1）\n\
+  ac check --all             同上，且含归档区（审计用，只读）\n\
+  touch-check [--base <ref>] 变更范围契约：实际改动 ⊆ GATE:TOUCH 声明并集\n\
+  touch --declare --glob <路径> [--glob <glob>...] [--reason <原因>]\n\
+                             扩张声明范围（AI 禁止；会打回技术方案重审）\n\
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\
   bypass   --reason <原因> [--ttl 60]           有时效的应急绕过（强制审计）\n\
   audit-digest               审计日志 SHA-256 摘要写入入库 DIGEST（PR 可比对）\n\

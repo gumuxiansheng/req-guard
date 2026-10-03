@@ -4,6 +4,7 @@
 //! **唯一真相在这里**：门禁判定与清单状态读写只实现一次，前端只渲染不判定，
 //! 杜绝"GUI 与 CLI 行为不一致"——对门禁工具而言那是致命的。
 
+pub mod ac;
 pub mod auth;
 pub mod comment;
 pub mod digest;
@@ -13,12 +14,15 @@ pub mod gate;
 pub mod idcheck;
 /// 审批身份绑定（git identity + 内联指纹 `sig=`）。
 pub mod identity;
+/// 通用问题模型（`Severity`：编号检查 / AC 校验 / 变更范围校验共用）。
+pub mod issue;
 /// AI 工具 hook payload 解析（PreToolUse 的 stdin JSON）。
 pub mod json;
 pub mod requirement;
 pub mod specmeta;
 pub mod status;
 pub mod token;
+pub mod touch;
 pub mod ui_mode;
 
 #[cfg(test)]

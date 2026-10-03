@@ -31,6 +31,10 @@ main:
             "$BIN" init -p "$P" >/dev/null
             "$BIN" install --verify -p "$P"            # 刚 init 完应全绿
             "$BIN" ids --check -p "$P"                 # 编号防冲突：空目录应全绿
+            "$BIN" ac check --all -p "$P"              # AC 校验：空目录应全绿
+            # 变更范围契约：空暂存集应放行；越界文件必须拦
+            HOOK_STAGED_FILES="core/src/gate.rs" "$BIN" touch-check -p "$P"   # 未声明 → 红
+            if "$BIN" touch-check -p "$P" 2>/dev/null; then echo "空暂存集应放行却拦"; exit 1; fi
             if "$BIN" check -p "$P" 2>/dev/null; then echo "未建需求应拦截却放行"; exit 1; fi
             "$BIN" create -t "CNB 自举" -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step decomposition --reviewer 张三 -p "$P" >/dev/null

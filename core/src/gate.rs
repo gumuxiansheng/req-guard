@@ -23,6 +23,8 @@ use std::process::Command;
 /// 拦截脚本相对路径（**唯一真相**）：gates-toolkit 片段、pre-commit 块、
 /// `req-guard check` 与 `req-guard install` 必须引用同一个名字。
 pub const HOOK_SH_REL: &str = ".gates/hooks/req-guard-check.sh";
+/// 变更范围校验脚本（pre-commit 专用；**不进** `HOOK_SH`，理由见 [`HOOK_TOUCH_SH`]）。
+pub const HOOK_TOUCH_SH_REL: &str = ".gates/hooks/req-guard-touch-check.sh";
 /// Windows 等价脚本相对路径。
 pub const HOOK_PS1_REL: &str = ".gates/hooks/req-guard-check.ps1";
 
@@ -437,12 +439,19 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
         &mut notes,
     )?);
     created.push(write_file(root, HOOK_SH_REL, HOOK_SH)?);
+    created.push(write_file(root, HOOK_TOUCH_SH_REL, HOOK_TOUCH_SH)?);
     created.push(write_file(root, HOOK_PS1_REL, &ps1_with_bom())?);
     // deny 包装（Codex/Cursor 专用）随安装一并落盘
     created.push(write_file(root, DENY_SH_REL, DENY_SH)?);
     created.push(write_file(root, DENY_PS1_REL, &deny_ps1_with_bom())?);
     // 落盘后补执行位：git 会静默跳过不可执行的钩子（详见 ensure_executable）。
-    for rel in [HOOK_SH_REL, HOOK_PS1_REL, DENY_SH_REL, DENY_PS1_REL] {
+    for rel in [
+        HOOK_SH_REL,
+        HOOK_PS1_REL,
+        DENY_SH_REL,
+        DENY_PS1_REL,
+        HOOK_TOUCH_SH_REL,
+    ] {
         ensure_executable(&root.join(rel));
     }
     created.push(write_file(root, ".gates/requirements/.gitkeep", "")?);
@@ -872,10 +881,19 @@ fn doc_write_guard(root: &Path, fp: &str, payload: &str) -> std::result::Result<
     Ok(())
 }
 
-/// 取出文本里的 GATE 状态行（已 trim），用于比对是否被篡改。
+/// 取出文本里的 GATE 标记行（已 trim），用于比对是否被篡改。
+///
+/// 判据是 [`crate::requirement::is_marker_line`]（**语法前缀**）而非字面量 `contains`：
+/// 清单正文里合法提到 `GATE:STEP` 是常态（本仓 `REQ-001` 的验收标准就在写
+/// "执行 approve 后 status 变为 approved"）。按字面量判会把这些散文计入状态行集合，
+/// 于是 AI 改动它们就被判成"自批"而拦截 —— 清单此后再也写不动。
+///
+/// 覆盖面**只按语法前缀、不按具体标记名**：将来新增 `GATE:AC` / `GATE:TOUCH` /
+/// `GATE:AUDIT` 时自动受保护，不必记得回来补这个清单（`GATE:AUDIT` 尤其实在 ——
+/// 那是审批证据链，AI 不该能删改自己的审核记录）。
 fn gate_lines(text: &str) -> Vec<String> {
     text.lines()
-        .filter(|l| l.contains("GATE:HEAD") || l.contains("GATE:STEP"))
+        .filter(|l| crate::requirement::is_marker_line(l))
         .map(|l| l.trim().to_string())
         .collect()
 }
@@ -1033,6 +1051,11 @@ fn hook_json(prof: &ToolProfile) -> String {
 ///
 /// 门禁是安全机制：拦截脚本缺失必须**拦截提交并提示初始化**，不得静默放行——
 /// "看起来在拦，实际没拦"是本工具最危险的失败模式（见《AI工具合规保证规范.md》§4.2）。
+/// git pre-commit 追加块（**新装时整块写入**）：**fail-closed**
+/// （与 gates-toolkit 片段 `030-reqguard` 语义一致）。
+///
+/// 门禁是安全机制：拦截脚本缺失必须**拦截提交并提示初始化**，不得静默放行——
+/// "看起来在拦，实际没拦"是本工具最危险的失败模式（见《AI工具合规保证规范.md》§4.2）。
 const PRE_COMMIT_BLOCK: &str = r#"
 # ===== req-guard（AI 需求门禁；追加在 gates-toolkit 之后） =====
 # ⚠️ fail-closed：脚本缺失即拦截，不得静默放行（与片段 030-reqguard 语义一致）
@@ -1042,6 +1065,29 @@ if [ ! -f .gates/hooks/req-guard-check.sh ]; then
   exit 1
 fi
 sh .gates/hooks/req-guard-check.sh || exit 1
+# 变更范围契约：实际改动 ⊆ 技术方案段 GATE:TOUCH 声明的并集（判定在 core）
+if [ ! -f .gates/hooks/req-guard-touch-check.sh ]; then
+  echo "✗ 变更范围校验脚本缺失（.gates/hooks/req-guard-touch-check.sh），提交已被阻止。" >&2
+  echo "  请先执行 req-guard install 初始化门禁；确需跳过本次：git commit --no-verify" >&2
+  exit 1
+fi
+sh .gates/hooks/req-guard-touch-check.sh || exit 1
+"#;
+
+/// 变更范围校验段（**可独立追加**，供已装旧版主门禁的老仓库补齐）。
+///
+/// 为什么单独一份：钩子里已有 `req-guard-check` 时整块会被幂等短路跳过，
+/// 于是"新装的"有这道墙、"升级的"没有 —— 静默缺口的最坏形态。
+/// 与 [`PRE_COMMIT_BLOCK`] 的尾部**逐字一致**，由
+/// `pre_commit_整块与增量段逐字一致` 用例锁住漂移。
+const PRE_COMMIT_TOUCH_BLOCK: &str = r#"
+# 变更范围契约：实际改动 ⊆ 技术方案段 GATE:TOUCH 声明的并集（判定在 core）
+if [ ! -f .gates/hooks/req-guard-touch-check.sh ]; then
+  echo "✗ 变更范围校验脚本缺失（.gates/hooks/req-guard-touch-check.sh），提交已被阻止。" >&2
+  echo "  请先执行 req-guard install 初始化门禁；确需跳过本次：git commit --no-verify" >&2
+  exit 1
+fi
+sh .gates/hooks/req-guard-touch-check.sh || exit 1
 "#;
 
 /// `.gitignore` 需要忽略的门禁本机运行态文件。
@@ -1079,6 +1125,160 @@ fn enforce_ci(root: &Path) -> bool {
         }
     }
     true
+}
+
+/// 变更范围校验脚本（POSIX）。**刻意与 [`HOOK_SH`] 分开**。
+///
+/// 三个理由：
+/// 1. [`HOOK_SH`] 同时服务两个上下文 —— AI PreToolUse（stdin 有 payload、无 staged 集）
+///    与 pre-commit（靠 `[ ! -t 0 ]` 猜上下文）。第 0 段那段启发式不能作为新校验的前提。
+/// 2. 任何加进 `HOOK_SH` 的判定都必须在 `HOOK_PS1` 里**逐行镜像**一遍 —— 纯负债。
+/// 3. 独立脚本 = 单一职责、单一上下文、无 Windows 镜像负担（pre-commit 本来就只注入 sh，
+///    Windows 走 Git Bash）。
+pub const HOOK_TOUCH_SH: &str = r#"#!/usr/bin/env sh
+# req-guard — 变更范围契约校验（pre-commit 专用）
+#
+# 判定「实际改动 ⊆ GATE:TOUCH 声明的并集」（core/src/touch.rs）。退出码：0 放行 / 1 拦截。
+set -u
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "[req-guard] 非 git 仓库，跳过变更范围校验（无可比对对象）" >&2
+  exit 0
+}
+cd "$PROJECT_ROOT" || exit 1
+
+# fail-closed：判定在 core，脚本只取参。二进制不在 PATH 就拦，不得静默放行 ——
+# "看起来在拦、其实没拦"是本工具最危险的失效模式（见《AI工具合规保证规范.md》§4.2）。
+if ! command -v req-guard >/dev/null 2>&1; then
+  echo "[req-guard] ✗ 变更范围无法校验：req-guard 不在 PATH，提交已被阻止。" >&2
+  echo "          请把 req-guard 加入 PATH 后重试；确需跳过本次：git commit --no-verify" >&2
+  exit 1
+fi
+
+# 已暂存文件集交给 core 判定（换行分隔）。用 -z 拿原始路径，避免带空格/非 ASCII
+# 的路径被 git 加引号后与真实路径对不上。
+HOOK_STAGED_FILES="$(git diff --cached --name-only --diff-filter=ACMRD -z 2>/dev/null | tr '\0' '\n')"
+export HOOK_STAGED_FILES
+req-guard touch-check || exit 1
+"#;
+
+/// 读取 `.gates/req-guard.yaml` 的 `touch.exempt`（默认最小集）。
+///
+/// 支持两种写法：块下列表（`- .gates/**`）与行内数组（`exempt: [.gates/**]`）。
+/// 默认集刻意**不含** `.github/workflows/**`：改 CI 编排就该被声明。
+pub fn touch_exempt_patterns(root: &Path) -> Vec<String> {
+    // `.gitignore` 必须在里面：`append_gitignore` 是**门禁自己**写它的，
+    // 不豁免等于工具每次 `install` 都给自己下一个未声明文件的判。
+    const DEFAULT: [&str; 5] = [
+        ".gates/**",
+        "target/**",
+        "dist/**",
+        "Cargo.lock",
+        ".gitignore",
+    ];
+    let Some(list) = yaml_list(root, "touch", "exempt") else {
+        return DEFAULT.iter().map(|s| s.to_string()).collect();
+    };
+    if list.is_empty() {
+        return DEFAULT.iter().map(|s| s.to_string()).collect();
+    }
+    list
+}
+
+/// 范围扩张后是否自动打回技术方案要求重新过审（默认 true）。
+pub fn touch_reapprove(root: &Path) -> bool {
+    yaml_bool(root, "touch", "reapprove", true)
+}
+
+/// 聚合口径：`union`（默认）/ `strict`。
+pub fn touch_scope_strict(root: &Path) -> bool {
+    match yaml_scalar(root, "touch", "scope") {
+        Some(v) => v.trim().eq_ignore_ascii_case("strict"),
+        None => false,
+    }
+}
+
+/// 零依赖读取 `block.key` 的**列表值**（块内 `- item` 或行内 `[a, b]`）。
+fn yaml_list(root: &Path, block: &str, key: &str) -> Option<Vec<String>> {
+    let content = fs::read_to_string(root.join(".gates/req-guard.yaml")).ok()?;
+    let mut in_block = false;
+    let mut out: Vec<String> = Vec::new();
+    let mut saw = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == format!("{block}:") {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(v) = t.strip_prefix(&format!("{key}:")) {
+                saw = true;
+                let v = v.split('#').next().unwrap_or("").trim();
+                for part in v.trim_start_matches('[').trim_end_matches(']').split(',') {
+                    let p = part.trim().trim_matches(['"', '\'']);
+                    if !p.is_empty() {
+                        out.push(p.to_string());
+                    }
+                }
+            } else if let Some(item) = t.strip_prefix("- ") {
+                if saw {
+                    let p = item.split('#').next().unwrap_or("").trim();
+                    if !p.is_empty() {
+                        out.push(p.to_string());
+                    }
+                }
+            }
+        } else if !t.is_empty() {
+            in_block = false;
+        }
+    }
+    if saw {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 零依赖读取 `block.key` 的标量值。
+fn yaml_scalar(root: &Path, block: &str, key: &str) -> Option<String> {
+    let path = root.join(".gates/req-guard.yaml");
+    let content = fs::read_to_string(path).ok()?;
+    let mut in_block = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == format!("{block}:") {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(v) = t.strip_prefix(&format!("{key}:")) {
+                return Some(v.split('#').next().unwrap_or("").trim().to_string());
+            }
+        } else if !t.is_empty() {
+            in_block = false;
+        }
+    }
+    None
+}
+
+/// 零依赖读取 `block.key` 的布尔值（缺省 `default`）。
+fn yaml_bool(root: &Path, block: &str, key: &str, default: bool) -> bool {
+    match yaml_scalar(root, block, key) {
+        Some(v) => !v.eq_ignore_ascii_case("false"),
+        None => default,
+    }
 }
 
 /// L3 CI 接入体检：`enforce.ci` 默认 true，仓库就必须有 CI 编排**实际调用** `req-guard`，
@@ -1156,6 +1356,7 @@ pub fn verify_install(root: &Path) -> Vec<String> {
         HOOK_PS1_REL,
         DENY_SH_REL,
         DENY_PS1_REL,
+        HOOK_TOUCH_SH_REL,
         ".gates/req-guard.yaml",
     ] {
         if !root.join(rel).exists() {
@@ -1190,6 +1391,15 @@ pub fn verify_install(root: &Path) -> Vec<String> {
         let hook_path = root.join(".git/hooks/pre-commit");
         match fs::read_to_string(&hook_path) {
             Ok(c) if c.contains("req-guard-check") => {
+                // L2 静默缺口之二：脚本装了、pre-commit 也接了主门禁，但变更范围那一段
+                // 不在 —— "只装不生效"，看着在拦其实没拦这条。
+                if !c.contains("req-guard-touch-check") {
+                    problems.push(
+                        ".git/hooks/pre-commit 已含主门禁但**缺变更范围校验段**—— \
+                         L2 静默缺口；重跑 req-guard install 补齐"
+                            .into(),
+                    );
+                }
                 // 内容对了不代表生效：Unix 上 git 会静默跳过没有执行位的钩子，
                 // 这是"verify 全绿但 L2 完全没拦"的唯一成因，必须单独查。
                 if !is_executable(&hook_path) {
@@ -1213,6 +1423,21 @@ pub fn verify_install(root: &Path) -> Vec<String> {
     // 否则样例没复制出去时"默认三层"实际只有两层（本机任何绕过服务端无人抵消）。
     problems.extend(verify_ci(root));
 
+    // L3 模板一致性：命令实现了但 CI 模板里没加那一步 = 服务端静默失效，
+    // 本机 `--no-verify` 就无人抵消（§3.6）。
+    let tpl = root.join(".gates/ci/req-guard-ci.yml");
+    if let Ok(c) = fs::read_to_string(&tpl) {
+        for step in ["ac check", "touch-check --base"] {
+            if !c.contains(step) {
+                problems.push(format!(
+                    ".gates/ci/req-guard-ci.yml 缺 `{step}` 步骤——L3 未落地：\
+                     本机绕过（含 --no-verify）在服务端无人抵消；\
+                     请把该步骤加进 CI 模板并复制到编排目录"
+                ));
+            }
+        }
+    }
+
     problems
 }
 
@@ -1234,10 +1459,27 @@ fn append_pre_commit(
             path: Some(hook.clone()),
             source: e,
         })?;
-        if c.contains("req-guard-check") {
+        if c.contains("req-guard-touch-check") {
             // 已接入：仍要补执行位——旧版 install 落盘时未设置，git 会静默跳过。
             // 少了这一步，老仓库重跑 install 也永远修不好 L2。
             ensure_executable(&hook);
+            return Ok(());
+        }
+        if c.contains("req-guard-check") {
+            // 装了旧版主门禁、还没有变更范围段：**只补缺的那一段**。
+            // 直接 return 会让"新装的"有这道墙而"升级的"没有 —— 静默缺口的最坏形态。
+            notes.push("pre-commit 已有主门禁但缺变更范围校验段，已追加（幂等）".into());
+            let mut nc = c;
+            if !nc.ends_with('\n') {
+                nc.push('\n');
+            }
+            nc.push_str(PRE_COMMIT_TOUCH_BLOCK);
+            fs::write(&hook, nc).map_err(|e| GateError::Io {
+                path: Some(hook.clone()),
+                source: e,
+            })?;
+            ensure_executable(&hook);
+            created.push(hook);
             return Ok(());
         }
         let mut nc = c;
@@ -1447,6 +1689,26 @@ bypass:
   enabled: true
   default_ttl_minutes: 60
   require_reason: true
+
+# 变更范围契约（GATE:TOUCH）
+#   技术方案段的 GATE:TOUCH 块是**唯一**人工声明源；frontmatter 的 source_refs
+#   由 req-guard 在 approve 时单向派生，不要手改（改了会被覆盖回去）。
+#   pre-commit 用它与 git 实际改动集比对，CI 用 `touch-check --base` 抵消 --no-verify。
+touch:
+  # 不参与比对的前缀（门禁自身运行态与构建产物）。
+  # 刻意**不含** .github/workflows/**：改 CI 编排就该被声明。
+  exempt:
+    - .gates/**          # 门禁自身运行态 + 需求清单（AI 必须能改自己的文档）
+    - target/**          # 构建产物
+    - dist/**            # 发布产物
+    - Cargo.lock         # 锁文件
+    - .gitignore         # 门禁自身会写它（append_gitignore），不豁免等于自己拦自己
+  # 聚合口径：union = 全部未归档清单的声明并集（默认，误报最少）
+  #           strict = 只比最新活跃清单（范围更紧、误报更多）
+  scope: union
+  # touch --declare 扩张范围后，是否自动打回技术方案要求重新过审。
+  # 关掉它等于允许范围单方面扩张，GATE:TOUCH 就从契约退化成建议。
+  reapprove: true
 
 # 到期自动归档：done 满 N 天后，req-guard done 成功时自动把清单
 # 物理搬入 .gates/requirements/archive/<创建年份>/（无日期段 → misc/）
@@ -1849,6 +2111,22 @@ exit 0
 
 #[cfg(test)]
 mod tests {
+    /// `PRE_COMMIT_BLOCK`（新装时整块追加）与 `PRE_COMMIT_TOUCH_BLOCK`
+    /// （给「已装旧版主门禁」的老仓库单独补的那段）**必须逐字一致**。
+    ///
+    /// 这两段 shell 文本在源码里各存一份（Rust 的 `concat!` 只能拼字面量，
+    /// 不能引用另一个 `const` 的值），所以必须用测试锁住漂移 ——
+    /// 否则改了增量段忘了改整块，新装的仓库和升级的仓库行为就会分叉。
+    #[test]
+    fn pre_commit_整块与增量段逐字一致() {
+        assert!(
+            PRE_COMMIT_BLOCK.ends_with(PRE_COMMIT_TOUCH_BLOCK),
+            "PRE_COMMIT_BLOCK 必须以 PRE_COMMIT_TOUCH_BLOCK 结尾（否则新装与升级行为分叉）"
+        );
+        assert!(PRE_COMMIT_TOUCH_BLOCK.contains("req-guard-touch-check"));
+        assert!(PRE_COMMIT_BLOCK.contains("req-guard-check.sh"));
+    }
+
     use super::*;
     use crate::testutil::{cleanup, temp_dir};
 
