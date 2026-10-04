@@ -8,3 +8,9 @@ gui/assets/unicodes.txt
 # req-guard 门禁本机运行态（不入库）
 .gates/.bypass
 .gates/audit/*.log
+
+# AI 工具 hook 配置：req-guard install 从 templates/ 派生，可再生，入库即多一份真相源
+/.claude/settings.json
+/.codebuddy/settings.json
+/.codex/hooks.json
+/.cursor/hooks.json

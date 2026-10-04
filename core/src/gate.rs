@@ -1202,7 +1202,32 @@ sh .gates/hooks/req-guard-touch-check.sh || exit 1
 "#;
 
 /// `.gitignore` 需要忽略的门禁本机运行态文件。
+/// 门禁自己的本机运行态（**只此两项**）。
+///
+/// 刻意与 AI 工具配置分开：这两项是"门禁运行时写的状态"，与用哪个 AI 工具无关；
+/// AI 工具配置那份由 [`gitignore_lines`] 按 [`TOOL_PROFILES`] **派生** ——
+/// 与豁免集同源（见 [`touch_exempt_patterns`]），不手写第二条清单。
 pub const GITIGNORE_LINES: [&str; 2] = [".gates/.bypass", ".gates/audit/*.log"];
+
+/// `install` 应写入 `.gitignore` 的全部条目 = 运行态两项 + **派生**的 AI 工具配置。
+///
+/// AI 工具配置必须忽略的三个理由（缺一不可）：
+/// 1. 它们是 `install` 从 `templates/` 派生的产物，**可再生** —— 入库即多一份
+///    真相源（改了 `templates/` 不会同步已入库的那份）；
+/// 2. 不入库就不必在 `touch-check` 里声明范围（但**仍要豁免**：本地新 clone
+///    跑过 `install` 就会生成它们，见 REQ-005 G1）；
+/// 3. 否则每次 `git status` 常带 4 个噪声项，久而久之就被整体忽略 —— 那时连
+///    真正该看的改动也会被淹没。
+///
+/// **根锚定**（前缀 `/`）：`CLAUDE.md` 这类工具会向上逐级查找配置，
+/// 非锚定的模式会把子目录里的同名配置也一并忽略掉。
+pub fn gitignore_lines() -> Vec<String> {
+    let mut out: Vec<String> = GITIGNORE_LINES.iter().map(|s| s.to_string()).collect();
+    for t in TOOL_PROFILES.iter() {
+        out.push(format!("/{}", t.config));
+    }
+    out
+}
 
 /// 读取 `.gates/req-guard.yaml` 的 `enforce.ci` 开关（缺省 **true**，fail-closed）。
 ///
@@ -1287,13 +1312,36 @@ pub fn touch_exempt_patterns(root: &Path) -> Vec<String> {
         "Cargo.lock",
         ".gitignore",
     ];
-    let Some(list) = yaml_list(root, "touch", "exempt") else {
-        return DEFAULT.iter().map(|s| s.to_string()).collect();
-    };
-    if list.is_empty() {
-        return DEFAULT.iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = DEFAULT.iter().map(|s| s.to_string()).collect();
+
+    // **派生源**（REQ-005 G1）：install 往哪些路径写 AI 工具 hook 配置，豁免就跟着
+    // 放行哪些 —— 与 install 共用同一份 [`TOOL_PROFILES`]，不手写第二条清单。
+    //
+    // 为什么必须派生：手写这四条（`.claude/settings.json` 等）等于把病复制一份。
+    // 工具清单一改（新增工具 / 改名 / 改路径），手写清单就会漂移，表现为
+    // 「每份清单都会冒出的 NotDeclared」——而这不是任何一条需求的改动。
+    //
+    // 精确到**文件**而非目录通配（`/` 不给）：目录级豁免会把工具自己的
+    // `CLAUDE.md` / `settings.local.json` 一并放行，那正是绕过声明的口子。
+    for t in TOOL_PROFILES.iter() {
+        if !out.iter().any(|p| p == t.config) {
+            out.push(t.config.to_string());
+        }
     }
-    list
+
+    // 配置**追加**到默认集（原先是替换，REQ-005 G3）。
+    // 替换语义本身就是陷阱：要加一条豁免就得把上面 5 条默认逐条抄回 `touch.exempt`，
+    // 漏抄一条就把 `.gates/**` 或 `target/**` 变成未声明文件；而这 5 条全是
+    // 「本来就不该被声明」的项（门禁自己的运行态、构建产物、锁文件），
+    // 没有任何人有理由主动收窄它们。
+    if let Some(list) = yaml_list(root, "touch", "exempt") {
+        for x in list {
+            if !out.contains(&x) {
+                out.push(x);
+            }
+        }
+    }
+    out
 }
 
 /// 范围扩张后是否自动打回技术方案要求重新过审（默认 true）。
@@ -1627,9 +1675,8 @@ fn append_gitignore(
 ) -> Result<()> {
     let path = root.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let missing: Vec<&str> = GITIGNORE_LINES
-        .iter()
-        .copied()
+    let missing: Vec<String> = gitignore_lines()
+        .into_iter()
         .filter(|l| !existing.lines().any(|e| e.trim() == *l))
         .collect();
     if missing.is_empty() {
@@ -1642,10 +1689,31 @@ fn append_gitignore(
     if !nc.is_empty() {
         nc.push('\n');
     }
-    nc.push_str("# req-guard 门禁本机运行态（不入库）\n");
-    for l in &missing {
-        nc.push_str(l);
-        nc.push('\n');
+    // 分两组写，并**只在该组真有内容时写标题** —— 否则重复 `install` 会留下一行
+    // 孤零零的注释（"本机运行态"下面什么都没有），读的人会以为配置漏了。
+    let runtime: Vec<&String> = missing
+        .iter()
+        .filter(|l| GITIGNORE_LINES.contains(&l.as_str()))
+        .collect();
+    if !runtime.is_empty() {
+        nc.push_str("# req-guard 门禁本机运行态（不入库）\n");
+        for l in runtime {
+            nc.push_str(l);
+            nc.push('\n');
+        }
+    }
+    let tool_lines: Vec<&String> = missing
+        .iter()
+        .filter(|l| !GITIGNORE_LINES.contains(&l.as_str()))
+        .collect();
+    if !tool_lines.is_empty() {
+        nc.push_str(
+            "# AI 工具 hook 配置：req-guard install 从 templates/ 派生，可再生，入库即多一份真相源\n",
+        );
+        for l in tool_lines {
+            nc.push_str(l);
+            nc.push('\n');
+        }
     }
     fs::write(&path, nc).map_err(|e| GateError::Io {
         path: Some(path.clone()),
@@ -2272,6 +2340,85 @@ mod tests {
     /// 这两段 shell 文本在源码里各存一份（Rust 的 `concat!` 只能拼字面量，
     /// 不能引用另一个 `const` 的值），所以必须用测试锁住漂移 ——
     /// 否则改了增量段忘了改整块，新装的仓库和升级的仓库行为就会分叉。
+    #[test]
+    fn touch_exempt_默认集由install写入目标派生() {
+        let root = temp_dir("exempt-derive");
+        install(&root, &["none".to_string()], false).unwrap();
+        let set = touch_exempt_patterns(&root);
+        // 默认 5 条一条不少（漏一条就是把门禁自己的运行态变成未声明文件）
+        for d in [
+            ".gates/**",
+            "target/**",
+            "dist/**",
+            "Cargo.lock",
+            ".gitignore",
+        ] {
+            assert!(set.iter().any(|p| p == d), "默认项缺失：{d}\n{set:?}");
+        }
+        // 与 install 的实际写入目标**逐项相等**（两者共用同一份 TOOL_PROFILES）
+        for t in TOOL_PROFILES.iter() {
+            assert!(
+                set.iter().any(|p| p == t.config),
+                "未派生出 {}（install 会写它，豁免却没放行）\n{set:?}",
+                t.config
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn touch_exempt_精确到文件不给目录通配() {
+        // 目录级豁免会把工具自己的 CLAUDE.md / settings.local.json 一并放行
+        let root = temp_dir("exempt-exact");
+        install(&root, &["none".to_string()], false).unwrap();
+        let set = touch_exempt_patterns(&root);
+        assert!(
+            !set.iter().any(|p| p == ".claude/**" || p == ".codex/**"),
+            "AI 工具配置不得用目录通配豁免：{set:?}"
+        );
+        for t in TOOL_PROFILES.iter() {
+            assert!(
+                !t.config.ends_with('/'),
+                "配置路径须精确到文件：{}",
+                t.config
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn touch_exempt_配置为追加而非替换() {
+        let root = temp_dir("exempt-append");
+        install(&root, &["none".to_string()], false).unwrap();
+        let y = root.join(".gates/req-guard.yaml");
+        let mut txt = std::fs::read_to_string(&y).unwrap();
+        txt.push_str("\ntouch:\n  exempt:\n    - custom/**\n");
+        std::fs::write(&y, txt).unwrap();
+        let set = touch_exempt_patterns(&root);
+        assert!(
+            set.iter().any(|p| p == "custom/**"),
+            "配置项须生效：{set:?}"
+        );
+        for d in [
+            ".gates/**",
+            "target/**",
+            "dist/**",
+            "Cargo.lock",
+            ".gitignore",
+        ] {
+            assert!(
+                set.iter().any(|p| p == d),
+                "配置不得覆盖默认项 {d}（替换语义是陷阱）：{set:?}"
+            );
+        }
+        assert_eq!(
+            1,
+            set.iter().filter(|p| *p == "custom/**").count(),
+            "重复项须去重：{set:?}"
+        );
+        cleanup(&root);
+    }
+
     #[test]
     fn pre_commit_整块与增量段逐字一致() {
         assert!(

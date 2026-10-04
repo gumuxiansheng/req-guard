@@ -295,6 +295,31 @@ REQ-002 上线前批准的存量清单补绑定（三段 `sum=` 全为 `-`）。
 - 该判定挂在**技术方案批准**上（`ensure_cross_refs_ok`）：挂在命令上要人记得跑，
   挂在钥匙上则物理上无法批出去一份引用已失效的方案。
 
+#### `install` 生成物：豁免由「install 写了什么」派生，不手写清单
+
+`req-guard install` 会往 `.claude/settings.json`、`.codebuddy/settings.json`、
+`.codex/hooks.json`、`.cursor/hooks.json` 写 hook 配置。这些文件**不是任何人写的
+代码**，却被变更范围门禁判成「不在任何需求的声明里」—— 每份清单都会冒出来。
+
+手写四条豁免是错的：那等于把「install 写了哪些文件」这个事实**复制一份**到别处，
+工具清单一改（新增工具 / 改名 / 改路径）就漂移。故豁免集 = 默认项 ∪ **由 install
+的写入目标派生**（`touch_exempt_patterns` 与 install 共用同一份 `TOOL_PROFILES`）。
+
+两条硬约束：
+
+- **精确到文件，不给目录通配**。`.claude/**` 会把工具自己的 `CLAUDE.md`、
+  `settings.local.json` 一并放行 —— 那正是绕过声明的口子。
+- **豁免只放宽「是否需要声明」，不放宽任何内容判定**。这些文件不含清单正文，
+  不参与 `ac check` / `verify-content` / 审批锁。
+
+同时它们进 `.gitignore`（同样由 `TOOL_PROFILES` 派生、根锚定）：可再生派生物入库
+即多一份真相源，且会让 `git status` 常带噪声，久而久之连真正该看的改动也被淹没。
+新 clone 的人本来就得跑 `req-guard install`，否则门禁不生效 —— 这不是额外成本。
+
+顺带修掉一个同源尖角：`touch.exempt` 配置原先**整体替换**默认集，于是「加一条豁免」
+必须把默认 5 条逐条抄回，漏抄一条就把 `.gates/**` 变成未声明文件。现改为**追加** ——
+默认 5 条全是「本来就不该被声明」的项，没有人有理由主动收窄它们。
+
 #### 清单内容不得是占位空话（`core/src/section.rs`）
 
 三段清单里第 3 段有 `GATE:AC`（A1–A12）、第 2 段有 `GATE:TOUCH`（T1–T6），

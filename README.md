@@ -154,6 +154,9 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
   **这条只能放在批准动作上**：FRS001 只检查 `source_refs` 这个键是否存在，
   `source_refs: []` 一律通过、FRS004 也无从匹配——声明侧留空在 doc-guard 侧完全静默，
   规格看似接入时效治理、实则永远不会被判过期
+- **install 生成物豁免**：`touch-check` 的豁免集默认项 + **由 install 写入目标派生**的
+  AI 工具 hook 配置（精确到文件，非目录通配）；这些文件同时进 `.gitignore`（可再生派生物）。
+  `touch.exempt` 配置为**追加**到默认集，不是替换。
 - **审计入库**：approve / reject / amend / resolve / bypass / seal / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见 [`docs/规范/AI工具合规保证规范.md`](docs/规范/AI工具合规保证规范.md)。

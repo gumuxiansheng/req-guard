@@ -372,6 +372,126 @@ def verify_content_freeze() -> bool:
     return ok
 
 
+def verify_install_exempt() -> bool:
+    """36–37 REQ-005：install 生成物豁免，且**精确到文件**。
+
+    36/37 是配对的一格：生成物放行，同目录下的**非**生成物仍须声明。
+    只测前者会漏掉"图省事给了 `.claude/**`"这个退化 —— 那会把工具自己的
+    CLAUDE.md 一起放行，正是本需求明令禁止的绕道。
+    """
+    if not BIN.exists():
+        print("SKIP  36-37_install生成物豁免: 未构建 req-guard 二进制")
+        return True
+
+    ok = True
+
+    def sandbox(tag: str) -> Path:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{tag}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        r = subprocess.run(
+            [str(BIN), "init", "-p", ".", "--tool", "claude,codebuddy,codex,cursor"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        (work / REQ_DIR).mkdir(parents=True, exist_ok=True)
+        # 夹具必须是**完整**清单：`make_req` 只造 GATE 头，没有 `## N.` 章节，
+        # 也没有 GATE:TOUCH 声明 —— 那样 touch-check 会因 SectionNotFound /
+        # EmptyDeclaration 恒拦，36/37 就都变成"因为错误的原因通过/失败"。
+        # 那是本项目最坏的失效模式（看着在拦，其实没在判你写的那份）。
+        (work / REQ_DIR / "REQ-001.md").write_text(
+            "# REQ-001 豁免场景\n\n"
+            "<!-- GATE:HEAD id=REQ-001 status=approved created=2026-01-01 -->\n"
+            + "".join(
+                f"<!-- GATE:STEP name={n} label={l} status=approved reviewer=t updated=- -->\n"
+                for n, l in (
+                    ("decomposition", "需求分解"),
+                    ("solution", "技术方案"),
+                    ("testplan", "测试计划"),
+                )
+            )
+            + "\n## 1. 需求分解\n\n- 背景：install 生成物豁免演示。\n\n"
+            "## 2. 技术方案\n\n<!-- GATE:TOUCH -->\n"
+            "core/**\n"
+            "<!-- /GATE:TOUCH -->\n"
+            "\n- 思路：声明范围后核对实际改动。\n\n"
+            "## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
+            "- Given: 已批准\n- When: 执行 touch-check\n- Then: 退出码 0\n"
+            "<!-- /GATE:AC -->\n\n- 用例：见上。\n\n## 审核记录\n",
+            encoding="utf-8",
+        )
+        y = work / ".gates" / "req-guard.yaml"
+        if y.exists():
+            y.write_text(
+                y.read_text(encoding="utf-8").replace("level: 3", "level: 0"),
+                encoding="utf-8",
+            )
+        del r
+        return work
+
+    def touch_rc(work: Path, rel: str):
+        dst = work / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("{}\n", encoding="utf-8")
+        subprocess.run(["git", "add", rel], cwd=work, capture_output=True, text=True)
+        r = subprocess.run(
+            [str(BIN), "touch-check", "-p", "."],
+            cwd=work, capture_output=True, text=True,
+            env={**os.environ, "REQ_GUARD_AI_CTX": ""}, **RUN_KW,
+        )
+        return r.returncode, r.stdout + r.stderr
+
+    # 36_install生成物豁免：**两层**都要成立
+    #   第一层：`.gitignore` 挡住（主）—— 装过 install 的仓不该再看到这些文件；
+    #   第二层：强行 `git add -f` 混进索引后 `touch-check` 仍放行（纵深防御）——
+    #           否则「.gitignore 被改掉 / 被人手工取消忽略」就会让它们重新变成
+    #           NotDeclared，又是每份清单都会冒出来的拦截。
+    work = sandbox("36-exempt")
+    gi = (work / ".gitignore").read_text(encoding="utf-8")
+    need = [
+        "/.claude/settings.json",
+        "/.codebuddy/settings.json",
+        "/.codex/hooks.json",
+        "/.cursor/hooks.json",
+    ]
+    missing_gi = [n for n in need if n not in gi]
+    r = subprocess.run(["git", "add", ".claude/settings.json"], cwd=work,
+                       capture_output=True, text=True, **RUN_KW)
+    blocked_by_gitignore = r.returncode != 0
+    r2 = subprocess.run(["git", "add", "-f", ".claude/settings.json"], cwd=work,
+                        capture_output=True, text=True, **RUN_KW)
+    rc = 99
+    if r2.returncode == 0:
+        rc = subprocess.run(
+            [str(BIN), "touch-check", "-p", "."],
+            cwd=work, capture_output=True, text=True,
+            env={**os.environ, "REQ_GUARD_AI_CTX": ""}, **RUN_KW,
+        ).returncode
+    good36 = not missing_gi and blocked_by_gitignore and rc == 0
+    ok = ok and good36
+    print(
+        f"{'PASS' if good36 else 'FAIL'}  36_install生成物豁免: "
+        f"gitignore缺失={len(missing_gi)} git已挡={blocked_by_gitignore} 强入后touch-check={rc} "
+        f"(期望 0 / True / 0)"
+    )
+    if missing_gi:
+        print(f"      ↳ 缺: {missing_gi}")
+    if not good36:
+        rr = subprocess.run([str(BIN), "touch-check", "-p", "."], cwd=work,
+                            capture_output=True, text=True,
+                            env={**os.environ, "REQ_GUARD_AI_CTX": ""}, **RUN_KW)
+        print(f"      ↳ {(rr.stdout + rr.stderr)[:400]}")
+
+    # 37_同目录非生成物仍须声明（精确到文件，不给目录通配）
+    work = sandbox("37-not-exempt")
+    rc, out37 = touch_rc(work, ".claude/CLAUDE.md")
+    # 必须是 `NotDeclared` 这条规则命中，而**不是**夹具缺声明导致的某种拦截
+    good37 = rc == 1 and "NotDeclared" in out37 and "CLAUDE.md" in out37
+    ok = ok and good37
+    print(f"{'PASS' if good37 else 'FAIL'}  37_同目录非生成物仍须声明: exit={rc} (期望 1)")
+    return ok
+
+
 def verify_amend_gate() -> bool:
     """32–34 REQ-004 场景：修订路径、seal 一次性、设计文档交叉引用。
 
@@ -638,6 +758,7 @@ ok = ok and verify_pre_commit_fail_closed()
 ok = ok and verify_touch_gate()
 ok = ok and verify_content_freeze()
 ok = ok and verify_amend_gate()
+ok = ok and verify_install_exempt()
 ok = ok and verify_section_gate()
 
 
