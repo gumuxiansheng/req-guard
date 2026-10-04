@@ -122,6 +122,71 @@ fn is_table_separator(t: &str) -> bool {
 ///
 /// `placeholders` 为模板占位文案集合。注释与标题的判定在此完成；
 /// 跨行注释与 GATE 块由调用方用状态机处理（见 [`count_substantive`]）。
+/// 把**代码围栏**内的字符掩成等长空格（换行保留），返回掩码后的副本。
+///
+/// 为什么需要（REQ-008）：`is_heading` 判「`trim_start()` 后以 `## ` 开头」，
+/// 而 Markdown 代码围栏里的 `## xxx` 是**示例内容**不是标题。缩进的示例
+/// （放在列表项下，几乎总是缩进的）同样命中 —— 于是「文档里展示 `## solution`
+/// 格式」会把自己那份清单的段落边界切错，表现为 `GATE:TOUCH` 块突然消失，
+/// 而报错（`MissingBlock`：你没写声明块）与真实原因完全无关。
+///
+/// **变长围栏**：开围栏取连续反引号/波浪号的**长度**，闭围栏要求长度**不少于**
+/// 开围栏。只认长度 3 会让「文档里展示三反引号示例的文档」再次切错边界 ——
+/// 与本缺陷同类。
+///
+/// **未闭合围栏按持续到文末处理**（fail-closed）：若按「未闭合则不生效」，
+/// 少一个收尾标记就会让围栏内所有 `## ` 变回标题，正是要消灭的形态。
+///
+/// **掩码而非删除**：行号必须原样保留，否则所有错误信息里的行号会指向错误位置
+/// （与 `touch::cross_refs` 同一理由）。
+pub fn mask_fenced(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let (mut in_fence, mut fence_char, mut fence_len) = (false, '\0', 0usize);
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        // 围栏行：**行首（可含前导空白）后连续同字符 ≥ 3**
+        //
+        // 「行首」要回看**本行已扫过的字符全是空白**，而不是「上一字符是 \n」——
+        // 缩进围栏（列表项里的 ```，实际文档里极常见）扫描到反引号时，
+        // 上一字符是空格而不是换行，用 \n 判会漏掉整类缩进围栏。
+        let line_prefix_blank = cs[..i]
+            .iter()
+            .rev()
+            .take_while(|c| **c != '\n')
+            .all(|c| c.is_whitespace());
+        if line_prefix_blank && (c == '`' || c == '~') {
+            let mut n = 0usize;
+            while i + n < cs.len() && cs[i + n] == c {
+                n += 1;
+            }
+            if n >= 3 {
+                if !in_fence {
+                    in_fence = true;
+                    fence_char = c;
+                    fence_len = n;
+                } else if c == fence_char && n >= fence_len {
+                    in_fence = false;
+                }
+                for _ in 0..n {
+                    out.push(c);
+                }
+                i += n;
+                continue;
+            }
+        }
+        // 换行永远保留：抹掉会改变行号，错误信息就指错位置了
+        if in_fence && c != '\n' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn is_substantive(line: &str, placeholders: &[String]) -> bool {
     let t = line.trim();
     if t.is_empty() {

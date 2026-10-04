@@ -372,6 +372,103 @@ def verify_content_freeze() -> bool:
     return ok
 
 
+def verify_fenced_boundary() -> bool:
+    """38–40 REQ-008：代码围栏内的 `## ` 不得成为段落边界。
+
+    38 是本缺陷的原始现场（起草 REQ-007 时在正文里展示 `## solution` 格式，
+    TOUCH 块被判"消失"）；39 是变长围栏；40 锁住"围栏外标题仍算边界"，
+    防止掩码把真边界也吃掉（那会让三段永远分不开）。
+    """
+    if not BIN.exists():
+        print("SKIP  38-40_围栏边界: 未构建 req-guard 二进制")
+        return True
+
+    ok = True
+
+    def sandbox(tag: str, solution_body: str) -> Path:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{tag}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        subprocess.run(
+            [str(BIN), "init", "-p", ".", "--tool", "none"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        (work / REQ_DIR).mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        (work / REQ_DIR / "REQ-001.md").write_text(
+            "# REQ-001 围栏边界\n\n"
+            "<!-- GATE:HEAD id=REQ-001 status=approved created=2026-01-01 -->\n"
+            + "".join(
+                f"<!-- GATE:STEP name={n} label={l} status=approved reviewer=t updated=- -->\n"
+                for n, l in (
+                    ("decomposition", "需求分解"),
+                    ("solution", "技术方案"),
+                    ("testplan", "测试计划"),
+                )
+            )
+            + "\n## 1. 需求分解\n\n- 背景：围栏边界演示。\n\n"
+            "## 2. 技术方案\n\n"
+            + solution_body
+            + "\n<!-- GATE:TOUCH -->\ncore/**\n<!-- /GATE:TOUCH -->\n"
+            "\n## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
+            "- Given: 一份三段均已批准的技术方案段，其中含代码围栏示例\n"
+            "- When: 执行 req-guard ac check 校验清单内容\n"
+            "- Then: 退出码为 0，SectionNotFound 问题数为 0\n"
+            "<!-- /GATE:AC -->\n\n- 用例：见上。\n\n## 审核记录\n",
+            encoding="utf-8",
+        )
+        y = work / ".gates" / "req-guard.yaml"
+        if y.exists():
+            y.write_text(
+                y.read_text(encoding="utf-8").replace("level: 3", "level: 0"),
+                encoding="utf-8",
+            )
+        return work
+
+    def run(work: Path, *args: str):
+        return subprocess.run(
+            [str(BIN), *args, "-p", "."],
+            cwd=work, capture_output=True, text=True,
+            env={**os.environ, "REQ_GUARD_AI_CTX": ""}, **RUN_KW,
+        )
+
+    # 38_围栏内标题不算边界：TOUCH 块必须仍被读到
+    work = sandbox(
+        "38-fenced",
+        "本段正文。\n\n   ```\n   ## solution\n   ```\n",
+    )
+    r = run(work, "touch-check")
+    good = r.returncode == 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  38_围栏内标题不算边界: exit={r.returncode} (期望 0)")
+    if not good:
+        print(f"      ↳ 38: {(r.stdout + r.stderr)[:300]}")
+
+    # 39_变长围栏（四反引号包三反引号）
+    work = sandbox(
+        "39-longfence",
+        "本段正文。\n\n   ````\n   ```\n   ## fake\n   ```\n   ````\n",
+    )
+    r = run(work, "touch-check")
+    good = r.returncode == 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  39_变长围栏内标题不算边界: exit={r.returncode} (期望 0)")
+    if not good:
+        print(f"      ↳ {(r.stdout + r.stderr)[:250]}")
+
+    # 40_围栏外标题仍算边界：TOUCH 块若被误判到别段，ac check 会报 SectionNotFound
+    work = sandbox("40-outside", "本段正文。\n")
+    r = run(work, "ac", "check", "REQ-001")
+    good = r.returncode == 0 and "SectionNotFound" not in (r.stdout + r.stderr)
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  40_围栏外标题仍算边界: exit={r.returncode} 且无 SectionNotFound")
+    if not good:
+        print(f"      ↳ {(r.stdout + r.stderr)[:300]}")
+    if not good:
+        print(f"      ↳ {(r.stdout + r.stderr)[:250]}")
+    return ok
+
+
 def verify_install_exempt() -> bool:
     """36–37 REQ-005：install 生成物豁免，且**精确到文件**。
 
@@ -416,7 +513,9 @@ def verify_install_exempt() -> bool:
             "<!-- /GATE:TOUCH -->\n"
             "\n- 思路：声明范围后核对实际改动。\n\n"
             "## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
-            "- Given: 已批准\n- When: 执行 touch-check\n- Then: 退出码 0\n"
+            "- Given: 一份三段均已批准的技术方案段，其中含代码围栏示例\n"
+            "- When: 执行 req-guard ac check 校验清单内容\n"
+            "- Then: 退出码为 0，SectionNotFound 问题数为 0\n"
             "<!-- /GATE:AC -->\n\n- 用例：见上。\n\n## 审核记录\n",
             encoding="utf-8",
         )
@@ -759,6 +858,7 @@ ok = ok and verify_touch_gate()
 ok = ok and verify_content_freeze()
 ok = ok and verify_amend_gate()
 ok = ok and verify_install_exempt()
+ok = ok and verify_fenced_boundary()
 ok = ok and verify_section_gate()
 
 

@@ -232,10 +232,17 @@ pub fn cross_refs(section: &str, first_line: usize) -> Vec<CrossRef> {
 ///
 /// 抹成等长空格而非删除：行号必须原样保留，错误信息才能指向清单里的真实位置。
 /// 围栏代码块一并抹掉：块里的引用是**示例**，同样不是承诺。
+/// 只掩掉 HTML 注释（`<!-- … -->`，可跨行），返回等长副本。
+///
+/// 围栏**不在这里处理** —— 交给 [`crate::section::mask_fenced`]。两处各写一份
+/// 围栏逻辑必然漂移（REQ-008 T4 / AC-009），而且旧实现只认长度 3、不认 `~~~`、
+/// 变长围栏，会在「文档里展示三反引号示例」时再次失效。
+///
+/// 换行永远保留：抹掉会改变行号，错误信息就指错位置了。
 fn mask_html_comments(section: &str) -> String {
     let cs: Vec<char> = section.chars().collect();
     let mut out = String::with_capacity(section.len());
-    let (mut in_comment, mut in_fence) = (false, false);
+    let mut in_comment = false;
     let mut i = 0usize;
     while i < cs.len() {
         let rest: String = cs[i..].iter().take(4).collect();
@@ -252,22 +259,17 @@ fn mask_html_comments(section: &str) -> String {
             in_comment = true;
             i += 4;
             continue;
-        } else if rest3 == "```" {
-            out.push_str("   ");
-            in_fence = !in_fence;
-            i += 3;
-            continue;
         }
         let c = cs[i];
-        // 换行必须原样保留：抹掉会改变行号，错误信息就指错位置了
-        if in_comment || in_fence {
-            out.push(if c == '\n' { '\n' } else { ' ' });
+        if in_comment && c != '\n' {
+            out.push(' ');
         } else {
             out.push(c);
         }
         i += 1;
     }
-    out
+    // 围栏交给共享实现：两处各写一份必然漂移
+    crate::section::mask_fenced(&out)
 }
 
 /// 目标设计文档里是否存在给定编号的小节标题（`^#{1,6}\s*§?\s*3\.8`）。
@@ -868,6 +870,12 @@ pub fn to_source_refs(paths: &[String]) -> (Vec<String>, Vec<String>) {
         }
     }
     (out, dropped)
+}
+
+/// 测试用：暴露注释+围栏掩码结果，供 core 侧比对两处是否共用一份（REQ-008 AC-009）。
+#[cfg(test)]
+pub fn mask_html_comments_for_test(section: &str) -> String {
+    mask_html_comments(section)
 }
 
 #[cfg(test)]

@@ -203,7 +203,13 @@ pub fn section_span(content: &str, step: usize) -> Option<(usize, usize)> {
         digits.parse().ok()
     }
 
-    let lines: Vec<&str> = content.lines().collect();
+    // **先掩掉代码围栏**（REQ-008）：围栏里的 `## xxx` 是示例内容，不是标题。
+    // 不掩的话，「文档里展示 `## solution` 格式」会把段落边界切错 ——
+    // 表现为 `GATE:TOUCH` 块"消失"，而报错（你没写声明块）与真实原因无关；
+    // 更糟的是另外三条判定（摘要覆盖范围、EmptySection 统计范围）
+    // 会**静默地**指向错误段落。掩码保持行号不变（见 `section::mask_fenced`）。
+    let masked = crate::section::mask_fenced(content);
+    let lines: Vec<&str> = masked.lines().collect();
     let start = lines.iter().position(|l| heading_no(l) == Some(step + 1))?;
     let end = lines[start + 1..]
         .iter()
@@ -3482,6 +3488,117 @@ mod tests {
             SealState::Unverifiable
         );
         assert!(seal_state(&broken, "decomposition").needs_action());
+        cleanup(&root);
+    }
+
+    // ── REQ-008：段落边界判定排除代码围栏 ──
+    #[test]
+    fn mask_fenced_围栏内标题不算边界() {
+        // 起草 REQ-007 时踩到：正文里展示 `## solution` 格式示例，
+        // 而 is_heading 判 trim_start().starts_with("## ") —— 缩进示例同样命中，
+        // 段落边界被切错，表现为 GATE:TOUCH 块"消失"。
+        let doc = "# T\n\n## 1. A\n\n正文一。\n\n## 2. B\n\n   ```\n   ## solution\n   ```\n\n正文二。\n\n## 3. C\n\n正文三。\n";
+        let (s1, e1) = section_span(doc, 1).unwrap();
+        let lines: Vec<&str> = doc.lines().collect();
+        let body = lines[s1 - 1..e1].join("\n");
+        assert!(
+            body.contains("## solution"),
+            "围栏内的 ## 必须留在第 2 段内（实际第 2 段 = {body}）"
+        );
+        assert!(!body.contains("正文三"), "第 3 段不得被吃进第 2 段");
+        let s3 = section_span(doc, 2).unwrap().0;
+        assert!(
+            s3 > e1,
+            "第 3 段起点({s3}) 必须在第 2 段终点({e1}) 之后 —— 围栏内的 ## 不得成为边界"
+        );
+    }
+
+    #[test]
+    fn mask_fenced_未闭合围栏持续到文末() {
+        // fail-closed：少一个收尾标记不能让围栏内的 ## 变回标题
+        let doc = "## 1. A\n\n正文。\n\n```\n## 2. B\n\n正文二。\n";
+        assert!(
+            section_span(doc, 1).is_none(),
+            "未闭合围栏内的 '## 2.' 不应被当作第 2 段"
+        );
+    }
+
+    #[test]
+    fn mask_fenced_变长围栏与波浪号() {
+        // 四反引号包裹三反引号：内层三反引号不结束围栏
+        let doc = "## 1. A\n\n````\n```\n## 2. B\n```\n````\n\n正文。\n\n## 3. C\n";
+        assert!(
+            section_span(doc, 1).is_none(),
+            "四反引号围栏内的 '## 2.' 不应被当作段边界"
+        );
+        // ~~~ 围栏
+        let doc2 = "## 1. A\n\n~~~\n## 2. B\n~~~\n\n正文。\n\n## 3. C\n";
+        assert!(section_span(doc2, 1).is_none(), "~~~ 围栏同样应排除");
+    }
+
+    #[test]
+    fn mask_fenced_掩码保持行数与行宽() {
+        let src = "a\n```\n## x\n```\nb\n";
+        let m = crate::section::mask_fenced(src);
+        assert_eq!(src.lines().count(), m.lines().count(), "行数必须不变");
+        for (x, y) in src.lines().zip(m.lines()) {
+            assert_eq!(x.chars().count(), y.chars().count(), "各行长度必须不变");
+        }
+        assert!(!m.contains("##"), "围栏内的 ## 应被抹成空格");
+        assert!(m.contains("```"), "围栏标记本身保留（便于人读）");
+    }
+
+    #[test]
+    fn mask_fenced_围栏外标题仍算边界() {
+        let doc = "## 1. A\n\n```\ncode\n```\n\n正文。\n\n## 2. B\n\n正文二。\n";
+        let (s, e) = section_span(doc, 0).unwrap();
+        let lines: Vec<&str> = doc.lines().collect();
+        let body = lines[s - 1..e].join("\n");
+        assert!(body.contains("正文。") && !body.contains("正文二"));
+    }
+
+    #[test]
+    fn mask_fenced_缩进围栏与文首围栏() {
+        // 列表项内的围栏（缩进）
+        // 缩进围栏内的 `## fake` 不得成为第 1 段的**终点**
+        let doc = "## 1. A\n\n- 项目：\n\n  ```\n  ## fake\n  ```\n\n正文。\n\n## 2. B\n";
+        let (_s1, e1) = section_span(doc, 0).unwrap();
+        let lines: Vec<&str> = doc.lines().collect();
+        let body = lines[0..e1].join("\n");
+        assert!(
+            body.contains("正文。"),
+            "缩进围栏内的 '## fake' 不得截断第 1 段（实际段 = {body}）"
+        );
+        // 文档以围栏开头：文内所有 `## ` 都在围栏里
+        let doc2 = "```\n## 1. A\n```\n\n正文。\n";
+        assert!(section_span(doc2, 0).is_none(), "文首围栏同样应排除");
+    }
+
+    #[test]
+    fn mask_fenced_touch与requirement共用一份() {
+        // AC-009：不得各写一份围栏逻辑
+        let src = "见 docs/设计/A.md §1.1\n\n```\n## fake\n```\n";
+        let by_section = crate::section::mask_fenced(src);
+        let by_touch = crate::touch::mask_html_comments_for_test(src);
+        assert_eq!(by_section, by_touch, "两处掩码结果必须一致");
+    }
+
+    #[test]
+    fn mask_fenced_既有行为不变() {
+        // AC-005：无围栏的合法清单，边界与修复前一致
+        let (root, c) = frozen_doc("req-008-regress");
+        // 无围栏时：三个段各自定位成功，且互不重叠、顺序递增
+        let spans: Vec<(usize, usize)> = (0..3)
+            .map(|i| section_span(&c, i).unwrap_or((0, 0)))
+            .collect();
+        assert!(
+            spans.iter().all(|(st, en)| *st > 0 && en > st),
+            "三段都应定位成功且非空：{spans:?}"
+        );
+        assert!(
+            spans.windows(2).all(|w| w[0].1 <= w[1].0),
+            "段区间不应交叠：{spans:?}"
+        );
         cleanup(&root);
     }
 
