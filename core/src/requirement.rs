@@ -1437,30 +1437,74 @@ fn seal_inner(root: &Path, id: &str, reason: &str) -> Result<Vec<(String, String
             "需求 {id} 已归档（done），不再绑定内容摘要"
         )));
     }
-    // 内容冻结的一次性约束（REQ-004 G2）。
+    // 可绑定集合 = **已批准 且 尚未绑定**的段。
     //
-    // `seal` 的正当用途**只有一个**：存量清单首次启用（三段 `sum=` 全为 `-`）。
-    // 已绑定过却再 seal，等于"改完再补个摘要"——那正是 REQ-002 要消灭的形态，
-    // 只是从 AI 手里换到了人手里。判据取"是否已绑定过"这个**事实**，
-    // 而不是次数上限：上限仍在鼓励"攒到上限前多擦几次"。
-    let already = STEPS
-        .iter()
-        .filter(|(k, _)| matches!(step_sum(&content, k), SumState::Frozen(_)))
-        .map(|(_, l)| *l)
-        .collect::<Vec<_>>();
-    let reseal = !already.is_empty();
-    if reseal && reason.trim().is_empty() {
-        return Err(GateError::Validation(format!(
-            "需求 {id} 的 {} 段已绑定过内容摘要，再次 seal 必须给 `--reason <原因>`。\n\
-             首次启用（存量清单补绑定）不需要理由；**再次**绑定意味着内容已改动过，\n\
-             正常路径是 `reject <需求ID> --step <段> --comment '...'` → 改 → 重新 `approve`，\n\
-             那会自动写入新摘要。确需跳过重审时请显式说明理由，此举会记入台账（RESEAL）并计数。",
-            already.join("、")
-        )));
+    // 两个条件缺一不可，各堵一个洞：
+    //
+    // ① 「已批准」—— 堵 `amend` → 改 → `seal` 的绕道：`amend` 把段置为 amended
+    //    并清 `sum=`，若 seal 照绑不误，它就成了「不重新审批也能让改动过的正文
+    //    重新获得冻结背书」的通道 —— 那恰好是 REQ-002 要消灭的形态。
+    //    未批准的段只能由 `approve` 绑定（approve 会留下 reviewer / updated）。
+    //
+    // ② 「尚未绑定」—— 这才是"首次启用"的准确判据。**部分绑定**（存量清单里
+    //    两段是 REQ-002 上线前批准的、另一段后来重审过）是常态而非例外；
+    //    把"仍有段没绑"当成"已启用过、需理由"会给**补齐**这条正路强加摩擦
+    //    （实测：REQ-004 自己就卡在这里 —— solution 后来重审带上了摘要，
+    //    decomposition / testplan 仍是 REQ-002 上线前批准的 `sum=-`）。
+    //
+    // 故：还有段可绑 → 正常放行（记 SEAL）；一段都没的可绑（= 冻结已全面启用）
+    // → 须 `--reason`（记 RESEAL 并计数），因为那时再 seal 只能是"改完再补摘要"。
+    let mut to_bind: Vec<(&str, &str)> = Vec::new();
+    let mut not_approved: Vec<&str> = Vec::new();
+    for (k, l) in STEPS {
+        if step_status(&content, k) != "approved" {
+            not_approved.push(l);
+            continue;
+        }
+        if matches!(step_sum(&content, k), SumState::Frozen(_)) {
+            continue;
+        }
+        to_bind.push((k, l));
+    }
+    let first_enable = !to_bind.is_empty();
+    if !first_enable {
+        if !not_approved.is_empty() {
+            return Err(GateError::Validation(format!(
+                "需求 {id} 的 {} 段未处于 approved，seal 不代劳审批：\n\
+                 请先 `approve <需求ID> --step <段> --comment '...'`，由它写入摘要。\n\
+                 这是刻意的：`amend` 清摘要是为了强制重审，若 seal 能绑未批准的段，\n\
+                 「打回 → 改 → seal」就成了一条跳过重审的绕道。",
+                not_approved.join("、")
+            )));
+        }
+        if reason.trim().is_empty() {
+            let bound_labels: Vec<&str> = STEPS
+                .iter()
+                .filter(|(k, _)| {
+                    step_status(&content, k) == "approved"
+                        && matches!(step_sum(&content, k), SumState::Frozen(_))
+                })
+                .map(|(_, l)| *l)
+                .collect();
+            return Err(GateError::Validation(format!(
+                "需求 {id} 的 {} 段已绑定过内容摘要，再次 seal 必须给 `--reason <原因>`。\n\
+                 首次启用（存量清单补绑定）不需要理由 —— 那种情况仍有段可绑。\n\
+                 到这一步还来 seal，意味着内容已改动过；正常路径是\n\
+                 `amend <需求ID> --step <段> --comment '...'` → 改 → `approve`（自动写入新摘要）。\n\
+                 确需跳过重审时请显式说明理由，此举记入台账（RESEAL）并计数。",
+                bound_labels.join("、")
+            )));
+        }
+        // RESEAL 路径：重绑全部已批准段（幂等）
+        to_bind = STEPS
+            .iter()
+            .filter(|(k, _)| step_status(&content, k) == "approved")
+            .map(|(k, l)| (*k, *l))
+            .collect();
     }
     let mut out = content.clone();
     let mut bound = Vec::new();
-    for (key, label) in STEPS {
+    for (key, label) in to_bind {
         let idx = step_index(key).unwrap_or(0);
         let Some(sum) = section_sum(&content, idx) else {
             return Err(GateError::Validation(format!(
@@ -1483,7 +1527,7 @@ fn seal_inner(root: &Path, id: &str, reason: &str) -> Result<Vec<(String, String
         .join(",");
     // 首次启用记 `SEAL`；再次绑定记 `RESEAL` 并带上理由 —— 台账里能直接数出
     // "有几份清单被反复擦过"，这是 REQ-002 落地后最需要被看见的信号。
-    let event = if reseal {
+    let event = if !first_enable {
         format!(
             "RESEAL {} sums={} reason={}",
             r.id,
@@ -3149,6 +3193,68 @@ mod tests {
         assert!(
             ledger.contains("RESEAL REQ-001") && ledger.contains("reason=格式同步"),
             "再次绑定须记 RESEAL 与理由：{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn seal_部分绑定可直接补齐且不需理由() {
+        // 回归锁：判据曾是"只要有任一段已绑定就须 --reason"，于是**部分绑定**
+        // （存量两段 + 后来重审过一段）这条补齐正路被强加摩擦 —— REQ-004 自己
+        // 就卡在这里。"首次启用"的准确判据是**仍有段可绑**。
+        let (root, _) = frozen_doc("req-seal-partial");
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        // 只清掉两段的 sum=，留下 solution 段已绑定 = 部分绑定
+        let partial: String = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") && token(l, "name") != "solution" {
+                    format!("{} sum=-", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, partial).unwrap();
+
+        let bound = seal(&root, "REQ-001", "").unwrap();
+        assert_eq!(
+            vec!["需求分解".to_string(), "测试计划".to_string()],
+            bound.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+            "只该补齐未绑定的两段"
+        );
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(
+            verify_sums(&after).is_empty(),
+            "补齐后三段都应一致：{:?}",
+            verify_sums(&after)
+        );
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(ledger.contains("SEAL REQ-001"), "{ledger}");
+        assert!(
+            !ledger.contains("RESEAL"),
+            "补齐首次绑定不该记 RESEAL：{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn seal_不绑未批准的段_否则amend成绕道() {
+        // `amend` 清摘要是为了强制重审；若 seal 能绑未批准的段，
+        // 「打回 → 改 → seal」就成了跳过重审的绕道。
+        let (root, _) = frozen_doc("req-seal-unapproved");
+        amend(&root, "REQ-001", "solution", "寇工", "改措辞", false).unwrap();
+        let e = seal(&root, "REQ-001", "给了理由也不行")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("approved"), "须说明未批准的段不代劳审批：{e}");
+        let after = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert_eq!(
+            SumState::Absent,
+            step_sum(&after, "solution"),
+            "amend 段的摘要不得被 seal 偷偷绑上"
         );
         cleanup(&root);
     }
