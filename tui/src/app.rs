@@ -44,6 +44,12 @@ pub enum Prompt {
     CommentText { blocking: bool },
     /// 关闭（resolve）评论：输入审核人。
     ResolveAuthor,
+    /// 修订（amend）当前段：输入提请人。
+    AmendReviewer,
+    /// 修订（amend）当前段：输入改稿说明（必填）。
+    AmendReason,
+    /// 绑定内容摘要（seal）：输入原因（首次补绑定可留空）。
+    SealReason,
 }
 
 impl Prompt {
@@ -64,6 +70,9 @@ impl Prompt {
                 }
             }
             Prompt::ResolveAuthor => "关闭（resolve）评论 — 输入审核人（只能人类）",
+            Prompt::AmendReviewer => "请求修订当前段 — 输入提请人",
+            Prompt::AmendReason => "请求修订 — 输入改稿说明（必填，会写进清单与台账）",
+            Prompt::SealReason => "绑定内容摘要 — 输入原因（首次补绑定可留空；已绑定过再封必填）",
         }
     }
 }
@@ -300,6 +309,9 @@ impl App {
             KeyCode::Char('b') => self.open_prompt(Prompt::BypassReason),
             // 审核人最高频的动作之一就是"留一条意见"，必须一步可达。
             KeyCode::Char('m') => self.open_comments(),
+            // e=修订（方向没错、只是要改）；s=seal（绑定内容摘要，人类专属兜底）。
+            KeyCode::Char('e') => self.begin_amend(),
+            KeyCode::Char('s') => self.begin_seal(),
             _ => {}
         }
     }
@@ -383,6 +395,110 @@ impl App {
             return;
         }
         self.open_prompt(Prompt::RejectReviewer);
+    }
+
+    /// 请求修订当前段（REQ-004 G1，`requirement::amend`）。
+    ///
+    /// 与打回机械同构（回退待审 + 清 `sum=` + 必须重审），区别在段标签（`amended`）
+    /// 与台账事件（`AMEND`）。单列一个键是因为"方向没错、只是漏个约束"用打回表达
+    /// 会让台账里"否决"与"改稿"混成一坨，事后答不出"哪几段反复返工"。
+    fn begin_amend(&mut self) {
+        if self.current().is_none() {
+            self.message = Some("没有可修订的需求，先按 n 新建".into());
+            return;
+        }
+        // 已通过段同样可修订（且那一段**没有**"打回"按钮）：若把 amend 也限在未通过段，
+        // "刚批准就想改一句"这条反馈路径在界面上就是死的。
+        self.open_prompt(Prompt::AmendReviewer);
+    }
+
+    /// 绑定内容摘要（`requirement::seal`）：存量清单首次启用冻结 / 改稿后重新绑定。
+    fn begin_seal(&mut self) {
+        if self.current().is_none() {
+            self.message = Some("没有可绑定的需求，先按 n 新建".into());
+            return;
+        }
+        self.open_prompt(Prompt::SealReason);
+    }
+
+    /// 执行修订（提请人与说明都已就绪）。
+    fn amend(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可修订的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let Some(step) = self.current_step() else {
+            return;
+        };
+        let reviewer = self.pending_reviewer.trim().to_string();
+        if reviewer.is_empty() {
+            self.message = Some("修订提请人不能为空".into());
+            return;
+        }
+        let reason = self.input.trim().to_string();
+        if reason.is_empty() {
+            self.message = Some("修订必须说明改什么、为什么改".into());
+            return;
+        }
+        let strict = gate::strict_order(&self.root);
+        // 与批准 / 打回同一套界面进程内凭据（scope 仍是 `<需求>:<段>`）。
+        if !self.prepare_credential(&format!("{}:{}", id, step)) {
+            return;
+        }
+        let outcome = requirement::amend(&self.root, &id, step, &reviewer, &reason, strict);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(_) => {
+                self.prompt = None;
+                self.input.clear();
+                self.pending_reviewer.clear();
+                self.reload();
+                self.message = Some(format!(
+                    "已请求修订 {} / {}（{}）—— 摘要已清空，段回到待审，请改完重新批准",
+                    id,
+                    requirement::step_label(step),
+                    reviewer
+                ));
+            }
+            Err(e) => self.message = Some(format!("修订失败：{}", e)),
+        }
+    }
+
+    /// 执行内容摘要绑定。
+    fn seal(&mut self) {
+        let Some(r) = self.current() else {
+            self.message = Some("没有可绑定的需求".into());
+            return;
+        };
+        let id = r.id.clone();
+        let reason = self.input.trim().to_string();
+        if !self.prepare_credential("seal") {
+            return;
+        }
+        let outcome = requirement::seal(&self.root, &id, &reason);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(bound) => {
+                self.prompt = None;
+                self.input.clear();
+                self.reload();
+                let sums: Vec<String> = bound
+                    .iter()
+                    .map(|(label, sum)| format!("{}={}…", label, &sum[..8.min(sum.len())]))
+                    .collect();
+                self.message = Some(format!(
+                    "已绑定 {} 段内容摘要{}",
+                    bound.len(),
+                    if sums.is_empty() {
+                        String::new()
+                    } else {
+                        format!("：{}", sums.join("，"))
+                    }
+                ));
+            }
+            Err(e) => self.message = Some(format!("绑定失败：{}", e)),
+        }
     }
 
     /// 打开评论面板（读当前需求的评论）。
@@ -704,6 +820,24 @@ impl App {
                 }
                 self.input = value;
                 self.add_comment(blocking);
+            }
+            Prompt::AmendReviewer => {
+                if value.is_empty() {
+                    self.message = Some("修订提请人不能为空".into());
+                    return;
+                }
+                self.pending_reviewer = value;
+                self.input.clear();
+                self.prompt = Some(Prompt::AmendReason);
+            }
+            Prompt::AmendReason => {
+                self.input = value;
+                self.amend();
+            }
+            Prompt::SealReason => {
+                // 原因可留空：首次补绑定不需要理由，是否"已绑定过"由 core 判定。
+                self.input = value;
+                self.seal();
             }
             Prompt::ResolveAuthor => {
                 if value.is_empty() {

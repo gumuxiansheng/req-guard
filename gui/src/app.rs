@@ -31,6 +31,10 @@ pub enum Dialog {
     NewComment,
     /// 关闭（resolve）选中的评论：需要审核人署名。
     ResolveComment,
+    /// 修订（amend）当前段：审核人 + 必须给出改稿说明。
+    Amend,
+    /// 绑定内容摘要（seal）：给存量清单补绑定 / 改稿后重新绑定。
+    Seal,
 }
 
 /// 管理台状态。
@@ -293,6 +297,103 @@ impl App {
                 );
             }
             Err(e) => self.set_msg(Tone::Danger, format!("打回失败：{}", e)),
+        }
+    }
+
+    /// 修订当前段（REQ-004 G1，`requirement::amend`）。
+    ///
+    /// 与 [`Self::reject`] 机械同构（回退待审 + 清 `sum=` + 必须重审），
+    /// 区别只在状态标签与台账事件名：段标 `amended`、记 `AMEND`。
+    /// 界面把它单列，是因为"方向没错、只是漏个约束"用 reject 表达会让台账里
+    /// "否决"与"改稿"混成一坨，事后答不出"哪几段反复返工"。
+    pub fn amend(&mut self) {
+        let (id, step) = match (self.current(), self.current_step()) {
+            (Some(r), Some(s)) => (r.id.clone(), s),
+            _ => {
+                self.set_msg(Tone::Warning, "没有可修订的需求");
+                return;
+            }
+        };
+        let reviewer = self.input_reviewer.trim().to_string();
+        if reviewer.is_empty() {
+            self.set_msg(Tone::Warning, "修订提请人不能为空");
+            return;
+        }
+        let reason = self.input_reason.trim().to_string();
+        if reason.is_empty() {
+            self.set_msg(Tone::Warning, "修订必须说明改什么、为什么改");
+            return;
+        }
+        let strict = gate::strict_order(&self.root);
+        // 与批准 / 打回同一套"界面进程内签发凭据"：scope 仍是 `<需求>:<段>`
+        // （core 的 amend 走 ensure_human + ScopeCheck::Exact）。
+        if !self.prepare_credential(&format!("{}:{}", id, step)) {
+            return;
+        }
+        let outcome = requirement::amend(&self.root, &id, step, &reviewer, &reason, strict);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(_) => {
+                self.dialog = Dialog::None;
+                self.input_reviewer.clear();
+                self.input_reason.clear();
+                self.reload();
+                self.set_msg(
+                    Tone::Warning,
+                    format!(
+                        "已请求修订 {} / {}（{}）——摘要已清空，段已回到待审，请改完重新批准",
+                        id,
+                        requirement::step_label(step),
+                        reviewer
+                    ),
+                );
+            }
+            Err(e) => self.set_msg(Tone::Danger, format!("修订失败：{}", e)),
+        }
+    }
+
+    /// 绑定内容摘要（`requirement::seal`）：把已批准段的 `sum=` 绑到**当前正文**。
+    ///
+    /// 两个用途，界面上不区分（core 会按"还有段可绑 / 都绑过了"给出不同要求）：
+    /// - 存量清单首次启用内容冻结（REQ-002 上线前批准的段）；
+    /// - 正文已改、但确实无需重审时显式重新绑定——此时**必须给理由**，记 `RESEAL`。
+    ///
+    /// 人类专属：core 的 `ensure_human` 会拒 AI；界面照旧走进程内凭据。
+    pub fn seal(&mut self) {
+        let Some(r) = self.current() else {
+            self.set_msg(Tone::Warning, "没有可绑定的需求");
+            return;
+        };
+        let id = r.id.clone();
+        let reason = self.input_reason.trim().to_string();
+        if !self.prepare_credential("seal") {
+            return;
+        }
+        let outcome = requirement::seal(&self.root, &id, &reason);
+        req_guard_core::auth::clear_credential();
+        match outcome {
+            Ok(bound) => {
+                self.dialog = Dialog::None;
+                self.input_reason.clear();
+                self.reload();
+                let sums: Vec<String> = bound
+                    .iter()
+                    .map(|(label, sum)| format!("{}={}…", label, &sum[..8.min(sum.len())]))
+                    .collect();
+                self.set_msg(
+                    Tone::Success,
+                    format!(
+                        "已绑定 {} 段内容摘要：{}",
+                        bound.len(),
+                        if sums.is_empty() {
+                            "（无）".to_string()
+                        } else {
+                            sums.join("，")
+                        }
+                    ),
+                );
+            }
+            Err(e) => self.set_msg(Tone::Danger, format!("绑定失败：{}", e)),
         }
     }
 
@@ -622,6 +723,36 @@ fn render_bottom(parent: &mut egui::Ui, app: &mut App) {
                     app.open_comments();
                 }
             }
+            // 内容摘要绑定：存量清单首次启用冻结、正文改过又确认无需重审时用。
+            // 与评论入口一样常驻操作条——它是"人类专属兜底动作"，藏起来就等于不存在。
+            {
+                let pending = app
+                    .current()
+                    .map(|r| r.steps.iter().filter(|s| s.seal.needs_action()).count())
+                    .unwrap_or(0);
+                let label = if pending > 0 {
+                    format!("绑定内容摘要（{pending} 段待处理）")
+                } else {
+                    "绑定内容摘要".to_string()
+                };
+                if ui
+                    .add_enabled(
+                        app.current().is_some(),
+                        egui::Button::new(if pending > 0 {
+                            egui::RichText::new(label).color(Tone::Warning.color(ui))
+                        } else {
+                            egui::RichText::new(label)
+                        }),
+                    )
+                    .on_hover_text(
+                        "把已批准段的内容摘要绑定到当前正文（存量清单补绑定 / 改稿后重新绑定）",
+                    )
+                    .clicked()
+                {
+                    app.input_reason.clear();
+                    app.dialog = Dialog::Seal;
+                }
+            }
             // 提示的颜色由 `msg_tone` 决定：失败红 / 成功绿 / 提示琥珀，
             // 并带一个同语义的图标，色弱用户不靠颜色也分得出级别。
             let tone = app.msg_tone;
@@ -702,6 +833,9 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                 let (mark, tone) = match s.state {
                     StepState::Approved => ("✓", Tone::Success),
                     StepState::Rejected => ("✗", Tone::Danger),
+                    // 修订与打回都要重新批准，色调一致；标记用 `~` 示"这是改稿不是否决"
+                    // （与 TUI 的 `[~]` 同一套语义，别让两个界面看起来不一样）。
+                    StepState::Amended => ("~", Tone::Danger),
                     StepState::Pending => ("○", Tone::Muted),
                 };
                 let who = s
@@ -709,13 +843,20 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                     .clone()
                     .map(|v| format!("  审核人 {} ", v))
                     .unwrap_or_default();
+                // 冻结异常（未绑定 / 被改动 / 无法校验）直接写进段标题——
+                // 审核人扫一眼三段就该知道哪段不能放行，而不是要点开才知道。
+                let seal_note = match seal_badge(s.seal) {
+                    Some((m, _)) => format!("  {} {}", m, s.seal.hint()),
+                    None => String::new(),
+                };
                 let header = egui::RichText::new(format!(
-                    "[{}] {}. {}  {}{}",
+                    "[{}] {}. {}  {}{}{}",
                     mark,
                     i + 1,
                     s.label,
                     s.state.label(),
-                    who
+                    who,
+                    seal_note
                 ))
                 .color(tone.color(ui));
 
@@ -736,6 +877,19 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                     });
                 if resp.header_response.clicked() {
                     app.step = i;
+                }
+
+                // 当前段的冻结异常 → 直接给出「绑定摘要」入口：
+                // 这条动作的正当理由就写在标题上，摆在旁边免得审核人再去想"该怎么办"。
+                if i == app.step
+                    && s.seal.needs_action()
+                    && ui
+                        .button("绑定本段内容摘要")
+                        .on_hover_text(s.seal.hint())
+                        .clicked()
+                {
+                    app.input_reason.clear();
+                    app.dialog = Dialog::Seal;
                 }
 
                 // 当前段的审核按钮（已通过的段无需再审，不显示，避免误导）
@@ -763,10 +917,45 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
                         app.input_reason.clear();
                     }
                 }
+
+                // 「修订」对**已通过**的段同样有意义：正文冻结之后，"方向没错、只是漏个约束"
+                // 这种反馈最常发生在刚批准的段上，而已通过段上恰恰没有"打回"按钮。
+                if i == app.step
+                    && s.state == StepState::Approved
+                    && ui
+                        .button("请求修订")
+                        .on_hover_text("方向没错、只是要改：回退待审 + 清空摘要，仍需重新批准")
+                        .clicked()
+                {
+                    app.dialog = Dialog::Amend;
+                    app.input_reviewer.clear();
+                    app.input_reason.clear();
+                }
                 ui.separator();
             }
         });
     });
+}
+
+/// 段状态的可读标记（`Seal` 弹窗里逐段列状态时复用，避免两处各写一套符号）。
+fn state_mark(state: StepState) -> &'static str {
+    match state {
+        StepState::Approved => "已通过",
+        StepState::Rejected => "已打回",
+        StepState::Amended => "待修订",
+        StepState::Pending => "待审核",
+    }
+}
+
+/// 内容冻结徽标：`(标记, 色调)`。`Frozen` / `NotApplicable` **不给徽标**——
+/// 正常状态没必要在每段标题上再挂一个符号，界面噪声会淹没真正要处理的事。
+fn seal_badge(seal: requirement::SealState) -> Option<(&'static str, Tone)> {
+    match seal {
+        requirement::SealState::Frozen | requirement::SealState::NotApplicable => None,
+        requirement::SealState::NotSealed => Some(("○未绑定", Tone::Warning)),
+        requirement::SealState::Changed => Some(("⚠已改动", Tone::Danger)),
+        requirement::SealState::Unverifiable => Some(("✗无法校验", Tone::Danger)),
+    }
 }
 
 /// 原文视图：只读、可滚动、**可框选 / 可复制**，等宽逐字呈现 Markdown 源。
@@ -1166,6 +1355,86 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
                 });
             },
         ),
+        Dialog::Amend => (
+            format!(
+                "修订当前段 · {}",
+                app.current_step()
+                    .map(requirement::step_label)
+                    .unwrap_or("—")
+            ),
+            |app, ui| {
+                ui.label("提请人（必填）：");
+                ui.text_edit_singleline(&mut app.input_reviewer);
+                ui.label("改稿说明（必填）：");
+                ui.label(
+                    egui::RichText::new("说明写进清单与台账（AMEND），并作为阻塞性评论留给 AI。")
+                        .italics(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("amend_reason")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 100.0],
+                            egui::TextEdit::multiline(&mut app.input_reason)
+                                .desired_width(f32::MAX)
+                                .hint_text("例：回滚方案缺 DB 迁移回退，方向没问题，请补该步骤"),
+                        );
+                    });
+                ui.label("修订 = 回退待审 + 清空内容摘要，**仍需重新批准**；不豁免重审。");
+                ui.horizontal(|ui| {
+                    if ui.button("提交修订").clicked() {
+                        app.amend();
+                    }
+                    if ui.button("取消").clicked() {
+                        app.dialog = Dialog::None;
+                    }
+                });
+            },
+        ),
+        Dialog::Seal => {
+            (
+                format!(
+                    "绑定内容摘要 · {}",
+                    app.current().map(|r| r.id.as_str()).unwrap_or("（无需求）")
+                ),
+                |app, ui| {
+                    // 把当前各段的冻结状态摊开：审核人得先看清"哪几段可绑、哪几段已绑"，
+                    // 否则点下去只会撞上 core 的报错文案。
+                    if let Some(r) = app.current() {
+                        for s in &r.steps {
+                            let text =
+                                format!("{} {}  {}", s.label, state_mark(s.state), s.seal.hint());
+                            match seal_badge(s.seal) {
+                                Some((_, tone)) => {
+                                    ui.colored_label(tone.color(ui), text);
+                                }
+                                None => {
+                                    ui.label(text);
+                                }
+                            }
+                        }
+                    }
+                    ui.separator();
+                    ui.label("原因（首次补绑定可留空）：");
+                    ui.label(
+                        egui::RichText::new(
+                            "已全部绑定过再执行 = 承认内容改动无需重审，必须写明原因（记 RESEAL）。",
+                        )
+                        .italics(),
+                    );
+                    ui.text_edit_singleline(&mut app.input_reason);
+                    ui.horizontal(|ui| {
+                        if ui.button("确认绑定").clicked() {
+                            app.seal();
+                        }
+                        if ui.button("取消").clicked() {
+                            app.dialog = Dialog::None;
+                        }
+                    });
+                },
+            )
+        }
         Dialog::None => return,
     };
 
@@ -1199,6 +1468,51 @@ mod tests {
         p
     }
 
+    /// 填三段实质正文并全部批准（三段都要有实质内容才批得过）。
+    ///
+    /// core 的 `testutil` 是 `#[cfg(test)]`，gui 用不了，故就地填——
+    /// 比把测试专用助手提成公开 API 划算（与 tui 的同名夹具同理由）。
+    fn approved_doc(root: &Path) {
+        requirement::create(root, None, "登录改造").expect("创建需求");
+        let p = requirement::find(root, "REQ-001").expect("清单应存在").path;
+        let mut c = std::fs::read_to_string(&p).expect("清单应可读");
+        for (heading, line) in [
+            ("## 1. 需求分解", "- 背景与问题：GUI 状态机夹具。"),
+            ("## 2. 技术方案", "- 总体思路：走 amend / seal。"),
+            ("## 3. 测试计划", "- 验收门槛：三段全通过。"),
+        ] {
+            let needle = format!("{heading}\n");
+            assert!(c.contains(&needle), "模板结构变了：{heading}");
+            c = c.replacen(&needle, &format!("{needle}{line}\n"), 1);
+        }
+        std::fs::write(&p, c).expect("写入应成功");
+        for step in ["decomposition", "solution", "testplan"] {
+            requirement::review(root, "REQ-001", step, "寇工", true, "", false)
+                .expect("三段都应批得过");
+        }
+    }
+
+    /// 把所有标记行的 `sum=` 抹成 `-`，模拟"REQ-002 之前批准的存量清单"。
+    fn strip_sums(root: &Path) {
+        let p = requirement::find(root, "REQ-001").expect("清单应存在").path;
+        let c = std::fs::read_to_string(&p).expect("清单应可读");
+        let out: String = c
+            .lines()
+            .map(|l| match l.find(" sum=") {
+                Some(i) if l.starts_with("<!-- GATE:STEP") => format!("{} sum=-", &l[..i]),
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, out).expect("写入应成功");
+    }
+
+    fn seal_of(root: &Path, step: &str) -> requirement::SealState {
+        let p = requirement::find(root, "REQ-001").expect("清单应存在").path;
+        let c = std::fs::read_to_string(&p).expect("清单应可读");
+        requirement::seal_state(&c, step)
+    }
+
     /// 建一条评论（走 core，界面只负责读）。
     fn add_comment(root: &Path, blocking: bool, text: &str) {
         comment::add(
@@ -1214,6 +1528,148 @@ mod tests {
             },
         )
         .expect("添加评论");
+    }
+
+    #[test]
+    fn amend_回退待审且清空内容摘要() {
+        let root = temp_root("amend");
+        approved_doc(&root);
+        assert_eq!(
+            seal_of(&root, "decomposition"),
+            requirement::SealState::Frozen
+        );
+        let mut app = App::new(&root);
+
+        // 说明必填：没有说明就分不清"方向没错的改稿"与"这段被否决"
+        app.input_reviewer = "寇工".into();
+        app.input_reason = "   ".into();
+        app.amend();
+        assert_eq!(
+            app.current().unwrap().steps[0].state,
+            StepState::Approved,
+            "说明为空时不应改动状态"
+        );
+
+        app.input_reason = "回滚方案缺 DB 迁移回退，方向没问题".into();
+        app.amend();
+        let r = app.current().expect("应有需求");
+        assert_eq!(
+            r.steps[0].state,
+            StepState::Amended,
+            "amend 应把段置为 amended（待修订）"
+        );
+        assert_eq!(
+            r.steps[0].seal,
+            requirement::SealState::NotApplicable,
+            "amend 清空 sum= → 不再有已批准正文要保护"
+        );
+        assert!(!r.unlocked, "amend 不豁免重审：三段不再全通过 → 重新锁回");
+        assert_eq!(app.dialog, Dialog::None, "成功后回到主界面");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("重新批准"),
+            "提示要写明「仍需重审」：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amend_已通过段也可请求修订() {
+        // "方向没错、只是漏个约束"最常发生在刚批准的段上，而那一段没有「打回」按钮——
+        // 若 amend 也只在未通过段可用，这条反馈路径在界面上就是死的。
+        let root = temp_root("amend-approved");
+        approved_doc(&root);
+        let mut app = App::new(&root);
+        app.input_reviewer = "寇工".into();
+        app.input_reason = "补充回滚步骤".into();
+        app.amend();
+        assert_eq!(app.current().unwrap().steps[0].state, StepState::Amended);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seal_为存量清单补绑定后三段皆冻结() {
+        let root = temp_root("seal-fresh");
+        approved_doc(&root);
+        strip_sums(&root);
+        let mut app = App::new(&root);
+        assert_eq!(
+            app.current().unwrap().steps[0].seal,
+            requirement::SealState::NotSealed
+        );
+
+        app.input_reason = "   ".into();
+        app.seal();
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_eq!(
+                seal_of(&root, step),
+                requirement::SealState::Frozen,
+                "{step} 首次补绑定后应真正冻结"
+            );
+        }
+        assert_eq!(app.dialog, Dialog::None);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已绑定"),
+            "应报出绑了哪几段：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seal_重复绑定须给理由() {
+        let root = temp_root("seal-reseal");
+        approved_doc(&root);
+        strip_sums(&root);
+        let mut app = App::new(&root);
+        app.seal();
+
+        // 已全部绑定过 → 空理由应被 core 挡下（正常路径是 amend → 改 → approve）
+        app.input_reason = "".into();
+        app.seal();
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("reason"),
+            "应提示需给理由：{:?}",
+            app.message
+        );
+
+        app.input_reason = "改动仅为错别字".into();
+        app.seal();
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已绑定"),
+            "给了理由应放行（记 RESEAL）：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seal_代劳审批的绕道被core挡住() {
+        // amend 清了 sum= 之后 seal 不能把未批准的段绑上，否则"打回 → 改 → seal"
+        // 就是一条跳过重审的通道（REQ-002 的核心防线，界面不能自己开口子）。
+        let root = temp_root("seal-no-approve");
+        approved_doc(&root);
+        let mut app = App::new(&root);
+        app.step = 1;
+        app.input_reviewer = "寇工".into();
+        app.input_reason = "补声明".into();
+        app.amend();
+        app.input_reason = "".into();
+        app.seal();
+        assert_eq!(
+            seal_of(&root, "solution"),
+            requirement::SealState::NotApplicable,
+            "未批准的段不应被 seal 绑定"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("未处于 approved"),
+            "应把 core 的拒绝理由原样带出来：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

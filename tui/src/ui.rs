@@ -44,6 +44,18 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
+/// 内容冻结徽标：`(标记, 颜色)`。与 GUI 同口径（都读 core 的
+/// [`req_guard_core::requirement::SealState`]），两个界面显示一致。
+fn seal_badge(seal: req_guard_core::requirement::SealState) -> Option<(&'static str, Color)> {
+    use req_guard_core::requirement::SealState as S;
+    match seal {
+        S::Frozen | S::NotApplicable => None,
+        S::NotSealed => Some(("[未绑定]", Color::Yellow)),
+        S::Changed => Some(("[已改动]", Color::Red)),
+        S::Unverifiable => Some(("[无法校验]", Color::Red)),
+    }
+}
+
 /// 面板外框：聚焦时用青色边框 + 标题前缀 `▶`。
 ///
 /// 必须有可见的焦点指示——否则用户按 `↑↓` 却不知道"现在动的是谁"，
@@ -184,6 +196,11 @@ fn render_steps(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
         if let Some(who) = &s.reviewer {
             spans.push(Span::raw(format!("  审核人: {}", who)));
         }
+        // 内容冻结异常写进本行：审核人扫一眼三段就该知道哪段不能放行。
+        // `Frozen` / `NotApplicable` 不带标记 —— 正常状态不必再挂符号刷存在感。
+        if let Some((m, c)) = seal_badge(s.seal) {
+            spans.push(Span::styled(format!("  {}", m), Style::default().fg(c)));
+        }
         if i == app.step {
             for sp in spans.iter_mut() {
                 *sp = sp.clone().style(sp.style.add_modifier(Modifier::BOLD));
@@ -192,10 +209,18 @@ fn render_steps(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    let block = pane(
-        &format!(" 三段审核（{}/3 已通过） ", r.approved_count()),
-        focused(app, Focus::Steps),
-    );
+    // 面板标题顺带报"待处理段数"：按 s 绑定摘要这件事**不阻断门禁**，
+    // 若不主动提示，它就会一直静默地挂在每份清单上直到没人再看。
+    let pending_seal = r.steps.iter().filter(|s| s.seal.needs_action()).count();
+    let title = if pending_seal > 0 {
+        format!(
+            " 三段审核（{}/3 已通过 · {pending_seal} 段待绑定摘要 s） ",
+            r.approved_count()
+        )
+    } else {
+        format!(" 三段审核（{}/3 已通过） ", r.approved_count())
+    };
+    let block = pane(&title, focused(app, Focus::Steps));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -228,7 +253,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.message {
         Some(m) => Line::from(Span::styled(m.clone(), Style::default().fg(Color::Yellow))),
         None => Line::from(
-            " a批准 r打回 m评论 n新建 g检查 b绕过 L审计 R刷新 ↑↓选择 ←→/Tab换焦点 ?帮助 q退出 ",
+            " a批准 r打回 e修订 m评论 s绑定摘要 n新建 g检查 b绕过 L审计 R刷新 ?帮助 q退出 ",
         ),
     };
     // 折行显示：终端窄时也不至于把「q退出」这类关键提示裁掉。
@@ -254,6 +279,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("    a  批准当前段（输入审核人）"),
         Line::from("    r  打回当前段（审核人 + 原因必填）"),
         Line::from("    m  评论面板：查看 / 新增（n 普通 · N 阻塞）/ 关闭 x / 重算锚点 A"),
+        Line::from("    e  请求修订当前段（提请人 + 改稿说明必填；回退待审、仍需重审）"),
+        Line::from("    s  绑定内容摘要 seal（存量清单补绑定；已全绑定再封必给原因）"),
         Line::from("    n  新建需求（输入标题）"),
         Line::from("    g  执行门禁检查（与 CLI req-guard check 等价）"),
         Line::from("    b  应急绕过（原因必填，默认 60 分钟，写审计）"),
@@ -753,6 +780,57 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
+    /// 填三段实质正文并全部批准（三段都要有实质内容才批得过）。
+    ///
+    /// core 的 `testutil` 是 `#[cfg(test)]`，tui 用不了，故就地填——
+    /// 与 gui 的同名夹具同理由（重复三行比把测试助手提成公开 API 划算）。
+    fn approved_doc(root: &std::path::Path) {
+        req_guard_core::requirement::create(root, None, "登录改造").expect("创建需求");
+        let p = req_guard_core::requirement::find(root, "REQ-001")
+            .expect("清单应存在")
+            .path;
+        let mut c = std::fs::read_to_string(&p).expect("清单应可读");
+        for (heading, line) in [
+            ("## 1. 需求分解", "- 背景与问题：TUI amend/seal 夹具。"),
+            ("## 2. 技术方案", "- 总体思路：验证修订与绑定。"),
+            ("## 3. 测试计划", "- 验收门槛：e / s 两个键可用。"),
+        ] {
+            let needle = format!("{heading}\n");
+            assert!(c.contains(&needle), "模板结构变了：{heading}");
+            c = c.replacen(&needle, &format!("{needle}{line}\n"), 1);
+        }
+        std::fs::write(&p, c).expect("写入应成功");
+        for step in ["decomposition", "solution", "testplan"] {
+            req_guard_core::requirement::review(root, "REQ-001", step, "寇工", true, "", false)
+                .expect("三段都应批得过");
+        }
+    }
+
+    /// 把所有标记行的 `sum=` 抹成 `-`（模拟 REQ-002 之前批准的存量清单）。
+    fn strip_sums(root: &std::path::Path) {
+        let p = req_guard_core::requirement::find(root, "REQ-001")
+            .expect("清单应存在")
+            .path;
+        let c = std::fs::read_to_string(&p).expect("清单应可读");
+        let out: String = c
+            .lines()
+            .map(|l| match l.find(" sum=") {
+                Some(i) if l.starts_with("<!-- GATE:STEP") => format!("{} sum=-", &l[..i]),
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, out).expect("写入应成功");
+    }
+
+    fn seal_of(root: &std::path::Path, step: &str) -> req_guard_core::requirement::SealState {
+        let p = req_guard_core::requirement::find(root, "REQ-001")
+            .expect("清单应存在")
+            .path;
+        let c = std::fs::read_to_string(&p).expect("清单应可读");
+        req_guard_core::requirement::seal_state(&c, step)
+    }
+
     /// 建一条评论（走 core，界面只负责读）。
     fn add_comment(root: &std::path::Path, blocking: bool, text: &str) {
         req_guard_core::comment::add(
@@ -768,6 +846,102 @@ mod tests {
             },
         )
         .expect("添加评论");
+    }
+
+    #[test]
+    fn e键请求修订_回退待审并清空摘要() {
+        let root = temp_dir("amend-flow");
+        approved_doc(&root);
+        let mut app = App::new(&root);
+        assert_eq!(
+            seal_of(&root, "decomposition"),
+            req_guard_core::requirement::SealState::Frozen
+        );
+
+        press(&mut app, 'e');
+        type_text(&mut app, "寇工");
+        enter(&mut app);
+        // 说明必填：空说明应停在原地
+        enter(&mut app);
+        assert_eq!(
+            app.current().unwrap().steps[0].state,
+            req_guard_core::status::StepState::Approved,
+            "改稿说明为空时不应改动状态"
+        );
+        type_text(&mut app, "回滚方案缺 DB 迁移回退");
+        enter(&mut app);
+
+        let r = app.current().expect("应有需求");
+        assert_eq!(r.steps[0].state, req_guard_core::status::StepState::Amended);
+        assert_eq!(
+            r.steps[0].seal,
+            req_guard_core::requirement::SealState::NotApplicable,
+            "amend 清 sum= → 不再有已批准正文要保护"
+        );
+        assert!(!r.unlocked, "amend 不豁免重审");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("重新批准"),
+            "提示要写明仍需重审：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn s键绑定存量清单后三段皆冻结() {
+        let root = temp_dir("seal-flow");
+        approved_doc(&root);
+        strip_sums(&root);
+        let mut app = App::new(&root);
+
+        press(&mut app, 's');
+        // 首次补绑定：原因可留空
+        enter(&mut app);
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_eq!(
+                seal_of(&root, step),
+                req_guard_core::requirement::SealState::Frozen,
+                "{step} 补绑定后应真正冻结"
+            );
+        }
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已绑定"),
+            "应报出绑了哪几段：{:?}",
+            app.message
+        );
+
+        // 已全部绑定 → 空原因应被挡；给了原因才放行（记 RESEAL）
+        press(&mut app, 's');
+        enter(&mut app);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("reason"),
+            "已绑定清单须给理由：{:?}",
+            app.message
+        );
+        type_text(&mut app, "改动仅为错别字");
+        enter(&mut app);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("已绑定"),
+            "给了理由应放行：{:?}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 三段面板标出待绑摘要的段() {
+        let root = temp_dir("seal-badge");
+        approved_doc(&root);
+        strip_sums(&root);
+        let app = App::new(&root);
+        let text = screen(&draw(&app, 120, 34));
+        assert!(
+            text.contains("待绑定摘要"),
+            "三段都已批准但未绑定 → 标题应报待处理段数：\n{}",
+            text
+        );
+        assert!(text.contains("[未绑定]"), "段行应带未绑定徽标：\n{}", text);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

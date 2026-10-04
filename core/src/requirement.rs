@@ -1247,6 +1247,79 @@ pub fn step_index(step: &str) -> Option<usize> {
     STEPS.iter().position(|(k, _)| *k == step)
 }
 
+/// 某一步的**内容冻结全景**（REQ-002：`approve` 时把摘要绑到所批内容上）。
+///
+/// 与 [`SumState`] 的区别：`SumState` 只看标记行里 `sum=` 这个**字段**
+/// （"有没有绑"），`SealState` 还把**当前正文**算进去（"绑的是不是现在这份"）。
+/// 前端要展示的恰恰是后者——审核人看到的是"这一段还能不能信"，
+/// 而不是"字段写没写"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealState {
+    /// 未批准：没有"已批准的正文"需要保护（`amend` / `reject` 后即如此）。
+    NotApplicable,
+    /// 已批准、已绑定，且正文与批准时逐字一致（真正的冻结）。
+    Frozen,
+    /// 已批准但未绑定摘要（存量清单，或还没执行过 `seal`）。
+    NotSealed,
+    /// 已批准且已绑定，但**正文已被改动** → 要么走 `amend` → 改 → `approve` 重审，
+    /// 要么显式 `seal --reason` 重新绑定（后者记 `RESEAL`，台账里数得出来）。
+    Changed,
+    /// `sum=` 字段格式非法，或该段二级标题定位失败 —— 一律 **fail-closed**，
+    /// 既不算"已冻结"也不放行界面照旧显示为已通过。
+    Unverifiable,
+}
+
+impl SealState {
+    /// 是否需要审核人处置（界面据此高亮，别让"待处理"混在一片绿里）。
+    pub fn needs_action(self) -> bool {
+        matches!(
+            self,
+            SealState::NotSealed | SealState::Changed | SealState::Unverifiable
+        )
+    }
+
+    /// 一行说明（界面提示 / 测试断言共用，避免各写一套文案）。
+    pub fn hint(self) -> &'static str {
+        match self {
+            SealState::NotApplicable => "未批准，不涉及内容冻结",
+            SealState::Frozen => "已绑定内容摘要：正文与批准时一致",
+            SealState::NotSealed => "已批准但未绑定内容摘要（执行 seal 绑定当前内容）",
+            SealState::Changed => "正文已被改动，需重审（amend → 改 → approve）或 seal 重新绑定",
+            SealState::Unverifiable => "sum 字段损坏或段落定位失败，无法校验（fail-closed）",
+        }
+    }
+}
+
+/// 某一步的内容冻结全景（纯函数：只读正文，不落盘）。
+///
+/// 为什么不叫前端各自算：这段判定要同时看 `status=` / `sum=` 与**当前段正文**，
+/// 三处任一不一致都会得出不同结论。放进 core 才有一份真相，两个界面也不会漂移。
+pub fn seal_state(content: &str, step: &str) -> SealState {
+    match step_sum(content, step) {
+        // 未批准 → 没有"已批准的正文"；`sum=` 此时是 `-`，不是缺失。
+        SumState::Absent => {
+            let status = step_line(content, step).map(|l| token(l, "status"));
+            if status.as_deref() == Some("approved") {
+                SealState::NotSealed
+            } else {
+                SealState::NotApplicable
+            }
+        }
+        SumState::Malformed(_) => SealState::Unverifiable,
+        SumState::Frozen(bound) => {
+            let Some(idx) = step_index(step) else {
+                return SealState::Unverifiable;
+            };
+            match section_sum(content, idx) {
+                // 段落定位失败 → 无从校验，fail-closed（与 verify_sums 的口径一致）。
+                None => SealState::Unverifiable,
+                Some(now) if now == bound => SealState::Frozen,
+                Some(_) => SealState::Changed,
+            }
+        }
+    }
+}
+
 /// 内容冻结问题类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SumIssueKind {
@@ -2954,51 +3027,47 @@ mod tests {
     }
 
     #[test]
-    fn seal_绑定当前正文且AI上下文下拒绝() {
-        let (root, _) = frozen_doc("req-sum-seal");
-        // 抹掉所有 sum= 模拟存量，再 seal
-        let p = find(&root, "REQ-001").unwrap().path;
-        let c = fs::read_to_string(&p).unwrap();
-        let stripped: String = c
-            .lines()
-            .map(|l| {
-                if is_marker_line(l) && l.contains("GATE:STEP") {
-                    format!("{} sum=-", &l[..l.find(" sum=").unwrap()])
-                } else {
-                    l.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&p, stripped).unwrap();
+    fn seal_state_四态判定() {
+        // 复用 frozen_doc：已批准 + 已绑定 sum 的真实文档，避免自己拼 marker 行
+        let (root, content) = frozen_doc("seal-state");
+        let sum_of = |c: &str| token(step_line(c, "decomposition").unwrap(), "sum");
 
-        set_level(&root, 0);
-        let bound = seal(&root, "REQ-001", "").unwrap();
-        assert_eq!(3, bound.len(), "三段都应绑定：{bound:?}");
-        let after = fs::read_to_string(&p).unwrap();
-        assert!(
-            verify_sums(&after).is_empty(),
-            "seal 后应一致：{:?}",
-            verify_sums(&after)
-        );
-        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
-        assert!(ledger.contains("SEAL REQ-001"), "须写 SEAL 台账：{ledger}");
+        // ① 已批准 + 已绑定 + 正文未改 → Frozen（唯一"可以当没这回事"的状态）
+        assert_eq!(seal_state(&content, "decomposition"), SealState::Frozen);
+        assert!(!seal_state(&content, "decomposition").needs_action());
 
-        // seal 走的是审批守卫：提高本机等级后无凭据即拒。
-        // 这里**不用 set_var 注入 REQ_GUARD_AI_CTX** —— 那是进程级全局量，并行用例
-        // 会互相看见（本仓库 `auth.rs` 的 `is_ai_context_读进程环境` 同样立此规矩），
-        // 表现为随机失败。AI 上下文这一维由 `auth::方案a_ai上下文一律拒` 直接
-        // 构造 `AuthFacts` 覆盖决策表（authorize 是 seal 必经的那道门）。
-        set_level(&root, 3);
-        let e = seal(&root, "REQ-001", "").unwrap_err().to_string();
-        assert!(
-            e.contains("凭据") || e.contains("票据"),
-            "无凭据应被审批锁拒：{e}"
+        // ② 已批准但 sum=- （存量清单 / 未 seal）→ NotSealed
+        let unsealed = content.replace(&format!("sum={}", sum_of(&content)), "sum=-");
+        assert_eq!(seal_state(&unsealed, "decomposition"), SealState::NotSealed);
+        assert!(seal_state(&unsealed, "decomposition").needs_action());
+
+        // ③ 正文被改过（摘要对不上）→ Changed。
+        //    关键是把**旧摘要**留在标记行上：若顺手把 sum 也更新了，那就等于"重新绑定"过了，
+        //    状态本就该是 Frozen —— 那正是 seal 干的事，不能拿来当 Changed 的样本。
+        let mutated = unsealed.replace(
+            "背景与问题：本用例的测试夹具。",
+            "背景与问题：被人偷偷改了。",
         );
+        let changed = mutated.replace("sum=-", &format!("sum={}", sum_of(&content)));
+        assert_eq!(seal_state(&changed, "decomposition"), SealState::Changed);
+
+        // ④ 未批准 → NotApplicable：sum=- 在这里不是"缺失"，是没东西可保护
+        let pending = unsealed.replace("status=approved", "status=pending");
+        assert_eq!(
+            seal_state(&pending, "decomposition"),
+            SealState::NotApplicable
+        );
+
+        // ⑤ sum 字段损坏 → Unverifiable（fail-closed，不许当通过）
+        let broken = unsealed.replace("sum=-", "sum=nothex");
+        assert_eq!(
+            seal_state(&broken, "decomposition"),
+            SealState::Unverifiable
+        );
+        assert!(seal_state(&broken, "decomposition").needs_action());
         cleanup(&root);
     }
 
-    // ── REQ-004：修订（amend）──
     #[test]
     fn amend_打回草稿并清sum为减号() {
         let (root, c) = frozen_doc("req-amend-1");

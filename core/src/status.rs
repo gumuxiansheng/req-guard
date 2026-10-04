@@ -72,6 +72,11 @@ pub struct StepStatus {
     pub reviewer: Option<String>,
     /// 审核时间（未审核时为 `None`）。
     pub updated: Option<String>,
+    /// 内容冻结状态（批准时绑定的摘要与当前正文是否仍一致）。
+    ///
+    /// 放在这里而不是让各前端自己算：判定要同时看 `status=` / `sum=` 与**当前段正文**，
+    /// 三处任一不一致都会得出不同结论——`SealState` 由 core 算一份，两个界面只渲染。
+    pub seal: requirement::SealState,
 }
 
 /// 清单整体状态（对应 `GATE:HEAD status=`）。
@@ -225,6 +230,7 @@ fn build(root: &Path, r: &Requirement, content: &str) -> Result<ReqStatus> {
                 state,
                 reviewer: dash_to_none(requirement::step_reviewer(content, key)),
                 updated: dash_to_none(requirement::step_updated(content, key)),
+                seal: requirement::seal_state(content, key),
             }
         })
         .collect();

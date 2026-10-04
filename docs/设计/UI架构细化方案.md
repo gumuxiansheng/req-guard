@@ -110,6 +110,9 @@ pub struct ReqStatus {
 | 评论 | `comment::resolve(root, req_id, cid, author) -> Result<()>` | **拒绝 `author=ai`**；属审批类动作，需界面凭据 |
 | 评论 | `comment::refresh_anchors(root, req_id) -> Result<usize>` | 行号漂移重算，返回 stale 数 |
 | 评论 | `comment::summary(root, req_id) -> Result<(usize, usize)>` | （未解决, 其中阻塞）——`ReqStatus` 里的计数字段即来自它 |
+| 清单 | `requirement::amend(root, id, step, reviewer, reason, strict)` | 修订：回退待审 + 清 `sum=`，**不豁免重审**；台账记 `AMEND` |
+| 清单 | `requirement::seal(root, id, reason) / seal_many / seal_all` | 绑定内容摘要（人类专属）；已全绑定再封须给原因，记 `RESEAL` |
+| 清单 | `requirement::seal_state(content, step) -> SealState` | **逐段**冻结全景（`NotApplicable`/`Frozen`/`NotSealed`/`Changed`/`Unverifiable`），经 `StepStatus.seal` 下发给前端 |
 | 清单 | `req_list(root) -> Result<Vec<ReqStatus>>` | 供列表渲染 |
 | 清单 | `req_get(root, id) -> Result<ReqStatus>` | 供详情渲染 |
 | 门禁 | `gate_install(root, tools) -> Result<Vec<PathBuf>>` | |
