@@ -168,6 +168,8 @@ fn render_steps(f: &mut Frame, app: &App, r: &ReqStatus, area: Rect) {
         let (mark, color) = match s.state {
             StepState::Approved => ("[✓]", Color::Green),
             StepState::Rejected => ("[✗]", Color::Red),
+            // 修订与驳回都需要重新批准，颜色一致；标记不同以示"这是改稿不是否决"
+            StepState::Amended => ("[~]", Color::Red),
             StepState::Pending => ("[ ]", Color::Gray),
         };
         let cursor = if i == app.step { "▶ " } else { "  " };
@@ -582,6 +584,25 @@ mod tests {
     fn 三段通过后显示已解锁() {
         let root = temp_dir("unlocked");
         req_guard_core::requirement::create(&root, None, "登录改造").expect("创建需求");
+        // 三段都要有实质正文才批得过（REQ-003 的 EmptySection 挂在 approve 上）。
+        // core 的 `testutil` 是 `#[cfg(test)]`，TUI 用不了，故就地填 —— 夹具重复
+        // 三行比把测试专用助手暴露成公开 API 划算。
+        {
+            let p = req_guard_core::requirement::find(&root, "REQ-001")
+                .expect("清单应存在")
+                .path;
+            let mut c = std::fs::read_to_string(&p).expect("清单应可读");
+            for (heading, line) in [
+                ("## 1. 需求分解", "- 背景与问题：TUI 渲染夹具。"),
+                ("## 2. 技术方案", "- 总体思路：渲染三段状态。"),
+                ("## 3. 测试计划", "- 验收门槛：屏幕出现「已解锁」。"),
+            ] {
+                let needle = format!("{heading}\n");
+                assert!(c.contains(&needle), "模板结构变了：{heading}");
+                c = c.replacen(&needle, &format!("{needle}{line}\n"), 1);
+            }
+            std::fs::write(&p, c).expect("写入应成功");
+        }
         for step in ["decomposition", "solution", "testplan"] {
             req_guard_core::requirement::review(&root, "REQ-001", step, "寇工", true, "", true)
                 .expect("审核");

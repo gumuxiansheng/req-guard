@@ -53,7 +53,25 @@ pub fn print_one(r: &ReqStatus) {
     } else {
         println!("  判定 : 未解锁，AI 不得编写/修改源码（门禁拦截）");
     }
+    print_rework(r);
     println!();
+}
+
+/// 返工率（REQ-004 G4 / T2）：只在**有修订记录**时输出，避免刷屏。
+///
+/// 只统计不阻断 —— 反复返工的段是"方案当初没想清楚"的信号，需要复盘；
+/// 把它做成门禁只会催生"少写 amend 刷分"。
+fn print_rework(r: &ReqStatus) {
+    let counts = req_guard_core::requirement::amend_counts(&r.root, &r.id);
+    let hot: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{} 修订{}次", k, n))
+        .collect();
+    if hot.is_empty() {
+        return;
+    }
+    println!("  返工 : {}", hot.join(" / "));
 }
 
 /// 渲染评论摘要（仅在存在未解决评论时输出，保证审核意见必然被看到）。

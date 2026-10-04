@@ -20,6 +20,8 @@ pub enum StepState {
     Approved,
     /// 审核人已打回。
     Rejected,
+    /// 已打回并附修订说明（REQ-004 G1）：与 `Rejected` 在判定上等价，标签不同。
+    Amended,
 }
 
 impl StepState {
@@ -28,6 +30,7 @@ impl StepState {
         match raw {
             "approved" => StepState::Approved,
             "rejected" => StepState::Rejected,
+            "amended" => StepState::Amended,
             _ => StepState::Pending,
         }
     }
@@ -37,6 +40,7 @@ impl StepState {
             StepState::Pending => "pending",
             StepState::Approved => "approved",
             StepState::Rejected => "rejected",
+            StepState::Amended => "amended",
         }
     }
 
@@ -46,6 +50,7 @@ impl StepState {
             StepState::Pending => "待审核",
             StepState::Approved => "已通过",
             StepState::Rejected => "已打回",
+            StepState::Amended => "待修订",
         }
     }
 
@@ -130,6 +135,8 @@ pub struct ReqStatus {
     pub open_comments: usize,
     /// 其中阻塞性的数量（> 0 即拦截编码）。
     pub blocking_comments: usize,
+    /// 项目根：渲染层要读台账算返工率，而清单路径不足以定位台账。
+    pub root: PathBuf,
 }
 
 impl ReqStatus {
@@ -234,6 +241,7 @@ fn build(root: &Path, r: &Requirement, content: &str) -> Result<ReqStatus> {
         steps,
         open_comments,
         blocking_comments,
+        root: root.to_path_buf(),
     })
 }
 

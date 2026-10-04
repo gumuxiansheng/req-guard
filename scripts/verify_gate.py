@@ -334,7 +334,7 @@ def verify_content_freeze() -> bool:
                 encoding="utf-8",
             )
         subprocess.run(
-            [str(BIN), "seal", "REQ-001", "-p", "."],
+            [str(BIN), "seal", "REQ-001", "--reason", "测试夹具绑定", "-p", "."],
             cwd=work, capture_output=True, text=True, **RUN_KW,
         )
         if mutate:
@@ -369,6 +369,116 @@ def verify_content_freeze() -> bool:
     good = r.returncode == 1 and "req-guard" in (r.stdout + r.stderr)
     ok = ok and good
     print(f"{'PASS' if good else 'FAIL'}  31_二进制缺失fail_closed: exit={r.returncode} (期望 1 且提示缺二进制)")
+    return ok
+
+
+def verify_amend_gate() -> bool:
+    """32–34 REQ-004 场景：修订路径、seal 一次性、设计文档交叉引用。
+
+    这三格都必须用**子进程跑二进制**（不是脚本）：`amend` / `seal` 是审批类动作，
+    沙箱里把 auth.level 降到 L0 才放行 —— 这也顺带证明它们走的是审批守卫。
+    """
+    if not BIN.exists():
+        print("SKIP  32-34_amend与seal: 未构建 req-guard 二进制")
+        return True
+
+    ok = True
+
+    def sandbox(tag: str, files: dict) -> Path:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{tag}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        subprocess.run(
+            [str(BIN), "init", "-p", ".", "--tool", "none"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        (work / REQ_DIR).mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        for rel, body in files.items():
+            dst = work / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(body, encoding="utf-8")
+        y = work / ".gates" / "req-guard.yaml"
+        if y.exists():
+            y.write_text(
+                y.read_text(encoding="utf-8").replace("level: 3", "level: 0"),
+                encoding="utf-8",
+            )
+        return work
+
+    def call(work: Path, *args: str):
+        return subprocess.run(
+            [str(BIN), *args, "-p", "."],
+            cwd=work, capture_output=True, text=True,
+            env={**os.environ, "REQ_GUARD_AI_CTX": ""}, **RUN_KW,
+        )
+
+    base = (
+        "# REQ-001 修订路径\n\n"
+        "<!-- GATE:HEAD id=REQ-001 status=approved created=2026-01-01 -->\n"
+        "<!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n"
+        "<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n"
+        "<!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n\n"
+        "## 1. 需求分解\n\n- 背景：修订路径演示。\n\n"
+        "## 2. 技术方案\n\n<!-- GATE:TOUCH -->\nsrc/**\n<!-- /GATE:TOUCH -->\n"
+        "\n- 思路：原始内容。\n\n"
+        "## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
+        "- Given: 已批准\n- When: 执行 check\n- Then: 退出码 0\n<!-- /GATE:AC -->\n"
+        "\n- 用例：见上。\n\n## 审核记录\n"
+    )
+
+    # 32_amend 打回后必须重新批准才放行
+    work = sandbox("32-amend", {f"{REQ_DIR}/REQ-001.md": base})
+    r = call(work, "amend", "REQ-001", "--step", "solution", "--comment", "补异常分支")
+    good = r.returncode == 0
+    doc = (work / REQ_DIR / "REQ-001.md").read_text(encoding="utf-8")
+    good = good and "status=amended" in doc and "sum=-" in doc
+    ledger = (work / ".gates" / "audit" / "ledger.md")
+    lt = ledger.read_text(encoding="utf-8") if ledger.exists() else ""
+    good = good and "AMEND REQ-001" in lt and "REJECT REQ-001" not in lt
+    # 未重审 → check 必须拦
+    chk = call(work, "check")
+    good = good and chk.returncode == 1
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  32_amend打回须重审: amend={r.returncode} check={chk.returncode} (期望 0 / 1)")
+    if not good:
+        print(f"      ↳ amend: {(r.stdout + r.stderr)[:300]}")
+        print(f"      ↳ doc amended={chr(39)}{'status=amended' in doc}{chr(39)} sum-={chr(39)}{'sum=-' in doc}{chr(39)}")
+        print(f"      ↳ ledger: {lt[:200]}")
+
+    # 33_seal 一次性：已绑定须 --reason，且记 RESEAL
+    work = sandbox("33-seal", {f"{REQ_DIR}/REQ-001.md": base})
+    r1 = call(work, "seal", "REQ-001")
+    good = r1.returncode == 1 and "--reason" in (r1.stdout + r1.stderr)
+    r2 = call(work, "seal", "REQ-001", "--reason", "格式同步")
+    lt = (work / ".gates" / "audit" / "ledger.md").read_text(encoding="utf-8")
+    good = good and r2.returncode == 0 and "RESEAL REQ-001" in lt
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  33_seal一次性: 无reason={r1.returncode} 带reason={r2.returncode} (期望 1 / 0)")
+    if not good:
+        print(f"      ↳ {(r1.stdout + r1.stderr)[:200]}")
+
+    # 34_设计文档交叉引用失效 → ac check 拦
+    for tag, doc_rel, want in [
+        ("34a-缺文件", None, 1),
+        ("34b-缺小节", "docs/设计/A.md", 1),
+    ]:
+        files = {f"{REQ_DIR}/REQ-001.md": base}
+        if doc_rel:
+            files[doc_rel] = "# 设计\n\n## 1.1 现存小节\n\n正文\n"
+        sec = "docs/设计/缺失.md §2.2" if doc_rel is None else "docs/设计/A.md §9.9"
+        files[f"{REQ_DIR}/REQ-001.md"] = base.replace("- 思路：原始内容。", f"- 思路：见 {sec}。")
+        work = sandbox(tag, files)
+        r = call(work, "ac", "check", "REQ-001")
+        out = r.stdout + r.stderr
+        good = r.returncode == want and "BrokenCrossRef" in out
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {tag}引用失效: exit={r.returncode} (期望 {want})")
+        if not good:
+            print(f"      ↳ {out[:200]}")
     return ok
 
 
@@ -527,6 +637,7 @@ def verify_pre_commit_fail_closed() -> bool:
 ok = ok and verify_pre_commit_fail_closed()
 ok = ok and verify_touch_gate()
 ok = ok and verify_content_freeze()
+ok = ok and verify_amend_gate()
 ok = ok and verify_section_gate()
 
 

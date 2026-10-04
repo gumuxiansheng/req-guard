@@ -94,6 +94,18 @@ fn run(a: &cli::Args) -> Result<()> {
                 r.id
             );
         }
+        Action::Amend => {
+            let id = a.id.as_deref().unwrap_or("");
+            let step = a.step.as_deref().unwrap_or("");
+            let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
+            let strict = gate::strict_order(root);
+            let r = requirement::amend(root, id, step, &reviewer, comment_of(a), strict)?;
+            // 明示"重审仍必需"：amend 与 reject 同构，**不豁免**重新批准。
+            println!(
+                "✅ 已请求修订：{} / {}（{}，提请人 {}）\n   摘要已清空、段已回到待审 —— 请改完重新 `approve`。",
+                r.id, step, requirement::step_label(step), reviewer
+            );
+        }
         Action::Approve | Action::Reject => {
             let pass = matches!(a.action, Action::Approve);
             let id = a.id.as_deref().unwrap_or("");
@@ -101,15 +113,7 @@ fn run(a: &cli::Args) -> Result<()> {
             let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
             // 是否强制审核顺序，由 .gates/req-guard.yaml 的 strict_order 决定（缺失时 fail-closed = true）。
             let strict = gate::strict_order(root);
-            let r = requirement::review(
-                root,
-                id,
-                step,
-                &reviewer,
-                pass,
-                a.reason.as_deref().unwrap_or(""),
-                strict,
-            )?;
+            let r = requirement::review(root, id, step, &reviewer, pass, comment_of(a), strict)?;
             println!(
                 "✅ 已{}：{} / {}（{}，审核人 {}）",
                 if pass { "批准" } else { "打回" },
@@ -689,6 +693,20 @@ fn resolve_identity(
 
 /// `req-guard ac check`：验收标准机械校验。
 ///
+/// 审批/修订的留痕正文：读 `--comment`（落 `text`），兼容 `--reason`。
+///
+/// 曾经的 bug：这里读的是 `a.reason`，而 `--comment` 解析进的是 `a.text` ——
+/// 于是 `req-guard reject <ID> --step X --comment "..."` 的注释**被静默丢弃**，
+/// 审核记录里只留下 `-`。留痕丢字比不记录更糟：它让人以为已经记下了。
+/// 两者都读是为了兼容既有脚本里的 `--reason` 写法。
+fn comment_of(a: &cli::Args) -> &str {
+    a.text
+        .as_deref()
+        .or(a.reason.as_deref())
+        .unwrap_or("")
+        .trim()
+}
+
 /// 判定全在 core（`ac::check` → `ac::lint`），这里只做参数翻译、渲染与退出码 ——
 /// 与 `ids --check` 同一套房屋风格（`{标记} [{严重级}] {message}`）。
 /// **Error 全部排在 Warn 之前**：门禁唯一的静默降级口是「仅 Warn 也放行」，
@@ -863,7 +881,10 @@ fn run_verify_content(root: &Path, a: &cli::Args) -> Result<()> {
     let reqs = match a.id.as_deref() {
         // 容忍 `REQ-003.md`：脚本里拿到的就是带扩展名的文件名，人类也常这么敲。
         // 两种写法都拼成 `REQ-003.md.md` 的话，钩子会静默变成"永远查不到需求"。
-        Some(id) => vec![requirement::find(root, id.strip_suffix(".md").unwrap_or(id))?],
+        Some(id) => vec![requirement::find(
+            root,
+            id.strip_suffix(".md").unwrap_or(id),
+        )?],
         None => requirement::list(root)?,
     };
     // 计数而非借用：SumIssue 逐清单生成，借用会短于循环体
@@ -924,9 +945,9 @@ fn run_seal(root: &Path, a: &cli::Args) -> Result<()> {
         .map(str::to_string)
         .collect();
     let outcomes = if ids.iter().any(|i| i == "ALL") {
-        requirement::seal_all(root)?
+        requirement::seal_all(root, a.reason.as_deref().unwrap_or(""))?
     } else {
-        requirement::seal_many(root, &ids)?
+        requirement::seal_many(root, &ids, a.reason.as_deref().unwrap_or(""))?
     };
     if outcomes.is_empty() {
         println!("没有未归档的需求清单可绑定");

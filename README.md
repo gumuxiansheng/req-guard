@@ -11,7 +11,7 @@
 - **证据不可篡改**：评论独立文件，AI 禁止直接写、禁止 resolve（只能 reply）
 - **审计留痕**：拦截/放行/绕过/评论全部入 `audit/gate-audit.log`
 - **应急绕过**：有时效、必填原因；**不覆盖评论证据保护**
-- **审批锁**：`approve/reject/resolve/bypass` 须出示人类凭据才放行——AI 会话标记（方案 A）、
+- **审批锁**：`approve/reject/amend/resolve/bypass/seal` 须出示人类凭据才放行——AI 会话标记（方案 A）、
   审批令牌（方案 B）、带外声明（方案 C）、终端挑战码（方案 D）；**严格模式下无凭据即拒**，
   不依赖"AI 工具是否已登记"，堵 AI 自批
 - 零外部依赖（纯 Rust 标准库），开箱即 build
@@ -112,7 +112,7 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
   **无法被 L1 拦到**，只能靠 L2/L3 兜底；
   Codex/Cursor 走 deny 包装（exit 2）适配其拦截语义，CodeBuddy 已修正为 `.codebuddy/settings.json`
 - **审批锁（方案 A，软标记）**：Claude Code / CodeBuddy 会话注入 `REQ_GUARD_AI_CTX=1`（配置 `env` 段），
-  `approve/reject/resolve/bypass` 检测到即拒；审核人在自己的终端审批。
+  `approve/reject/amend/resolve/bypass/seal` 检测到即拒；审核人在自己的终端审批。
   ⚠️ 白名单式：**未登记的 AI 工具会话内没有该标记**，"没标记 = 人类"是 fail-open，
   靠它单独挡不住新工具（2026-09-29 Firedit 事故）
 - **审批凭据（方案 B）**：`req-guard token issue` 签发凭据（原文仅打印一次，人类带外持有），
@@ -136,7 +136,7 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
 - **清单正文可写、状态行不可改**：AI 可用 Write 整篇填写 `.gates/requirements/*.md`
   （不等三段批准——否则"AI 填三段正文"这步会被门禁自己拦死）；但 GATE 状态行必须与磁盘
   **逐行一致**，改动即拦截（防 AI 自批）；片段编辑（Edit）无法与基线比对，一律禁止
-- **身份绑定（可归属）**：`approve/reject/resolve/done/bypass` 的操作人**自动取 git 身份**
+- **身份绑定（可归属）**：`approve/reject/amend/resolve/done/bypass` 的操作人**自动取 git 身份**
   （`git config user.name/user.email`，即提交本身的署名），并把 `email` + 指纹 `sig` 写进
   `GATE:STEP` 标记行、审核记录、入库台账与 `.bypass`；`--reviewer` 可省略。
   `auth.level ≥ 1` 时 `--reviewer` 与 git 身份冲突、或取不到 git 身份**一律拒绝**；
@@ -154,13 +154,13 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
   **这条只能放在批准动作上**：FRS001 只检查 `source_refs` 这个键是否存在，
   `source_refs: []` 一律通过、FRS004 也无从匹配——声明侧留空在 doc-guard 侧完全静默，
   规格看似接入时效治理、实则永远不会被判过期
-- **审计入库**：approve / reject / resolve / bypass / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
+- **审计入库**：approve / reject / amend / resolve / bypass / seal / 阻塞评论写入 `.gates/audit/ledger.md`（PR 可复核）
 
 详见 [`docs/规范/AI工具合规保证规范.md`](docs/规范/AI工具合规保证规范.md)。
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
+`init` `create` `approve` `reject` `amend` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `verify-content` `seal` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
 （`ac check [<需求ID>] [--all]` 校验清单内容：第 3 段验收标准（编号连续 +
 Given/When/Then 齐备）+ **三段实质正文**（模板占位不算）；硬伤退出码 1；
 `approve` 时已跑同一判据，CI 这一步是服务端兜底）

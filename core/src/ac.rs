@@ -104,6 +104,8 @@ pub enum AcIssueKind {
     SectionNotFound,
     /// 某段实质正文为 0（`crate::section` 的判定，见 REQ-003）。
     EmptySection,
+    /// 方案段对设计文档的交叉引用已失效（文件或小节号不存在，见 REQ-004 G3）。
+    BrokenCrossRef,
 }
 
 /// 一条 AC 问题。`message` 自含上下文（编号 + 行号 + 修复指引），可直接展示。
@@ -137,6 +139,7 @@ impl AcIssueKind {
             AcIssueKind::InlineEntry => "InlineEntry",
             AcIssueKind::SectionNotFound => "SectionNotFound",
             AcIssueKind::EmptySection => "EmptySection",
+            AcIssueKind::BrokenCrossRef => "BrokenCrossRef",
         }
     }
 }
@@ -247,6 +250,33 @@ pub fn check(root: &Path, target: &AcTarget<'_>) -> Result<Vec<AcIssue>> {
             i
         }));
         let _ = name;
+        // 设计文档交叉引用有效性（REQ-004 G3）：判**方案段**（第 2 段），
+        // 与上面的 AC / 段落实质性并列输出，不塞进 `touch-check` ——
+        // 那条是「实际改动 ⊆ 声明范围」的集合判定，混在一起两边报错会互相稀释。
+        if let Some((sstart, send)) = requirement::section_span(&content, 1) {
+            let slines: Vec<&str> = content.lines().collect();
+            let sec = slines[sstart - 1..send].join("\n");
+            for bad in crate::touch::check_cross_refs(root, &sec, sstart) {
+                let (what, fix) = if bad.target_missing {
+                    (
+                        "文件不存在（被移动/重命名，或路径写错）",
+                        "确认该设计文档的新路径，或删掉这条引用",
+                    )
+                } else {
+                    (
+                        "小节号不存在（小节被重命名 —— 设计文档演进后忘了同步引用）",
+                        "改成目标文档里现存的 §编号，或删掉这条引用",
+                    )
+                };
+                out.push(AcIssue::err(
+                    AcIssueKind::BrokenCrossRef,
+                    format!(
+                        "清单 {} 第 {} 行引用的 `{}` §{} {}。\n  处置：{}。\n                           引用写法固定为 `docs/<目录>/<文件>.md §<编号>`，其它写法不做判定。",
+                        r.id, bad.line, bad.path, bad.section, what, fix
+                    ),
+                ));
+            }
+        }
         // 段落实质性（REQ-003）：三段逐段独立判定。段定位失败时**不**报空段 ——
         // 那已由 SectionNotFound 说过一遍，重复报等于噪音掩盖真问题。
         let ph = requirement::template_placeholder_texts();

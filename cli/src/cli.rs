@@ -6,6 +6,7 @@
 //! req-guard create   -t <标题>           创建需求清单
 //! req-guard approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
 //! req-guard reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
+//! req-guard amend    <需求ID> --step <步骤> --comment <意见>   （修订：回退待审+清摘要，必须重审）
 //! req-guard comment  <需求ID> --author <姓名> --text <意见> [--step] [--quote] [--blocking] [--reply C001]
 //! req-guard resolve  <需求ID> <评论ID> --author <姓名>     （AI 禁止调用）
 //! req-guard done     <需求ID> --author <姓名>      归档需求（拦截随之跳过）
@@ -71,6 +72,8 @@ pub enum Action {
     VerifyContent,
     /// `seal`：把已批准段的 `sum=` 绑定到当前正文（人类专属；存量清单迁移用）。
     Seal,
+    /// 修订：与 reject 同构，台账记 AMEND（REQ-004 G1）
+    Amend,
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
     /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
@@ -261,6 +264,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "touch-check" => Action::TouchCheck,
         "verify-content" => Action::VerifyContent,
         "seal" => Action::Seal,
+        "amend" => Action::Amend,
         "ui" => Action::Ui,
         "hook-check" => Action::HookCheck,
         "-h" | "--help" => return Err(help()),
@@ -397,7 +401,8 @@ fn help() -> String {
   init                       初始化 .gates/ 门禁（脚本 + AI 工具 hook + pre-commit）\n\
   create   -t <标题>         创建需求清单（REQ-001…）\n\
   approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
-  reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
+  reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
+  amend    <需求ID> --step <步骤> --comment <意见>    修订（回退待审+清摘要，必须重审）\n\
                              --reviewer 可省略：缺省取 git 身份（user.name）\n\
   comment  <需求ID> --author <姓名> --text <意见> [--step <步骤>]\n\
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
@@ -417,7 +422,10 @@ fn help() -> String {
   ac check --all             同上，且含归档区（审计用，只读）\n\
   touch-check [--base <ref>] 变更范围契约：实际改动 ⊆ GATE:TOUCH 声明并集\n\
   verify-content [<需求ID>]  校验已批准段正文未被改动（pre-commit 内部调用）\n\
-  seal <需求ID> [...]       把已批准段的 sum= 绑定到当前正文（AI 禁止执行）\n\
+  seal <需求ID> [...]       把已批准段的 sum= 绑定到当前正文（AI 禁止执行）
+                           已绑定过的清单须加 --reason <原因>（记 RESEAL 事件）
+  amend <需求ID> --step <步骤> --comment <意见>
+                           修订已批准的段（回退待审 + 清摘要，必须重审）\n\
   touch --declare --glob <路径> [--glob <glob>...] [--reason <原因>]\n\
                              扩张声明范围（AI 禁止；会打回技术方案重审）\n\
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\

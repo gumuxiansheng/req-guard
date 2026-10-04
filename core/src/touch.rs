@@ -162,6 +162,177 @@ pub fn block_state(section: &str) -> BlockState {
     }
 }
 
+/// 一条交叉引用：`docs/设计/X.md §3.8` 里的 `(文件, 小节号)` 对。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossRef {
+    pub path: String,
+    pub section: String,
+    /// 该引用所在行的 1-based 行号（相对整篇清单）。
+    pub line: usize,
+}
+
+/// 从一段正文里抽出对**设计文档**的交叉引用（**纯函数**）。
+///
+/// 只认一种写法：`docs/<目录>/<文件名>.md §<数字>(.<数字>)*`（REQ-004 G3 / T4）。
+///
+/// 为什么只认这一种：判定必须可机械解析。约定不明确时，要么误报（作者用别的
+/// 写法引用 → annoyance → 整条规则被忽略），要么漏报。**宁可漏，不可扰**——
+/// 漏掉的引用由人补，误报会让这条规则连同其他规则一起被习惯性绕过。
+///
+/// 刻意**不判**引用描述与目标正文是否相符：那属于语义判断（N1），不可机械判定。
+pub fn cross_refs(section: &str, first_line: usize) -> Vec<CrossRef> {
+    let masked = mask_html_comments(section);
+    let mut out = Vec::new();
+    for (i, line) in masked.lines().enumerate() {
+        let mut from = 0usize;
+        // 逐个 `docs/` 出现处向前解析；**不是**"行首必须是 docs/"——
+        // 引用几乎总是出现在句子中间（"见 docs/设计/X.md §3.8"）。
+        while let Some(pos) = line[from..].find("docs/") {
+            let start = from + pos;
+            let rest = &line[start..];
+            let Some(md) = rest.find(".md") else {
+                break; // 本行再无 `.md` 终点，后面也不会有完整路径
+            };
+            let path = &rest[..md + 3];
+            let after = rest[md + 3..].trim_start();
+            if let Some(numsrc) = after.strip_prefix('§') {
+                let section_no: String = numsrc
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                // 路径须像**真的**路径：不含空白（否则是散文里的巧合）、不逃出仓库根、
+                // 且不含元变量尖括号 —— `docs/设计/<文件名>.md §<编号>` 是**语法说明**，
+                // 不是一条引用。漏掉这一条的话，「定义该语法的规格文档」本身永远
+                // 会被自己的规则判成硬伤（实测：REQ-004 起草时就是这样被拦住的）。
+                let sane = !path.contains(char::is_whitespace)
+                    && !path.contains("..")
+                    && !path.contains('<')
+                    && !path.contains('>')
+                    && !section_no.is_empty()
+                    && !section_no.ends_with('.');
+                if sane {
+                    out.push(CrossRef {
+                        path: path.to_string(),
+                        section: section_no,
+                        line: first_line + i,
+                    });
+                }
+            }
+            from = start + md + 3;
+        }
+    }
+    out
+}
+
+/// 把 HTML 注释（`<!-- … -->`，可跨行）与围栏代码块**抹成等长空格**。
+///
+/// 为什么必须抹：模板自带的引导说明里就写着 `见 docs/设计/X.md §3.8` 这类**示例引用**，
+/// 它不是作者写的引用。判它失效会让**每份新建清单**都命中一条硬伤 —— 那是纯粹的噪音，
+/// 而噪音会让整条规则连同其他规则一起被习惯性忽略。
+///
+/// 抹成等长空格而非删除：行号必须原样保留，错误信息才能指向清单里的真实位置。
+/// 围栏代码块一并抹掉：块里的引用是**示例**，同样不是承诺。
+fn mask_html_comments(section: &str) -> String {
+    let cs: Vec<char> = section.chars().collect();
+    let mut out = String::with_capacity(section.len());
+    let (mut in_comment, mut in_fence) = (false, false);
+    let mut i = 0usize;
+    while i < cs.len() {
+        let rest: String = cs[i..].iter().take(4).collect();
+        let rest3: String = cs[i..].iter().take(3).collect();
+        if in_comment {
+            if rest3 == "-->" {
+                out.push_str("   ");
+                in_comment = false;
+                i += 3;
+                continue;
+            }
+        } else if rest == "<!--" {
+            out.push_str("    ");
+            in_comment = true;
+            i += 4;
+            continue;
+        } else if rest3 == "```" {
+            out.push_str("   ");
+            in_fence = !in_fence;
+            i += 3;
+            continue;
+        }
+        let c = cs[i];
+        // 换行必须原样保留：抹掉会改变行号，错误信息就指错位置了
+        if in_comment || in_fence {
+            out.push(if c == '\n' { '\n' } else { ' ' });
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 目标设计文档里是否存在给定编号的小节标题（`^#{1,6}\s*§?\s*3\.8`）。
+pub fn has_section_heading(text: &str, section: &str) -> bool {
+    // 无 regex 依赖（core 零外部依赖是铁律）：手写行首匹配
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        let Some(h) = t.strip_prefix('#') else {
+            return false;
+        };
+        let t = h.trim_start();
+        let t = t.strip_prefix('#').map(str::trim_start).unwrap_or(t);
+        let t = t.strip_prefix('#').map(str::trim_start).unwrap_or(t);
+        let t = t.strip_prefix('#').map(str::trim_start).unwrap_or(t);
+        let t = t.strip_prefix('#').map(str::trim_start).unwrap_or(t);
+        let t = t.strip_prefix('#').map(str::trim_start).unwrap_or(t);
+        let t = t.strip_prefix("§").map(str::trim_start).unwrap_or(t);
+        // 编号之后必须是分隔符或结尾，不能是更长编号的前缀（§3.8 不得匹配 §3.81）
+        t == section
+            || t.strip_prefix(section)
+                .map(|r| r.starts_with(|c: char| c.is_whitespace() || c == '\u{3000}'))
+                .unwrap_or(false)
+    })
+}
+
+/// 判定一段正文里对设计文档的交叉引用是否仍然有效（REQ-004 G3）。
+///
+/// 两种失效**用不同措辞**报告，因为修法不同：
+/// - 文件不存在 → 重命名/移动了文档，或引用写错路径
+/// - 文件在但小节号不存在 → 小节被重命名（最常见：设计文档演进后忘了同步引用）
+pub fn check_cross_refs(root: &Path, section: &str, first_line: usize) -> Vec<CrossRefIssue> {
+    let mut out = Vec::new();
+    for r in cross_refs(section, first_line) {
+        let path = root.join(&r.path);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            out.push(CrossRefIssue {
+                line: r.line,
+                path: r.path.clone(),
+                section: r.section.clone(),
+                target_missing: true,
+            });
+            continue;
+        };
+        if !has_section_heading(&text, &r.section) {
+            out.push(CrossRefIssue {
+                line: r.line,
+                path: r.path,
+                section: r.section,
+                target_missing: false,
+            });
+        }
+    }
+    out
+}
+
+/// 一条失效的交叉引用。
+#[derive(Debug, Clone)]
+pub struct CrossRefIssue {
+    pub line: usize,
+    pub path: String,
+    pub section: String,
+    /// `true` = 目标文件不存在；`false` = 文件在但小节号不存在。
+    pub target_missing: bool,
+}
+
 /// 抽出一段正文里的声明条目（**纯函数**），返回 `(归一后的路径, 出错的原文, 行号)`。
 ///
 /// `first_line` 是该段首行的 1-based 行号。空行与 `#` 注释被忽略（不是错误）。

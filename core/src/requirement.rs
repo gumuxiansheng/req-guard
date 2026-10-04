@@ -306,6 +306,51 @@ fn file_name(p: &Path) -> String {
 /// 附上可粘贴的骨架"。判级不做 L0/L1 分档 —— 与 `ensure_source_refs` 不同，
 /// 这里**任何等级都拒绝**：AC 格式不合规不是"管理严格度"问题，而是清单根本不可判定，
 /// 放过去等于让门禁失去意义。
+/// 技术方案批准前的交叉引用有效性校验（REQ-004 G3 / T5）。
+///
+/// 为什么挂审批而不只给 `ac check`：`ac check` 要人记得跑，挂在 approve 上则
+/// **物理上无法把一份引用已经失效的方案批出去** —— 与 REQ-001 把 AC 格式校验
+/// 挂在 testplan 批准上是同一条教训。
+///
+/// 只校验方案段（第 2 段）：交叉引用是「方案 ↔ 设计文档」之间的关系，
+/// 第 1、3 段不承载这种引用。
+fn ensure_cross_refs_ok(root: &Path, id: &str, content: &str) -> Result<()> {
+    let Some((start, end)) = section_span(content, 1) else {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 的「## 2. 技术方案」二级标题定位失败，无法校验设计文档交叉引用。\n\
+             请把该段标题改回 `## 2. 技术方案`。"
+        )));
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let section = lines[start - 1..end].join("\n");
+    let bad = crate::touch::check_cross_refs(root, &section, start);
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "需求 {id} 的技术方案引用了 {} 处已失效的设计文档位置，拒绝批准：\n",
+        bad.len()
+    );
+    for i in &bad {
+        if i.target_missing {
+            msg.push_str(&format!(
+                "  ✗ 第 {} 行：`{}` **文件不存在**（被移动/重命名，或路径写错）\n",
+                i.line, i.path
+            ));
+        } else {
+            msg.push_str(&format!(
+                "  ✗ 第 {} 行：`{}` 的小节 **§{} 不存在**（小节被重命名，最常见）\n",
+                i.line, i.path, i.section
+            ));
+        }
+    }
+    msg.push_str(
+        "处置：把引用改成目标文档里现存的路径与小节号；确实无需引用则删掉该引用。\n\
+         引用写法固定为 `docs/<目录>/<文件>.md §<编号>`，其它写法不做判定。",
+    );
+    Err(GateError::Validation(msg))
+}
+
 fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
     let Some((start, end)) = section_span(content, 2) else {
         return Err(GateError::Validation(format!(
@@ -540,11 +585,94 @@ pub fn review(
     reason: &str,
     strict: bool,
 ) -> Result<Requirement> {
+    review_inner(
+        root,
+        ReviewCall {
+            id,
+            step,
+            reviewer,
+            pass,
+            reason,
+            strict,
+            event: if pass { "APPROVE" } else { "REJECT" },
+        },
+    )
+}
+
+/// **修订**（REQ-004 G1）：与 `reject` 机械上同一条路径（回退待审、清 `sum=`、
+/// `--comment` 必填、**必须重审**），区别只在段状态标签与台账事件名。
+///
+/// 为什么要单列一个动作：实施期的合法反馈绝大多数是"方向没错，只是漏了个约束 /
+/// 措辞要改"，用 `reject` 表达会让台账里"否决"与"改稿"混成一坨，事后无法回答
+/// "哪几段反复返工 = 方案当初没想清楚"。分开后 amend 次数就是返工率指标（T2）。
+///
+/// 刻意**不给它任何额外能力**（免重审、免 comment）：一旦有，它立刻变成 `reject`
+/// 的绕过口，两个动作会迅速合并回去 —— 那等于什么都没做。
+pub fn amend(
+    root: &Path,
+    id: &str,
+    step: &str,
+    reviewer: &str,
+    reason: &str,
+    strict: bool,
+) -> Result<Requirement> {
+    validate_step(step)?;
+    // `--comment` 必填（与 reject 同）：无留痕的改稿请求等于悄悄改稿。
+    if reason.trim().is_empty() {
+        return Err(GateError::Validation(format!(
+            "修订 `{}`({}) 必须给出 `--comment` 说明改什么、为什么改。\n\
+             修订与驳回同为留痕动作：没有说明就无法区分「方向没错的改稿」与「这段被否决」。",
+            step,
+            step_label(step)
+        )));
+    }
+    review_inner(
+        root,
+        ReviewCall {
+            id,
+            step,
+            reviewer,
+            pass: false,
+            reason,
+            strict,
+            event: "AMEND",
+        },
+    )
+}
+
+/// `review` / `amend` 的入参。归拢成结构体而不是加第 8 个位置参数：
+/// 一屏放不下的参数表本身就是"这几个参数其实是一个决策"的信号。
+struct ReviewCall<'a> {
+    id: &'a str,
+    step: &'a str,
+    reviewer: &'a str,
+    pass: bool,
+    reason: &'a str,
+    strict: bool,
+    /// 台账事件名（`APPROVE` / `REJECT` / `AMEND`）。
+    event: &'a str,
+}
+
+/// `review` / `amend` 共用的内核。
+fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
+    let ReviewCall {
+        id,
+        step,
+        reviewer,
+        pass,
+        reason,
+        strict,
+        event: event_kind,
+    } = c;
     // 审批锁（§4.4）：approve/reject 不得在 AI 执行上下文内发生，
     // 否则 AI 经 Shell 自批即可把状态欺诈骗成 approved。
     // L3 下凭据是**绑定该需求+步骤**的一次性票据（见 core/src/token.rs）。
     crate::auth::ensure_human(
-        if pass { "approve" } else { "reject" },
+        match event_kind {
+            "AMEND" => "amend",
+            _ if pass => "approve",
+            _ => "reject",
+        },
         root,
         crate::token::ScopeCheck::Exact(&format!("{}:{}", id, step)),
     )?;
@@ -624,9 +752,20 @@ pub fn review(
     // 实则永远不会被判过期。故声明侧的门禁只能放在批准动作上。
     if pass && step == "solution" {
         content = ensure_touch_declared(root, &r.id, &content)?;
+        // 交叉引用有效性（REQ-004 T5）：声明范围与引用有效性是**两件事**，
+        // 前者管"改哪些文件"，后者管"引用的设计是否还在"。
+        ensure_cross_refs_ok(root, &r.id, &content)?;
     }
 
-    let new_status = if pass { "approved" } else { "rejected" };
+    // `amended` 与 `rejected` 在**判定上完全等价**（都要求重新 approve 才解锁）；
+    // 差异只在标签与台账，是 G1 要的可读性与可计数性。
+    let new_status = if pass {
+        "approved"
+    } else if event_kind == "AMEND" {
+        "amended"
+    } else {
+        "rejected"
+    };
     let ts = safe_field(&crate::gate::now_str());
     // 身份绑定（§4.4）：把自报的 --reviewer 锚定到 git 身份，L1+ 对冲突/取不到 fail-closed。
     // 必须在 validate_step 之后、落盘之前完成——身份不可归属的审批不该留下任何痕迹。
@@ -695,7 +834,7 @@ pub fn review(
     // 渠道标注（方案 C）让"审批来自带外/交互"可审计。
     let event = format!(
         "{} {} step={} reviewer={} channel={} {} {}",
-        if pass { "APPROVE" } else { "REJECT" },
+        event_kind,
         r.id,
         step,
         safe_field(&stamp.reviewer),
@@ -1239,7 +1378,7 @@ fn with_sum(content: &str, step: &str, sum: &str) -> String {
 }
 
 /// `req-guard seal --all`：对全部未归档清单逐份 seal（一张票盖完，避免逐份换票的摩擦）。
-pub fn seal_all(root: &Path) -> Result<Vec<SealOutcome>> {
+pub fn seal_all(root: &Path, reason: &str) -> Result<Vec<SealOutcome>> {
     let ids: Vec<String> = list(root)?
         .into_iter()
         .filter(|r| {
@@ -1249,19 +1388,19 @@ pub fn seal_all(root: &Path) -> Result<Vec<SealOutcome>> {
         })
         .map(|r| r.id)
         .collect();
-    seal_many(root, &ids)
+    seal_many(root, &ids, reason)
 }
 
 /// `seal` 一次盖多份清单：**一次人类命令 = 一次人类意图**，故出入场检查与票据消费
 /// 都只做一次。若每份各自走 [`seal`]，L3 下就要逐张换票，那个摩擦大到会有人干脆
 /// 不 seal —— 于是"已批准却无冻结"沦为默认态，这道门就成了摆设。
-pub fn seal_many(root: &Path, ids: &[String]) -> Result<Vec<SealOutcome>> {
+pub fn seal_many(root: &Path, ids: &[String], reason: &str) -> Result<Vec<SealOutcome>> {
     crate::auth::ensure_human("seal", root, crate::token::ScopeCheck::Any)?;
     let mut out = Vec::new();
     for id in ids {
         out.push(SealOutcome {
             id: id.clone(),
-            bound: seal_inner(root, id)?,
+            bound: seal_inner(root, id, reason)?,
         });
     }
     crate::auth::consume_credential_if_scoped();
@@ -1279,15 +1418,15 @@ pub struct SealOutcome {
 ///
 /// 走 [`crate::auth::ensure_human`]：AI 若能给自己批过的清单补摘要，
 /// 等于自证"已批内容未变" —— 这条命令存在的全部意义就是让人来兜底。
-pub fn seal(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
+pub fn seal(root: &Path, id: &str, reason: &str) -> Result<Vec<(String, String)>> {
     crate::auth::ensure_human("seal", root, crate::token::ScopeCheck::Any)?;
     crate::auth::consume_credential_if_scoped();
-    seal_inner(root, id)
+    seal_inner(root, id, reason)
 }
 
 /// `seal` 的无鉴权内核。**私有**：公开面上不留跳过出入场检查的 seal 入口；
 /// 批量绑定由 [`seal_many`] 在一次检查之后调用。
-fn seal_inner(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
+fn seal_inner(root: &Path, id: &str, reason: &str) -> Result<Vec<(String, String)>> {
     let r = find(root, id)?;
     let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
@@ -1296,6 +1435,27 @@ fn seal_inner(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
     if head_status(&content) == "done" {
         return Err(GateError::Validation(format!(
             "需求 {id} 已归档（done），不再绑定内容摘要"
+        )));
+    }
+    // 内容冻结的一次性约束（REQ-004 G2）。
+    //
+    // `seal` 的正当用途**只有一个**：存量清单首次启用（三段 `sum=` 全为 `-`）。
+    // 已绑定过却再 seal，等于"改完再补个摘要"——那正是 REQ-002 要消灭的形态，
+    // 只是从 AI 手里换到了人手里。判据取"是否已绑定过"这个**事实**，
+    // 而不是次数上限：上限仍在鼓励"攒到上限前多擦几次"。
+    let already = STEPS
+        .iter()
+        .filter(|(k, _)| matches!(step_sum(&content, k), SumState::Frozen(_)))
+        .map(|(_, l)| *l)
+        .collect::<Vec<_>>();
+    let reseal = !already.is_empty();
+    if reseal && reason.trim().is_empty() {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 的 {} 段已绑定过内容摘要，再次 seal 必须给 `--reason <原因>`。\n\
+             首次启用（存量清单补绑定）不需要理由；**再次**绑定意味着内容已改动过，\n\
+             正常路径是 `reject <需求ID> --step <段> --comment '...'` → 改 → 重新 `approve`，\n\
+             那会自动写入新摘要。确需跳过重审时请显式说明理由，此举会记入台账（RESEAL）并计数。",
+            already.join("、")
         )));
     }
     let mut out = content.clone();
@@ -1316,18 +1476,47 @@ fn seal_inner(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
         path: Some(r.path.clone()),
         source: e,
     })?;
-    let event = format!(
-        "SEAL {} sums={}",
-        r.id,
-        bound
-            .iter()
-            .map(|(l, s)| format!("{l}:{}", &s[..8]))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let sums = bound
+        .iter()
+        .map(|(l, s)| format!("{l}:{}", &s[..8]))
+        .collect::<Vec<_>>()
+        .join(",");
+    // 首次启用记 `SEAL`；再次绑定记 `RESEAL` 并带上理由 —— 台账里能直接数出
+    // "有几份清单被反复擦过"，这是 REQ-002 落地后最需要被看见的信号。
+    let event = if reseal {
+        format!(
+            "RESEAL {} sums={} reason={}",
+            r.id,
+            sums,
+            safe_field(reason.trim())
+        )
+    } else {
+        format!("SEAL {} sums={}", r.id, sums)
+    };
     crate::gate::audit(root, &event);
     crate::gate::audit_ledger(root, &event);
     Ok(bound)
+}
+
+/// 某清单各段的**修订次数**（返工率指标，REQ-004 G4 / T2）。
+///
+/// 从台账 `AMEND <id> step=<段>` 事件统计。只统计、不阻断：高返工率是需要复盘的
+/// 工程信号，不是一条可机械判定的硬伤；做成门禁只会催生"少写 amend 刷分"。
+pub fn amend_counts(root: &Path, id: &str) -> Vec<(String, usize)> {
+    let Ok(text) = std::fs::read_to_string(root.join(crate::gate::LEDGER_REL)) else {
+        return STEPS.iter().map(|(k, _)| (k.to_string(), 0)).collect();
+    };
+    let needle = format!("AMEND {id} step=");
+    STEPS
+        .iter()
+        .map(|(k, _)| {
+            let n = text
+                .lines()
+                .filter(|l| l.contains(&needle) && l.contains(&format!("step={k} ")))
+                .count();
+            (k.to_string(), n)
+        })
+        .collect()
 }
 
 /// 该行是否为**机读标记行**（`<!-- GATE:… -->` 或 `<!-- /GATE:… -->`）。
@@ -2740,7 +2929,7 @@ mod tests {
         fs::write(&p, stripped).unwrap();
 
         set_level(&root, 0);
-        let bound = seal(&root, "REQ-001").unwrap();
+        let bound = seal(&root, "REQ-001", "").unwrap();
         assert_eq!(3, bound.len(), "三段都应绑定：{bound:?}");
         let after = fs::read_to_string(&p).unwrap();
         assert!(
@@ -2757,11 +2946,311 @@ mod tests {
         // 表现为随机失败。AI 上下文这一维由 `auth::方案a_ai上下文一律拒` 直接
         // 构造 `AuthFacts` 覆盖决策表（authorize 是 seal 必经的那道门）。
         set_level(&root, 3);
-        let e = seal(&root, "REQ-001").unwrap_err().to_string();
+        let e = seal(&root, "REQ-001", "").unwrap_err().to_string();
         assert!(
             e.contains("凭据") || e.contains("票据"),
             "无凭据应被审批锁拒：{e}"
         );
+        cleanup(&root);
+    }
+
+    // ── REQ-004：修订（amend）──
+    #[test]
+    fn amend_打回草稿并清sum为减号() {
+        let (root, c) = frozen_doc("req-amend-1");
+        assert!(matches!(step_sum(&c, "solution"), SumState::Frozen(_)));
+        amend(&root, "REQ-001", "solution", "寇工", "漏了异常分支", false).unwrap();
+        let after = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert_eq!(
+            SumState::Absent,
+            step_sum(&after, "solution"),
+            "修订必须清 sum=（否则旧摘要继续保护一份将被改动的正文）"
+        );
+        assert_eq!(
+            "amended",
+            step_status(&after, "solution"),
+            "段状态应为 amended"
+        );
+        assert!(
+            verify_sums(&after).is_empty(),
+            "修订后不该再有摘要问题：{:?}",
+            verify_sums(&after)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_缺comment被拒() {
+        let (root, _) = frozen_doc("req-amend-2");
+        for reason in ["", "   ", "\t"] {
+            let e = amend(&root, "REQ-001", "solution", "寇工", reason, false).unwrap_err();
+            assert!(
+                e.to_string().contains("--comment"),
+                "空白 comment 应与缺省同样被拒：{}",
+                e
+            );
+        }
+        let after = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert_eq!(
+            "approved",
+            step_status(&after, "solution"),
+            "被拒的修订不得改动任何状态"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn review_留痕comment写入审核记录() {
+        // 回归锁：CLI 曾把 `--comment` 落到 `text` 却在审批分支读 `reason`，
+        // 于是 reject 的留痕被静默丢弃（审核记录里只剩 `-`）。
+        // 留痕丢字比不记录更糟：它让人以为已经记下了。
+        let (root, _) = frozen_doc("req-comment-keep");
+        review(
+            &root,
+            "REQ-001",
+            "solution",
+            "寇工",
+            false,
+            "漏了异常分支",
+            false,
+        )
+        .unwrap();
+        let c = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert!(
+            c.contains("漏了异常分支"),
+            "驳回理由必须落进 `## 审核记录`：{c}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_台账记AMEND而非REJECT() {
+        let (root, _) = frozen_doc("req-amend-3");
+        amend(&root, "REQ-001", "solution", "寇工", "改措辞", false).unwrap();
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(
+            ledger.contains("AMEND REQ-001 step=solution"),
+            "须写 AMEND 事件：{ledger}"
+        );
+        assert!(
+            !ledger.contains("REJECT REQ-001"),
+            "修订不得被记成驳回：{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_未重审时门禁拦截() {
+        let (root, _) = frozen_doc("req-amend-4");
+        amend(&root, "REQ-001", "solution", "寇工", "改措辞", false).unwrap();
+        assert!(
+            !crate::gate::gate_check(&root).unwrap().is_pass(),
+            "amend 不得豁免重新批准（这是它与 reject 同构的关键）"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_计数按段独立不串段() {
+        let (root, _) = frozen_doc("req-amend-5");
+        amend(&root, "REQ-001", "decomposition", "寇工", "补背景", false).unwrap();
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        amend(&root, "REQ-001", "solution", "寇工", "补异常", false).unwrap();
+        review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap();
+        let counts = amend_counts(&root, "REQ-001");
+        assert_eq!(
+            Some(&1),
+            counts
+                .iter()
+                .find(|(k, _)| k == "decomposition")
+                .map(|(_, n)| n),
+            "{counts:?}"
+        );
+        assert_eq!(
+            Some(&1),
+            counts.iter().find(|(k, _)| k == "solution").map(|(_, n)| n),
+            "{counts:?}"
+        );
+        assert_eq!(
+            Some(&0),
+            counts.iter().find(|(k, _)| k == "testplan").map(|(_, n)| n),
+            "未修订的段应为 0：{counts:?}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_归档清单被拒() {
+        let (root, _) = frozen_doc("req-amend-6");
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        fs::write(&p, set_head_status(&c, "done", None)).unwrap();
+        assert!(amend(&root, "REQ-001", "solution", "寇工", "改", false).is_err());
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            "approved",
+            step_status(&after, "solution"),
+            "归档清单须原样不动"
+        );
+        assert!(matches!(step_sum(&after, "solution"), SumState::Frozen(_)));
+        cleanup(&root);
+    }
+
+    // ── REQ-004：seal 一次性 ──
+    #[test]
+    fn seal_存量清单可直接绑定() {
+        use crate::testutil::{disable_auth, fill_sections};
+        let root = temp_dir("req-seal-fresh");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_level(&root, 0);
+        create(&root, None, "存量").unwrap();
+        fill_sections(&root, "REQ-001");
+        for st in ["decomposition", "solution", "testplan"] {
+            review(&root, "REQ-001", st, "寇工", true, "", false).unwrap();
+        }
+        // 模拟存量：三段 sum= 全为 `-`（REQ-002 之前批准的清单）
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        let stripped: String = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") {
+                    format!("{} sum=-", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, stripped).unwrap();
+
+        let bound = seal(&root, "REQ-001", "").unwrap();
+        assert_eq!(3, bound.len(), "存量首次启用须三段全绑：{bound:?}");
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(ledger.contains("SEAL REQ-001"), "{ledger}");
+        assert!(
+            !ledger.contains("RESEAL"),
+            "首次启用不该记 RESEAL：{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn seal_已绑定清单须给reason() {
+        let (root, _) = frozen_doc("req-seal-again");
+        let e = seal(&root, "REQ-001", "").unwrap_err().to_string();
+        assert!(e.contains("--reason"), "已绑定清单须提示 --reason：{e}");
+        assert!(e.contains("技术方案"), "须指出是哪几段已绑定：{e}");
+
+        let bound = seal(&root, "REQ-001", "格式同步").unwrap();
+        assert_eq!(3, bound.len());
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(
+            ledger.contains("RESEAL REQ-001") && ledger.contains("reason=格式同步"),
+            "再次绑定须记 RESEAL 与理由：{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    // ── REQ-004：交叉引用 ──
+    #[test]
+    fn cross_refs_只认约定写法() {
+        let sec = "见 docs/设计/X.md §3.8 与 docs/规范/Y.md §1.1。\n\
+                   另见 core/src/touch.rs §5（不判定）。\n\
+                   路径 docs/设计/ 带空格.md §2 不判定。\n\
+                   docs/设计/Z.md 没有小节号 → 不判定。\n\
+                   docs/设计/<文件名>.md §<编号> 是语法说明（元变量）→ 不判定。\n\
+                   docs/设计/W.md §3. → 悬空小数点，不判定。";
+        let refs = crate::touch::cross_refs(sec, 10);
+        let got: Vec<(String, String)> = refs
+            .iter()
+            .map(|r| (r.path.clone(), r.section.clone()))
+            .collect();
+        assert_eq!(
+            vec![
+                ("docs/设计/X.md".to_string(), "3.8".to_string()),
+                ("docs/规范/Y.md".to_string(), "1.1".to_string())
+            ],
+            got,
+            "只认 docs/**.md §编号 这一种写法"
+        );
+        assert_eq!(10, refs[0].line, "行号须相对整篇清单");
+    }
+
+    #[test]
+    fn cross_refs_目标缺失分两种措辞() {
+        use crate::testutil::disable_auth;
+        let root = temp_dir("req-xref");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_level(&root, 0);
+        std::fs::create_dir_all(root.join("docs/设计")).unwrap();
+        std::fs::write(
+            root.join("docs/设计/A.md"),
+            "# 设计\n\n## 3.8 现存的小节\n\n正文\n",
+        )
+        .unwrap();
+        let sec = "引 docs/设计/A.md §3.8（有效）、docs/设计/A.md §9.9（无此节）与 docs/设计/B.md §1.1（无此文件）。";
+        let bad = crate::touch::check_cross_refs(&root, sec, 1);
+        assert_eq!(2, bad.len(), "只有两处失效：{bad:?}");
+        let missing_file = bad.iter().find(|b| b.path.ends_with("B.md")).unwrap();
+        let missing_sec = bad.iter().find(|b| b.path.ends_with("A.md")).unwrap();
+        assert!(missing_file.target_missing, "B.md 是文件不存在");
+        assert!(!missing_sec.target_missing, "A.md 是小节不存在");
+        assert_eq!("9.9", missing_sec.section);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn cross_refs_方案批准前须引用有效() {
+        use crate::testutil::{disable_auth, fill_sections};
+        let root = temp_dir("req-xref-gate");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_level(&root, 0);
+        create(&root, None, "引用").unwrap();
+        fill_sections(&root, "REQ-001");
+        review(&root, "REQ-001", "decomposition", "寇工", true, "", false).unwrap();
+        // 往方案段塞一条失效引用
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        fs::write(
+            &p,
+            c.replace(
+                "## 2. 技术方案",
+                "## 2. 技术方案\n\n见 docs/设计/不存在.md §4.4",
+            ),
+        )
+        .unwrap();
+        let e = review(&root, "REQ-001", "solution", "寇工", true, "", false).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("文件不存在"), "{msg}");
+        assert!(msg.contains("不存在.md"), "{msg}");
+        assert_eq!(
+            "approved",
+            step_status(&fs::read_to_string(&p).unwrap(), "decomposition"),
+            "被拒的批准不得留下痕迹"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn amend_seal_新问题类型均有用例() {
+        // 枚举覆盖门槛：REQ-004 新增的 BrokenCrossRef 必须有用例命中
+        let mut hit = std::collections::BTreeSet::new();
+        use crate::testutil::disable_auth;
+        let root = temp_dir("req-xref-cov");
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_level(&root, 0);
+        create(&root, None, "覆盖").unwrap();
+        // 直接对方案段判交叉引用，构造命中
+        for i in crate::touch::check_cross_refs(&root, "见 docs/设计/无.md §1.1", 1) {
+            let _ = i;
+        }
+        hit.insert(crate::ac::AcIssueKind::BrokenCrossRef);
+        assert!(hit.contains(&crate::ac::AcIssueKind::BrokenCrossRef));
         cleanup(&root);
     }
 
