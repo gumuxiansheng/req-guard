@@ -14,3 +14,6 @@ gui/assets/unicodes.txt
 /.codebuddy/settings.json
 /.codex/hooks.json
 /.cursor/hooks.json
+
+# 草稿区（AI 拟改清单内容的暂存处，工作态；apply 消费后即删除）
+/.gates/drafts

@@ -94,6 +94,20 @@ fn run(a: &cli::Args) -> Result<()> {
                 r.id
             );
         }
+        Action::Apply => {
+            let id = a.id.as_deref().unwrap_or("");
+            let step = a.step.as_deref().unwrap_or("");
+            let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
+            let r = requirement::apply(root, id, step, &reviewer, comment_of(a))?;
+            // 明示"草稿已消费"：草稿文件已删除，重复 apply 会报未找到草稿。
+            println!(
+                "✅ 已应用草稿并重新批准：{} / {}（{}，审核人 {}）\n   该段已绑定新摘要，草稿已消费。",
+                r.id,
+                step,
+                requirement::step_label(step),
+                reviewer
+            );
+        }
         Action::Amend => {
             let id = a.id.as_deref().unwrap_or("");
             let step = a.step.as_deref().unwrap_or("");

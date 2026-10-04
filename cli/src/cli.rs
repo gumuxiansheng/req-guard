@@ -74,6 +74,8 @@ pub enum Action {
     Seal,
     /// 修订：与 reject 同构，台账记 AMEND（REQ-004 G1）
     Amend,
+    /// 一次命令完成「读草稿 → 写正文 → 重新批准」（REQ-007）
+    Apply,
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
     /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
@@ -265,6 +267,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
         "verify-content" => Action::VerifyContent,
         "seal" => Action::Seal,
         "amend" => Action::Amend,
+        "apply" => Action::Apply,
         "ui" => Action::Ui,
         "hook-check" => Action::HookCheck,
         "-h" | "--help" => return Err(help()),
@@ -403,7 +406,9 @@ fn help() -> String {
   approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
   reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
   amend    <需求ID> --step <步骤> --comment <意见>    修订（回退待审+清摘要，必须重审）\n\
-                             --reviewer 可省略：缺省取 git 身份（user.name）\n\
+                             --reviewer 可省略：缺省取 git 身份（user.name）\n\\
+  apply    <需求ID> --step <步骤> --comment <意见>    一次完成修订：读 .gates/drafts/<需求ID>.draft.md\n\
+                             写入正文 + 重新批准 + 绑定新摘要（AI 禁止执行）\n\
   comment  <需求ID> --author <姓名> --text <意见> [--step <步骤>]\n\
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
   resolve  <需求ID> <评论ID> --author <姓名>    关闭评论（AI 禁止调用）\n\

@@ -1226,6 +1226,10 @@ pub fn gitignore_lines() -> Vec<String> {
     for t in TOOL_PROFILES.iter() {
         out.push(format!("/{}", t.config));
     }
+    // 草稿区（REQ-007）：AI 拟改内容的暂存处，是**工作态** ——
+    // 可能含尚未成形的表述，入库会误提交半成品；不入库则 apply 前它只在本地。
+    // 草稿被 apply 消费后即删除，所以正常情况下这里长期为空。
+    out.push(format!("/{}", crate::requirement::DRAFTS_DIR));
     out
 }
 
@@ -1689,12 +1693,12 @@ fn append_gitignore(
     if !nc.is_empty() {
         nc.push('\n');
     }
-    // 分两组写，并**只在该组真有内容时写标题** —— 否则重复 `install` 会留下一行
+    // 分三组写，并**只在该组真有内容时写标题** —— 否则重复 `install` 会留下一行
     // 孤零零的注释（"本机运行态"下面什么都没有），读的人会以为配置漏了。
-    let runtime: Vec<&String> = missing
-        .iter()
-        .filter(|l| GITIGNORE_LINES.contains(&l.as_str()))
-        .collect();
+    let is_runtime = |l: &String| GITIGNORE_LINES.contains(&l.as_str());
+    let is_drafts = |l: &String| l == &format!("/{}", crate::requirement::DRAFTS_DIR);
+
+    let runtime: Vec<&String> = missing.iter().filter(|l| is_runtime(l)).collect();
     if !runtime.is_empty() {
         nc.push_str("# req-guard 门禁本机运行态（不入库）\n");
         for l in runtime {
@@ -1702,9 +1706,17 @@ fn append_gitignore(
             nc.push('\n');
         }
     }
+    let drafts: Vec<&String> = missing.iter().filter(|l| is_drafts(l)).collect();
+    if !drafts.is_empty() {
+        nc.push_str("# 草稿区（AI 拟改清单内容的暂存处，工作态；apply 消费后即删除）\n");
+        for l in drafts {
+            nc.push_str(l);
+            nc.push('\n');
+        }
+    }
     let tool_lines: Vec<&String> = missing
         .iter()
-        .filter(|l| !GITIGNORE_LINES.contains(&l.as_str()))
+        .filter(|l| !is_runtime(l) && !is_drafts(l))
         .collect();
     if !tool_lines.is_empty() {
         nc.push_str(

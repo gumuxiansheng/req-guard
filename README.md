@@ -163,7 +163,7 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `amend` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `verify-content` `seal` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
+`init` `create` `approve` `reject` `amend` `apply` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `verify-content` `seal` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
 （`ac check [<需求ID>] [--all]` 校验清单内容：第 3 段验收标准（编号连续 +
 Given/When/Then 齐备）+ **三段实质正文**（模板占位不算）；硬伤退出码 1；
 `approve` 时已跑同一判据，CI 这一步是服务端兜底）
