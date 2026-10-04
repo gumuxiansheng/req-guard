@@ -280,6 +280,98 @@ def verify_section_gate() -> bool:
     return ok
 
 
+SUM_FIELD = "sum=" + "a" * 64
+
+
+def verify_content_freeze() -> bool:
+    """29–31 内容冻结场景（REQ-002）。
+
+    29/30 用 `req-guard verify-content` 直接验判定；31 验脚本在**二进制缺失**时
+    fail-closed —— 那是最容易漏的一格（看起来在拦，实际因为找不到命令而恒拦）。
+    """
+    if not BIN.exists():
+        print("SKIP  29-31_内容冻结: 未构建 req-guard 二进制")
+        return True
+
+    ok = True
+    req = (
+        "# REQ-001 内容冻结\n\n"
+        "<!-- GATE:HEAD id=REQ-001 status=approved created=2026-01-01 -->\n"
+        "<!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n"
+        "<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n"
+        "<!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=t updated=- "
+        + SUM_FIELD + " -->\n\n"
+        "## 1. 需求分解\n\n- 背景：内容冻结演示。\n\n"
+        "## 2. 技术方案\n\n<!-- GATE:TOUCH -->\nsrc/**\n<!-- /GATE:TOUCH -->\n"
+        "\n- 思路：原始内容。\n\n"
+        "## 3. 测试计划\n\n<!-- GATE:AC -->\n### AC-001\n"
+        "- Given: 已批准\n- When: 执行 check\n- Then: 退出码 0\n<!-- /GATE:AC -->\n"
+        "\n- 用例：见上。\n\n## 审核记录\n"
+    )
+
+    # 摘要要对得上才算"一致"，故先让 req-guard 自己 seal 一遍再改内容
+    for name, mutate, expect in [
+        ("29_已批准段摘要一致则放行", False, 0),
+        ("30_已批准段被改则拦截", True, 1),
+    ]:
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{name}"))
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        subprocess.run(
+            [str(BIN), "init", "-p", ".", "--tool", "none"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        (work / REQ_DIR).mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        (work / REQ_DIR / "REQ-001.md").write_text(req, encoding="utf-8")
+        # 用真实 seal 绑定当前正文（沙箱 L0）
+        yaml = work / ".gates" / "req-guard.yaml"
+        if yaml.exists():
+            yaml.write_text(
+                yaml.read_text(encoding="utf-8").replace("level: 3", "level: 0"),
+                encoding="utf-8",
+            )
+        subprocess.run(
+            [str(BIN), "seal", "REQ-001", "-p", "."],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        if mutate:
+            f = work / REQ_DIR / "REQ-001.md"
+            f.write_text(
+                f.read_text(encoding="utf-8").replace("- 思路：原始内容。", "- 思路：偷偷改。"),
+                encoding="utf-8",
+            )
+        r = subprocess.run(
+            [str(BIN), "verify-content", "-p", "."],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
+        )
+        good = r.returncode == expect
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {name}: exit={r.returncode} (期望 {expect})")
+        if not good:
+            print(f"      ↳ {(r.stdout + r.stderr)[:300]}")
+
+    # 31_二进制缺失 → 脚本 fail-closed（不能因为找不到命令就静默放行）
+    work = Path(tempfile.mkdtemp(prefix="reqguard-31"))
+    (work / REQ_DIR).mkdir(parents=True)
+    (work / HOOK_REL).parent.mkdir(parents=True, exist_ok=True)
+    (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+    (work / REQ_DIR / "REQ-001.md").write_text(req, encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = ""  # 彻底没有 req-guard
+    r = subprocess.run(
+        [SH, str(work / HOOK_REL)],
+        cwd=work, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, env=env, **RUN_KW,
+    )
+    good = r.returncode == 1 and "req-guard" in (r.stdout + r.stderr)
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  31_二进制缺失fail_closed: exit={r.returncode} (期望 1 且提示缺二进制)")
+    return ok
+
+
 def verify_touch_gate() -> bool:
     """19–25 变更范围契约场景（设计文档 §6.4）。
 
@@ -434,6 +526,7 @@ def verify_pre_commit_fail_closed() -> bool:
 
 ok = ok and verify_pre_commit_fail_closed()
 ok = ok and verify_touch_gate()
+ok = ok and verify_content_freeze()
 ok = ok and verify_section_gate()
 
 

@@ -434,6 +434,8 @@ fn run(a: &cli::Args) -> Result<()> {
         Action::Token { ref sub } => run_token(root, a, sub)?,
         Action::Ac { ref sub } => run_ac(root, a, sub)?,
         Action::TouchCheck => run_touch_check(root, a)?,
+        Action::VerifyContent => run_verify_content(root, a)?,
+        Action::Seal => run_seal(root, a)?,
         Action::Touch { ref sub } => run_touch(root, a, sub)?,
         Action::Ui => run_ui(root, a)?,
     }
@@ -846,5 +848,98 @@ fn run_touch(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
     if gate::touch_reapprove(root) {
         println!("   技术方案已打回 pending —— 范围扩张须重新过审（req-guard approve {id} --step solution）");
     }
+    Ok(())
+}
+
+/// `req-guard verify-content`：已批准段的正文冻结校验（判定在 [`requirement::verify_sums`]）。
+///
+/// 由 `.gates/hooks/req-guard-check.sh` 第 3.5 段调用，也可手工执行。
+/// 退出码 1 表示"已批准段的正文与批准时不一致"—— 本机与 CI 共用这一份判定。
+/// `req-guard verify-content`：已批准段的正文冻结校验（判定在 [`requirement::verify_sums`]）。
+///
+/// 由 `.gates/hooks/req-guard-check.sh` 第 3.5 段调用，也可手工执行。
+/// 退出码 1 表示"已批准段的正文与批准时不一致" —— 本机与 CI 共用这一份判定。
+fn run_verify_content(root: &Path, a: &cli::Args) -> Result<()> {
+    let reqs = match a.id.as_deref() {
+        // 容忍 `REQ-003.md`：脚本里拿到的就是带扩展名的文件名，人类也常这么敲。
+        // 两种写法都拼成 `REQ-003.md.md` 的话，钩子会静默变成"永远查不到需求"。
+        Some(id) => vec![requirement::find(root, id.strip_suffix(".md").unwrap_or(id))?],
+        None => requirement::list(root)?,
+    };
+    // 计数而非借用：SumIssue 逐清单生成，借用会短于循环体
+    let mut errs = 0usize;
+    let mut warns = 0usize;
+    let mut checked = 0usize;
+    for r in &reqs {
+        let content = std::fs::read_to_string(&r.path).unwrap_or_default();
+        if requirement::head_status(&content) == "done" {
+            continue; // 已归档是生命周期终点，不再校验其摘要
+        }
+        if !requirement::frozen_sections(&content).is_empty() {
+            checked += 1;
+        }
+        for i in requirement::verify_sums(&content) {
+            let line = format!("{} {}", r.id, i.message);
+            if i.severity.is_error() {
+                errs += 1;
+                println!("✗ [错误] [{}] {}", i.kind.as_str(), line);
+            } else {
+                warns += 1;
+                println!("⚠️ [警告] [{}] {}", i.kind.as_str(), line);
+            }
+        }
+    }
+    if errs == 0 {
+        if checked == 0 {
+            println!(
+                "⚠️ 没有任何已批准段绑定内容冻结（sum=-）：批准后正文可被改动而无人察觉。\n\
+                 执行 req-guard seal <需求ID> 可绑定当前内容。"
+            );
+        } else {
+            println!("✅ 内容冻结校验通过：{checked} 份清单的已批准段正文与批准时一致");
+        }
+    }
+    if errs > 0 {
+        eprintln!("共 {errs} 项硬伤；处置见上方文案（reject 后重审 / seal 重新绑定）");
+        std::process::exit(1);
+    } else if warns > 0 {
+        println!("共 {warns} 项告警（不阻断）");
+    }
+    Ok(())
+}
+
+/// `req-guard seal`：绑定 `sum=` 到当前正文。AI 不得执行（`ensure_human` 会拦）。
+fn run_seal(root: &Path, a: &cli::Args) -> Result<()> {
+    let Some(spec) = a.id.as_deref() else {
+        return Err(GateError::Validation(
+            "用法：req-guard seal <需求ID> [<需求ID> ...]".into(),
+        ));
+    };
+    // 支持一次 seal 多份清单：L3 票据用后即废，而"逐份换票"的摩擦大到会有人干脆
+    // 不 seal —— 于是"已批准却无冻结"就成了默认态，等于把这道门-optional。
+    let ids: Vec<String> = spec
+        .split([',', ' ', '、'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let outcomes = if ids.iter().any(|i| i == "ALL") {
+        requirement::seal_all(root)?
+    } else {
+        requirement::seal_many(root, &ids)?
+    };
+    if outcomes.is_empty() {
+        println!("没有未归档的需求清单可绑定");
+        return Ok(());
+    }
+    let mut n = 0;
+    for o in &outcomes {
+        n += o.bound.len();
+        println!("✅ {} 已绑定 {} 段：", o.id, o.bound.len());
+        for (label, sum) in &o.bound {
+            println!("   {label:<8} sum={}…", &sum[..8]);
+        }
+    }
+    println!("\n共绑定 {n} 段。今后改动这些段都需要 reject → 重审；确实无需重审时再次执行本命令。");
     Ok(())
 }

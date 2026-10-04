@@ -639,9 +639,26 @@ pub fn review(
     for line in content.lines() {
         if is_marker_line(line) && line.contains("GATE:STEP") && token(line, "name") == step {
             let label = token(line, "label");
+            // 内容冻结：approve 绑定**本次所批内容**的摘要；reject 写 `-`
+            // （被拒绝的内容没有"已批准的正文"需要保护，留着旧摘要只会
+            //  在下一轮 approve 前继续"保护"一份已经过时的内容）。
+            let sum = if pass {
+                match section_sum(&content, step_index(step).unwrap_or(0)) {
+                    Some(v) => v,
+                    None => {
+                        return Err(GateError::Validation(format!(
+                            "需求 {id} 的「{label}」段二级标题定位失败，无法绑定内容摘要。\n\
+                             请把该段标题改回 `## {} . {label}`",
+                            step_index(step).unwrap_or(0) + 1
+                        )))
+                    }
+                }
+            } else {
+                "-".to_string()
+            };
             out.push_str(&format!(
-                "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} -->\n",
-                step, label, new_status, rv, em, sg, ts
+                "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} sum={} -->\n",
+                step, label, new_status, rv, em, sg, ts, sum
             ));
         } else {
             out.push_str(line);
@@ -1035,6 +1052,284 @@ pub fn token(line: &str, key: &str) -> String {
     String::new()
 }
 
+// ===================== 内容冻结：批准与内容绑定 =====================
+
+/// 某一步的内容冻结状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SumState {
+    /// 已绑定：状态 approved 且 `sum=` 是合法的 64 位十六进制。
+    Frozen(String),
+    /// 未绑定：`sum=` 缺失或为 `-`（含存量清单）。
+    Absent,
+    /// 字段存在但格式非法（被手改坏了）——**不得当成通过**。
+    Malformed(String),
+}
+
+/// 该段正文的 SHA-256（64 位十六进制）。
+///
+/// **归一化只做两件事，且都是免费的**：
+/// - 行尾统一：走 [`str::lines`] —— Rust 的 `lines()` 本就把 `\r\n` 切成 `\n`
+///   并丢弃残留的 `\r`，所以 `lines().join("\n")` 天然跨平台一致。
+///   不做这一步，同一份内容在 LF 与 CRLF 平台会算出两个摘要，跨平台 CI 全假红。
+/// - 尾部换行：`lines()` 对 `"a\nb"` 与 `"a\nb\n"` 给出同样的结果，join 后一致。
+///
+/// **刻意不做**去首尾空白之类的"更友好"归一：那些归一会让真实改动藏起来。
+/// 摘要的作用是"逐字未变"，任何宽容都削弱它。
+pub fn section_sum(content: &str, step: usize) -> Option<String> {
+    let (start, end) = section_span(content, step)?;
+    let lines: Vec<&str> = content.lines().collect();
+    Some(crate::digest::sha256_hex(
+        lines[start - 1..end].join("\n").as_bytes(),
+    ))
+}
+
+/// 某一步的 `sum=` 字段状态。
+pub fn step_sum(content: &str, step: &str) -> SumState {
+    let Some(line) = step_line(content, step) else {
+        return SumState::Absent;
+    };
+    if token(line, "status") != "approved" {
+        // 未批准就没有"已批准的正文"需要保护
+        return SumState::Absent;
+    }
+    let raw = token(line, "sum");
+    if raw.is_empty() || raw == "-" {
+        return SumState::Absent;
+    }
+    if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        SumState::Frozen(raw)
+    } else {
+        SumState::Malformed(raw)
+    }
+}
+
+/// 某一步的下标（按 [`STEPS`]）。
+pub fn step_index(step: &str) -> Option<usize> {
+    STEPS.iter().position(|(k, _)| *k == step)
+}
+
+/// 内容冻结问题类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SumIssueKind {
+    /// 已批准段的正文与批准时不一致（被改过）。
+    ContentChanged,
+    /// 已批准但未绑定摘要（存量清单 / 未 seal）。
+    NotSealed,
+    /// `sum=` 存在但格式非法。
+    MalformedSum,
+    /// 已绑定摘要但该段定位失败 —— 无从校验，fail-closed。
+    SectionMissing,
+}
+
+impl SumIssueKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SumIssueKind::ContentChanged => "ContentChanged",
+            SumIssueKind::NotSealed => "NotSealed",
+            SumIssueKind::MalformedSum => "MalformedSum",
+            SumIssueKind::SectionMissing => "SectionMissing",
+        }
+    }
+}
+
+/// 一条内容冻结问题。
+#[derive(Debug, Clone)]
+pub struct SumIssue {
+    pub severity: crate::issue::Severity,
+    pub kind: SumIssueKind,
+    pub message: String,
+}
+
+/// 校验一份清单的三个步骤：已批准段的正文是否仍与批准时一致（**纯函数**）。
+///
+/// 严重级取向：
+/// - `ContentChanged` / `MalformedSum` / `SectionMissing` → **Error**（fail-closed）
+/// - `NotSealed` → **Warn**（存量清单不能因此卡死，但必须**显式报出** ——
+///   静默跳过等于"看起来有冻结、实际没有"）
+pub fn verify_sums(content: &str) -> Vec<SumIssue> {
+    let mut out = Vec::new();
+    for (idx, (key, label)) in STEPS.iter().enumerate() {
+        match step_sum(content, key) {
+            SumState::Absent => {
+                let line = step_line(content, key);
+                let status = line.map(|l| token(l, "status")).unwrap_or_default();
+                if status == "approved" {
+                    out.push(SumIssue {
+                        severity: crate::issue::Severity::Warn,
+                        kind: SumIssueKind::NotSealed,
+                        message: format!(
+                            "「{label}」已批准但**未启用内容冻结**（sum=-）：\
+                             批准后该段正文可被任意改动而无人察觉。\n\
+                             执行 `req-guard seal <需求ID>` 可绑定当前内容"
+                        ),
+                    });
+                }
+            }
+            SumState::Malformed(raw) => out.push(SumIssue {
+                severity: crate::issue::Severity::Error,
+                kind: SumIssueKind::MalformedSum,
+                message: format!(
+                    "「{label}」的 sum={raw:?} 不是 64 位十六进制摘要 —— 无法校验，不当通过。\n\
+                     请用 `req-guard seal <需求ID>` 重新绑定"
+                ),
+            }),
+            SumState::Frozen(expect) => match section_sum(content, idx) {
+                None => out.push(SumIssue {
+                    severity: crate::issue::Severity::Error,
+                    kind: SumIssueKind::SectionMissing,
+                    message: format!(
+                        "「{label}」已绑定内容摘要，但该段的二级标题定位失败 —— \
+                         无从校验正文是否被改过，故不放行。\n\
+                         请把标题改回第 {} 段的二级标题，或 `req-guard seal <需求ID>` 重新绑定",
+                        idx + 1
+                    ),
+                }),
+                Some(actual) if actual != expect => out.push(SumIssue {
+                    severity: crate::issue::Severity::Error,
+                    kind: SumIssueKind::ContentChanged,
+                    message: format!(
+                        "「{label}」正文与批准时不一致：期望 {}… 实际 {}…。\n\
+                         批准绑定的是**当时那份内容**，改了就必须重新过审。\n\
+                         处置：先 `req-guard reject <需求ID> --step {key} --comment \"内容已变更\"` \
+                         改完再 `approve`；若确实无需重审，用 `req-guard seal <需求ID>` 重新绑定。",
+                        &expect[..8],
+                        &actual[..8]
+                    ),
+                }),
+                Some(_) => {}
+            },
+        }
+    }
+    out
+}
+
+/// 已冻结段清单：`(步骤下标, 摘要)`，供写入侧比对"这次写入改了哪一段"。
+pub fn frozen_sections(content: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (idx, (key, _)) in STEPS.iter().enumerate() {
+        if let SumState::Frozen(sum) = step_sum(content, key) {
+            out.push((idx, sum));
+        }
+    }
+    out
+}
+
+/// 改写 `GATE:STEP` 的 `sum=` 字段（[`seal`] 用；保持其余字段原样）。
+fn with_sum(content: &str, step: &str, sum: &str) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        if is_marker_line(line) && line.contains("GATE:STEP") && token(line, "name") == step {
+            out.push_str(&format!(
+                "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} sum={} -->\n",
+                step,
+                token(line, "label"),
+                token(line, "status"),
+                token(line, "reviewer"),
+                token(line, "email"),
+                token(line, "sig"),
+                token(line, "updated"),
+                sum
+            ));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `req-guard seal --all`：对全部未归档清单逐份 seal（一张票盖完，避免逐份换票的摩擦）。
+pub fn seal_all(root: &Path) -> Result<Vec<SealOutcome>> {
+    let ids: Vec<String> = list(root)?
+        .into_iter()
+        .filter(|r| {
+            std::fs::read_to_string(&r.path)
+                .map(|c| head_status(&c) != "done")
+                .unwrap_or(true)
+        })
+        .map(|r| r.id)
+        .collect();
+    seal_many(root, &ids)
+}
+
+/// `seal` 一次盖多份清单：**一次人类命令 = 一次人类意图**，故出入场检查与票据消费
+/// 都只做一次。若每份各自走 [`seal`]，L3 下就要逐张换票，那个摩擦大到会有人干脆
+/// 不 seal —— 于是"已批准却无冻结"沦为默认态，这道门就成了摆设。
+pub fn seal_many(root: &Path, ids: &[String]) -> Result<Vec<SealOutcome>> {
+    crate::auth::ensure_human("seal", root, crate::token::ScopeCheck::Any)?;
+    let mut out = Vec::new();
+    for id in ids {
+        out.push(SealOutcome {
+            id: id.clone(),
+            bound: seal_inner(root, id)?,
+        });
+    }
+    crate::auth::consume_credential_if_scoped();
+    Ok(out)
+}
+
+/// `seal` 逐份结果：需求 ID 与该清单各段的绑定摘要（段标签 → 摘要）。
+#[derive(Debug, Clone)]
+pub struct SealOutcome {
+    pub id: String,
+    pub bound: Vec<(String, String)>,
+}
+
+/// `req-guard seal`：把三个步骤的 `sum=` 绑定到**当前正文**（不改状态）。
+///
+/// 走 [`crate::auth::ensure_human`]：AI 若能给自己批过的清单补摘要，
+/// 等于自证"已批内容未变" —— 这条命令存在的全部意义就是让人来兜底。
+pub fn seal(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
+    crate::auth::ensure_human("seal", root, crate::token::ScopeCheck::Any)?;
+    crate::auth::consume_credential_if_scoped();
+    seal_inner(root, id)
+}
+
+/// `seal` 的无鉴权内核。**私有**：公开面上不留跳过出入场检查的 seal 入口；
+/// 批量绑定由 [`seal_many`] 在一次检查之后调用。
+fn seal_inner(root: &Path, id: &str) -> Result<Vec<(String, String)>> {
+    let r = find(root, id)?;
+    let content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })?;
+    if head_status(&content) == "done" {
+        return Err(GateError::Validation(format!(
+            "需求 {id} 已归档（done），不再绑定内容摘要"
+        )));
+    }
+    let mut out = content.clone();
+    let mut bound = Vec::new();
+    for (key, label) in STEPS {
+        let idx = step_index(key).unwrap_or(0);
+        let Some(sum) = section_sum(&content, idx) else {
+            return Err(GateError::Validation(format!(
+                "需求 {id} 的「{label}」段二级标题定位失败，无法计算摘要；\
+                 请把该段标题改回第 {} 段的二级标题后重试",
+                idx + 1
+            )));
+        };
+        out = with_sum(&out, key, &sum);
+        bound.push((label.to_string(), sum));
+    }
+    fs::write(&r.path, &out).map_err(|e| GateError::Io {
+        path: Some(r.path.clone()),
+        source: e,
+    })?;
+    let event = format!(
+        "SEAL {} sums={}",
+        r.id,
+        bound
+            .iter()
+            .map(|(l, s)| format!("{l}:{}", &s[..8]))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    crate::gate::audit(root, &event);
+    crate::gate::audit_ledger(root, &event);
+    Ok(bound)
+}
+
 /// 该行是否为**机读标记行**（`<!-- GATE:… -->` 或 `<!-- /GATE:… -->`）。
 ///
 /// **为什么不能按字面量 `contains` 判定**：正文里合法地提到 `GATE:STEP` 是常态 ——
@@ -1077,7 +1372,9 @@ pub fn reopen_step(root: &Path, id: &str, step: &str) -> Result<()> {
             hit = true;
             let label = token(line, "label");
             out.push_str(&format!(
-                "<!-- GATE:STEP name={} label={} status=pending reviewer=- email=- sig=- updated={} -->\n",
+                // sum= 一并清空：内容因 `--declare` 扩张而变了，旧摘要若留着，
+                // 会继续"保护"一份已改动的正文 —— 那正是本功能要消灭的形态。
+                "<!-- GATE:STEP name={} label={} status=pending reviewer=- email=- sig=- updated={} sum=- -->\n",
                 step,
                 label,
                 safe_field(&crate::gate::now_str())
@@ -1839,8 +2136,8 @@ mod tests {
         // 本用例验的是"归档后门禁跳过"，与鉴权无关：降为 L0 以免依赖人类凭据。
         crate::testutil::disable_auth(&root);
         create(&root, None, "已完成").unwrap();
+        fill_sections(&root, "REQ-001");
         for s in ["decomposition", "solution", "testplan"] {
-            fill_sections(&root, "REQ-001");
             review(&root, "REQ-001", s, "寇工", true, "", true).unwrap();
         }
         assert!(crate::gate::gate_check(&root).unwrap().is_pass());
@@ -2193,6 +2490,333 @@ mod tests {
             .is_ok(),
             "reject 不该被 AC 门禁拦住"
         );
+        cleanup(&root);
+    }
+
+    // ---------- REQ-002：内容冻结（批准与内容绑定） ----------
+
+    /// 造一份三段各有指定内容、且三段都已 approve（带 sum=）的清单。
+    fn frozen_doc(tag: &str) -> (std::path::PathBuf, String) {
+        use crate::testutil::{disable_auth, fill_sections};
+        let root = temp_dir(tag);
+        crate::gate::install(&root, &["none".to_string()], false).unwrap();
+        disable_auth(&root);
+        set_level(&root, 0);
+        create(&root, None, "冻结").unwrap();
+        fill_sections(&root, "REQ-001");
+        for st in ["decomposition", "solution", "testplan"] {
+            review(&root, "REQ-001", st, "寇工", true, "", false).unwrap();
+        }
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        (root, c)
+    }
+
+    fn set_level(root: &std::path::Path, n: u8) {
+        crate::testutil::set_auth_level(root, n);
+    }
+
+    fn body_of(c: &str, heading: &str) -> String {
+        let i = c.find(heading).unwrap();
+        c[i..].to_string()
+    }
+
+    #[test]
+    fn approve_写入sum且段正文与批准时一致() {
+        let (root, c) = frozen_doc("req-sum-ok");
+        for (key, expect_frozen) in [
+            ("decomposition", true),
+            ("solution", true),
+            ("testplan", true),
+        ] {
+            assert_eq!(
+                expect_frozen,
+                matches!(step_sum(&c, key), SumState::Frozen(_)),
+                "{key}"
+            );
+        }
+        assert!(
+            verify_sums(&c).is_empty(),
+            "刚批完就该一致：{:?}",
+            verify_sums(&c)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 正文被改_摘要不一致且报出两侧前缀() {
+        let (root, c) = frozen_doc("req-sum-changed");
+        let edited = c.replace("本用例的测试夹具。", "偷偷改过的内容。");
+        let issues = verify_sums(&edited);
+        assert!(!issues.is_empty());
+        let i = issues
+            .iter()
+            .find(|i| i.kind == SumIssueKind::ContentChanged)
+            .expect("应报 ContentChanged");
+        assert_eq!(crate::issue::Severity::Error, i.severity);
+        let bound = match step_sum(&c, "decomposition") {
+            SumState::Frozen(s) => s,
+            _ => unreachable!(),
+        };
+        assert!(
+            i.message.contains(&bound[..8]),
+            "须给出期望摘要：{}",
+            i.message
+        );
+        assert!(
+            i.message.contains("reject"),
+            "须给出修复路径：{}",
+            i.message
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 改回去_即恢复一致() {
+        // 摘要只认内容、不认改过几次
+        let (root, c) = frozen_doc("req-sum-revert");
+        let edited = c.replace("本用例的测试夹具。", "改一下。");
+        assert!(!verify_sums(&edited).is_empty());
+        let back = edited.replace("改一下。", "本用例的测试夹具。");
+        assert!(
+            verify_sums(&back).is_empty(),
+            "改回原样应恢复一致：{:?}",
+            verify_sums(&back)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 行尾差异不影响摘要_CRLF与LF同值() {
+        let lf = "## 1. 需求分解\n\n- 背景。\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let a = section_sum(lf, 0).unwrap();
+        let b = section_sum(&crlf, 0).unwrap();
+        assert_eq!(a, b, "跨平台必须同值，否则 Windows CI 全假红");
+    }
+
+    #[test]
+    fn 摘要只覆盖该段_不因其他段变化而变() {
+        // approve 任何一步都会改写文件头并追加审核记录；摘要若覆盖整篇就会自毁
+        let doc = "<!-- GATE:HEAD id=REQ-001 status=approved -->\n\n## 1. 需求分解\n\n- 背景。\n\n## 2. 技术方案\n\n- 思路。\n";
+        let s1 = section_sum(doc, 0).unwrap();
+        let s2 = section_sum(doc, 1).unwrap();
+        assert_ne!(s1, s2, "不同段的摘要必须不同");
+        assert_eq!(
+            Some(s1.clone()),
+            section_sum(&format!("{doc}额外尾行\n"), 0),
+            "尾部追加不得影响第 1 段"
+        );
+    }
+
+    #[test]
+    fn reject_清sum为减号且可自由编辑() {
+        let (root, c) = frozen_doc("req-sum-reject");
+        assert!(matches!(step_sum(&c, "solution"), SumState::Frozen(_)));
+        review(
+            &root,
+            "REQ-001",
+            "solution",
+            "寇工",
+            false,
+            "内容变更",
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert_eq!(
+            SumState::Absent,
+            step_sum(&after, "solution"),
+            "reject 后不该再冻结"
+        );
+        assert!(verify_sums(&after).is_empty());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn touch_declare_打回solution时同步清空sum() {
+        // 契约扩张改了正文，旧摘要若留着就会"保护"一份已改动的正文
+        let (root, _) = frozen_doc("req-sum-declare");
+        reopen_step(&root, "REQ-001", "solution").unwrap();
+        let after = fs::read_to_string(&find(&root, "REQ-001").unwrap().path).unwrap();
+        assert_eq!(
+            SumState::Absent,
+            step_sum(&after, "solution"),
+            "打回必须清 sum="
+        );
+        let line = step_line(&after, "solution").unwrap();
+        assert!(
+            token(line, "sum") == "-",
+            "sum= 应为 -，实际 {:?}",
+            token(line, "sum")
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 存量清单未启用冻结_报Warn而非阻断() {
+        let mut c = body_of(&frozen_doc("req-sum-legacy").1, "<!-- GATE:STEP");
+        // 模拟存量：三个 sum= 全部抹掉
+        c = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") {
+                    l.replace(&format!(" sum={}", token(l, "sum")), " sum=-")
+                        .to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let issues = verify_sums(&c);
+        assert_eq!(3, issues.len(), "三段都应报未启用：{issues:?}");
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.kind == SumIssueKind::NotSealed && !i.severity.is_error()),
+            "未启用只告警，不阻断存量：{issues:?}"
+        );
+        assert!(
+            issues.iter().all(|i| i.message.contains("seal")),
+            "必须给出补齐路径：{issues:?}"
+        );
+    }
+
+    #[test]
+    fn sum字段非法_不得当成通过() {
+        let (root, c) = frozen_doc("req-sum-bad");
+        let bad = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") && token(l, "name") == "solution" {
+                    format!("{} sum=xyz", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let issues = verify_sums(&bad);
+        let i = issues
+            .iter()
+            .find(|i| i.kind == SumIssueKind::MalformedSum)
+            .expect("应报 MalformedSum");
+        assert!(i.severity.is_error(), "非法摘要必须 fail-closed");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 段标题被删_已绑定摘要时fail_closed() {
+        let (root, c) = frozen_doc("req-sum-nosec");
+        let broken = c.replace("## 2. 技术方案", "### 二、技术方案");
+        let issues = verify_sums(&broken);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.kind == SumIssueKind::SectionMissing && i.severity.is_error()),
+            "有摘要却定位不到段 = 无从校验，必须拦：{issues:?}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn seal_绑定当前正文且AI上下文下拒绝() {
+        let (root, _) = frozen_doc("req-sum-seal");
+        // 抹掉所有 sum= 模拟存量，再 seal
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        let stripped: String = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") {
+                    format!("{} sum=-", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, stripped).unwrap();
+
+        set_level(&root, 0);
+        let bound = seal(&root, "REQ-001").unwrap();
+        assert_eq!(3, bound.len(), "三段都应绑定：{bound:?}");
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(
+            verify_sums(&after).is_empty(),
+            "seal 后应一致：{:?}",
+            verify_sums(&after)
+        );
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        assert!(ledger.contains("SEAL REQ-001"), "须写 SEAL 台账：{ledger}");
+
+        // seal 走的是审批守卫：提高本机等级后无凭据即拒。
+        // 这里**不用 set_var 注入 REQ_GUARD_AI_CTX** —— 那是进程级全局量，并行用例
+        // 会互相看见（本仓库 `auth.rs` 的 `is_ai_context_读进程环境` 同样立此规矩），
+        // 表现为随机失败。AI 上下文这一维由 `auth::方案a_ai上下文一律拒` 直接
+        // 构造 `AuthFacts` 覆盖决策表（authorize 是 seal 必经的那道门）。
+        set_level(&root, 3);
+        let e = seal(&root, "REQ-001").unwrap_err().to_string();
+        assert!(
+            e.contains("凭据") || e.contains("票据"),
+            "无凭据应被审批锁拒：{e}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn summary_枚举覆盖门槛() {
+        use std::collections::BTreeSet;
+        let (root, c) = frozen_doc("req-sum-cover");
+        let mut covered: BTreeSet<SumIssueKind> = BTreeSet::new();
+        for k in verify_sums(&c).iter().map(|i| i.kind) {
+            covered.insert(k);
+        }
+        for k in verify_sums(&c.replace("## 2. 技术方案", "### 二、技术方案"))
+            .iter()
+            .map(|i| i.kind)
+        {
+            covered.insert(k);
+        }
+        // NotSealed：把 sum= 全抹掉（模拟存量清单）
+        let unsealed: String = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") {
+                    format!("{} sum=-", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for k in verify_sums(&unsealed).iter().map(|i| i.kind) {
+            covered.insert(k);
+        }
+        // MalformedSum：把某步的 sum= 写成非法值
+        let bad: String = c
+            .lines()
+            .map(|l| {
+                if is_marker_line(l) && l.contains("GATE:STEP") && token(l, "name") == "solution" {
+                    format!("{} sum=xyz", &l[..l.find(" sum=").unwrap()])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for k in verify_sums(&bad).iter().map(|i| i.kind) {
+            covered.insert(k);
+        }
+        for k in [
+            SumIssueKind::ContentChanged,
+            SumIssueKind::NotSealed,
+            SumIssueKind::MalformedSum,
+            SumIssueKind::SectionMissing,
+        ] {
+            assert!(covered.contains(&k), "SumIssueKind::{k:?} 没有任何用例命中");
+        }
         cleanup(&root);
     }
 }

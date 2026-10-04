@@ -164,6 +164,8 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
 （`ac check [<需求ID>] [--all]` 校验清单内容：第 3 段验收标准（编号连续 +
 Given/When/Then 齐备）+ **三段实质正文**（模板占位不算）；硬伤退出码 1；
 `approve` 时已跑同一判据，CI 这一步是服务端兜底）
+（`verify-content [<需求ID>]` 校验已批准段的正文未被改动 —— `GATE:STEP` 的 `sum=` 绑定
+批准那一刻的内容；`seal <需求ID>` 把摘要绑定到当前正文，AI 禁止执行）
 （`touch-check [--base <ref>]` 校验「实际改动 ⊆ 技术方案段 `GATE:TOUCH` 声明并集」；
 `touch --declare --glob <路径>` 扩张声明范围，AI 禁止调用且会打回技术方案重审；
 CI 侧的 `--base` 是服务端对应物，抵消 `--no-verify`）

@@ -68,6 +68,11 @@ pub fn fill_sections(root: &std::path::Path, id: &str) {
     ] {
         let needle = format!("{heading}\n");
         assert!(c.contains(&needle), "模板结构变了：找不到 {heading}");
+        // **幂等**：已填过就跳过。重复调用会再插一份内容，等于改动了已批准段的正文
+        // —— 内容冻结门禁会（正确地）把夹具自身判成"被偷改"。
+        if c.contains(&format!("{needle}\n{line}")) {
+            continue;
+        }
         c = c.replacen(&needle, &format!("{needle}\n{line}\n"), 1);
     }
     std::fs::write(&p, c).expect("清单应可写");

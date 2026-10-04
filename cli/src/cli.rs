@@ -67,6 +67,10 @@ pub enum Action {
     },
     /// `touch-check`：判定实际改动 ⊆ `GATE:TOUCH` 声明并集。
     TouchCheck,
+    /// `verify-content`：校验已批准段的正文仍与批准时一致（`HOOK_SH` 第 3.5 段调用）。
+    VerifyContent,
+    /// `seal`：把已批准段的 `sum=` 绑定到当前正文（人类专属；存量清单迁移用）。
+    Seal,
     /// 打开门禁管理台（TUI / GUI，按构建 feature 与运行环境自动选择）。
     Ui,
     /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
@@ -255,6 +259,8 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             }
         }
         "touch-check" => Action::TouchCheck,
+        "verify-content" => Action::VerifyContent,
+        "seal" => Action::Seal,
         "ui" => Action::Ui,
         "hook-check" => Action::HookCheck,
         "-h" | "--help" => return Err(help()),
@@ -410,6 +416,8 @@ fn help() -> String {
   ac check [<需求ID>]        验收标准机械校验（A1–A12；硬伤退出码 1）\n\
   ac check --all             同上，且含归档区（审计用，只读）\n\
   touch-check [--base <ref>] 变更范围契约：实际改动 ⊆ GATE:TOUCH 声明并集\n\
+  verify-content [<需求ID>]  校验已批准段正文未被改动（pre-commit 内部调用）\n\
+  seal <需求ID> [...]       把已批准段的 sum= 绑定到当前正文（AI 禁止执行）\n\
   touch --declare --glob <路径> [--glob <glob>...] [--reason <原因>]\n\
                              扩张声明范围（AI 禁止；会打回技术方案重审）\n\
   install  [--tool <a,b>] [--verify]           安装或修复拦截；--verify 只校验就位情况（CI 用）\n\

@@ -45,6 +45,14 @@ pub const DENY_PS1_REL: &str = ".gates/hooks/req-guard-deny.ps1";
 /// 由单测 `hook_脚本输出绕过标记` 锁定两端与本常量一致。
 pub const BYPASS_MARKER: &str = "REQ_GUARD_BYPASS=1";
 
+/// `req-guard check` 代为判定内容冻结后设此变量，脚本据此**跳过**自己的第 3.5 段。
+///
+/// 为什么需要：内容冻结的判定（SHA-256）只能在 core 做，脚本要做就得把二进制
+/// 放进 PATH —— 而 `req-guard check` 本身就是那个二进制。让它反过来依赖自己
+/// 在 PATH 上，既绕（自证）又不稳（PATH 最小化时 `check` 恒拦）。
+/// 分工：**Rust 入口自查 + 告诉脚本"已查过"；pre-commit 直跑脚本时由脚本兜**。
+pub const SUM_CHECKED_ENV: &str = "REQ_GUARD_SUM_CHECKED";
+
 /// 当前平台注入工具配置时引用的拦截脚本**相对路径**（Windows→`.ps1`，其余→`.sh`）。
 ///
 /// 与 [`run_hook`] 同规则：按**编译目标平台**选，不按"哪个文件存在"（install 在任意平台
@@ -721,8 +729,64 @@ fn run_hook(root: &Path) -> Result<(bool, String, String)> {
 /// 放行时同样保留脚本明细：绕过窗口内脚本会输出 [`BYPASS_MARKER`]，据此置
 /// [`GateVerdict::bypassed`] 并把 summary 改成显式警告——绝不能让"靠绕过放行"
 /// 显示成"三段已批准"。
+/// 内容冻结校验的明细行（每条清单一组）。
+fn sum_check_detail(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in match crate::requirement::list(root) {
+        Ok(v) => v,
+        Err(_) => return out,
+    } {
+        let content = std::fs::read_to_string(&r.path).unwrap_or_default();
+        if crate::requirement::head_status(&content) == "done" {
+            continue; // 已归档是生命周期终点
+        }
+        for i in crate::requirement::verify_sums(&content) {
+            let mark = if i.severity.is_error() {
+                "[错误]"
+            } else {
+                "[警告]"
+            };
+            out.push(format!(
+                "{mark} [{}] {} {}",
+                i.kind.as_str(),
+                r.id,
+                i.message.lines().next().unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
 pub fn gate_check(root: &Path) -> Result<GateVerdict> {
-    let (ok, stdout, stderr) = run_hook(root)?;
+    // 内容冻结先自查（core 判定，不经脚本、不依赖 PATH），并把结论并入 detail。
+    // 放在脚本之前：这段判定与"三段是否批准"正交，脚本失败时它依然有效。
+    let sum_detail = sum_check_detail(root);
+    let (ok, stdout, stderr) = {
+        std::env::set_var(SUM_CHECKED_ENV, "1");
+        let r = run_hook(root);
+        std::env::remove_var(SUM_CHECKED_ENV);
+        r
+    }?;
+    if !ok && sum_detail.iter().any(|d| d.contains("[错误]")) {
+        // 脚本已拦；把内容冻结的结论也带出去，避免"两处问题只看到一处"
+        let raw = format!("{}\n{}", stdout, stderr);
+        return Ok(GateVerdict::Block {
+            summary: format!(
+                "⛔ 拦截：{}（共 {} 项）",
+                sum_detail[0].lines().next().unwrap_or("内容冻结校验未通过"),
+                sum_detail.iter().filter(|d| d.contains("[错误]")).count()
+            ),
+            detail: {
+                let mut v: Vec<String> = raw
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.contains(BYPASS_MARKER))
+                    .collect();
+                v.extend(sum_detail);
+                v
+            },
+        });
+    }
     let raw = format!("{}\n{}", stdout, stderr);
     let bypassed = ok && raw.contains(BYPASS_MARKER);
     let detail: Vec<String> = raw
@@ -734,6 +798,14 @@ pub fn gate_check(root: &Path) -> Result<GateVerdict> {
         .collect();
 
     if ok {
+        let mut detail = detail;
+        detail.extend(sum_detail);
+        if !bypassed && detail.iter().any(|d| d.contains("[错误]")) {
+            return Ok(GateVerdict::Block {
+                summary: "⛔ 拦截：已批准段的正文与批准时不一致".to_string(),
+                detail,
+            });
+        }
         let summary = if bypassed {
             "⚠️ 门禁放行：命中应急绕过窗口（三段并非全部批准，已记审计日志）".to_string()
         } else {
@@ -869,6 +941,13 @@ fn doc_write_guard(root: &Path, fp: &str, payload: &str) -> std::result::Result<
         return Ok(());
     }
 
+    // 内容冻结（REQ-002）：**已批准且已绑定摘要**的段，写入不得改动其正文。
+    // 这是最强的一层 —— 状态行比对只能发现"标记行被改"，而正文被改是合法的
+    // （AI 要能写正文），只有摘要能把它和"已批准"这件事绑起来。
+    if let Some(reason) = frozen_section_violation(&disk, &new_text, fp) {
+        return Err(reason);
+    }
+
     let before = gate_lines(&disk);
     let after = gate_lines(&new_text);
     if before != after {
@@ -879,6 +958,38 @@ fn doc_write_guard(root: &Path, fp: &str, payload: &str) -> std::result::Result<
         ));
     }
     Ok(())
+}
+
+/// 写入是否改动了"已批准且已绑定摘要"的段；改动则返回拦截理由。
+///
+/// 只看**磁盘上**的冻结状态：写入不会新增绑定（那只由 `approve`/`seal` 写），
+/// 所以新文本里即使也带着同样的 `sum=`，也不影响"这段本来受保护"这个判断。
+fn frozen_section_violation(disk: &str, new_text: &str, fp: &str) -> Option<String> {
+    for (idx, expect) in crate::requirement::frozen_sections(disk) {
+        let before = crate::requirement::section_sum(disk, idx);
+        let after = crate::requirement::section_sum(new_text, idx);
+        // 段定位失败（标题被这次写入删掉/改坏）同样算改动 ——
+        // 那是"让校验无从进行"的等价手段，与直接改正文同级。
+        if before.as_deref() == Some(expect.as_str()) && after.as_deref() == Some(expect.as_str()) {
+            continue;
+        }
+        let (label, key) = match crate::requirement::STEPS.get(idx) {
+            Some((k, l)) => (l, k),
+            None => continue,
+        };
+        return Some(format!(
+            "{fp}：第 {n} 段「{label}」已被**批准并绑定内容摘要**，本次写入改动了它。\n\
+             批准绑定的是**当时那份内容** —— 改了它，审核人看到的 approved\n\
+             与他当时审的那份就不再是同一份（见 docs/设计/…/REQ-002）。\n\
+             处置：先请审核人 `req-guard reject {fp} --step {key} --comment \"内容已变更\"`，\n\
+             改完重新 `approve`；若本次改动确实无需重审，请审核人执行\n\
+             `req-guard seal <需求ID>` 把当前内容重新绑定。\n\
+             （AI 不得自行执行 seal —— 那等于自证已批内容未变。）",
+            n = idx + 1,
+            fp = fp,
+        ));
+    }
+    None
 }
 
 /// 取出文本里的 GATE 标记行（已 trim），用于比对是否被篡改。
@@ -1939,6 +2050,27 @@ if [ -n "$FAILED" ]; then
   exit 1
 fi
 
+# ---------- 3.5) 已批准段的内容冻结（有 sum= 才需要；缺二进制即 fail-closed） ----------
+# 只在**确实存在绑定摘要**时才调用二进制：存量清单没有 sum=，若无条件调用，
+# 未装二进制的仓库会从"能提交"变成"不能提交"——那是新功能制造的 outage。
+# 一旦有 sum= 却没有 req-guard，就无从校验"批准后正文是否被改"，必须拦。
+if [ -z "${REQ_GUARD_SUM_CHECKED:-}" ] \
+   && grep -q '^<!-- GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null \
+   && grep -q 'sum=[0-9a-f]' "$REQ_DIR/$ACTIVE" 2>/dev/null; then
+  if ! command -v req-guard >/dev/null 2>&1; then
+    log "BLOCK-SUM no-binary"
+    echo "[req-guard] ⛔ 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。" >&2
+    echo "          把 req-guard 加入 PATH 后重试；确需跳过本次：git commit --no-verify" >&2
+    exit 1
+  fi
+  SUM_OUT=$(req-guard verify-content "$ACTIVE" 2>&1) || {
+    log "BLOCK-SUM $ACTIVE"
+    printf '%s\n' "$SUM_OUT" >&2
+    exit 1
+  }
+  printf '%s\n' "$SUM_OUT" >&2
+fi
+
 # ---------- 4) 阻塞性评论必须全部 resolved ----------
 COMMENTS="$REQ_DIR/${ACTIVE%.md}.comments.md"
 if [ -f "$COMMENTS" ] && grep -q 'blocking=true' "$COMMENTS" 2>/dev/null; then
@@ -2055,6 +2187,27 @@ if ($failed.Count -gt 0) {
   Write-GateAudit "BLOCK $($active.Name)"
   Write-Error "[req-guard] 拦截：需求 $($active.Name) 尚未通过审核，AI 不得编写/修改源码。未完成步骤： $($failed -join '; ')"
   exit 1
+}
+
+# ---------- 3.5) 已批准段的内容冻结（与 HOOK_SH 同一判定、同一 fail-closed 取向） ----------
+# 只在确实存在绑定摘要时才调二进制：存量清单没有 sum=，无条件调用会让
+# 未装二进制的仓库从"能提交"变成"不能提交"——那是新功能制造的 outage。
+if (-not $env:REQ_GUARD_SUM_CHECKED) {
+  $hasSum = Select-String -Path $active.FullName -Pattern 'sum=[0-9a-f]' -Quiet
+} else { $hasSum = $false }
+if ($hasSum) {
+  if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
+    Write-GateAudit "BLOCK-SUM no-binary"
+    Write-Error "[req-guard] 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。确需跳过本次：git commit --no-verify"
+    exit 1
+  }
+  $sumOut = & req-guard verify-content $active.Name 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-GateAudit "BLOCK-SUM $($active.Name)"
+    $sumOut | ForEach-Object { Write-Error $_ }
+    exit 1
+  }
+  $sumOut | ForEach-Object { Write-Error $_ }
 }
 
 # ---------- 4) 阻塞性评论必须全部 resolved ----------

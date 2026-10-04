@@ -101,6 +101,27 @@ if [ -n "$FAILED" ]; then
   exit 1
 fi
 
+# ---------- 3.5) 已批准段的内容冻结（有 sum= 才需要；缺二进制即 fail-closed） ----------
+# 只在**确实存在绑定摘要**时才调用二进制：存量清单没有 sum=，若无条件调用，
+# 未装二进制的仓库会从"能提交"变成"不能提交"——那是新功能制造的 outage。
+# 一旦有 sum= 却没有 req-guard，就无从校验"批准后正文是否被改"，必须拦。
+if [ -z "${REQ_GUARD_SUM_CHECKED:-}" ] \
+   && grep -q '^<!-- GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null \
+   && grep -q 'sum=[0-9a-f]' "$REQ_DIR/$ACTIVE" 2>/dev/null; then
+  if ! command -v req-guard >/dev/null 2>&1; then
+    log "BLOCK-SUM no-binary"
+    echo "[req-guard] ⛔ 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。" >&2
+    echo "          把 req-guard 加入 PATH 后重试；确需跳过本次：git commit --no-verify" >&2
+    exit 1
+  fi
+  SUM_OUT=$(req-guard verify-content "$ACTIVE" 2>&1) || {
+    log "BLOCK-SUM $ACTIVE"
+    printf '%s\n' "$SUM_OUT" >&2
+    exit 1
+  }
+  printf '%s\n' "$SUM_OUT" >&2
+fi
+
 # ---------- 4) 阻塞性评论必须全部 resolved ----------
 COMMENTS="$REQ_DIR/${ACTIVE%.md}.comments.md"
 if [ -f "$COMMENTS" ] && grep -q 'blocking=true' "$COMMENTS" 2>/dev/null; then

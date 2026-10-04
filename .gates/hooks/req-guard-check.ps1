@@ -91,6 +91,27 @@ if ($failed.Count -gt 0) {
   exit 1
 }
 
+# ---------- 3.5) 已批准段的内容冻结（与 HOOK_SH 同一判定、同一 fail-closed 取向） ----------
+# 只在确实存在绑定摘要时才调二进制：存量清单没有 sum=，无条件调用会让
+# 未装二进制的仓库从"能提交"变成"不能提交"——那是新功能制造的 outage。
+if (-not $env:REQ_GUARD_SUM_CHECKED) {
+  $hasSum = Select-String -Path $active.FullName -Pattern 'sum=[0-9a-f]' -Quiet
+} else { $hasSum = $false }
+if ($hasSum) {
+  if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
+    Write-GateAudit "BLOCK-SUM no-binary"
+    Write-Error "[req-guard] 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。确需跳过本次：git commit --no-verify"
+    exit 1
+  }
+  $sumOut = & req-guard verify-content $active.Name 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-GateAudit "BLOCK-SUM $($active.Name)"
+    $sumOut | ForEach-Object { Write-Error $_ }
+    exit 1
+  }
+  $sumOut | ForEach-Object { Write-Error $_ }
+}
+
 # ---------- 4) 阻塞性评论必须全部 resolved ----------
 $commentsFile = Join-Path $REQ_DIR ($active.BaseName + ".comments.md")
 if (Test-Path $commentsFile) {
