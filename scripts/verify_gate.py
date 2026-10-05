@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1242,7 +1243,281 @@ def verify_multi_gate() -> bool:
     return ok
 
 
+# ───────────────────────────── REQ-009 判决性实验脚本 ─────────────────────────────
+TEETH_SH = ROOT / "scripts" / "verify_tests_have_teeth.sh"
+
+# 假 cargo：把「跑测试」这一步的耗时与 cargo 依赖从场景里摘掉。
+#
+# **按调用次数分场景**，而不是只看环境变量 —— 因为脚本会先跑一次**基线**
+# （未注入），基线必须是绿的，否则「变异杀死了它」证明不了任何事。若用
+# 「环境变量一设就永远失败」，基线也会红，场景就永远走不到注入那一步。
+#   第 1 次（基线）      → 恒绿
+#   第 2 次（变异后）    → 由 FAKE_TEST_FAIL / FAKE_BUILD_FAIL 决定
+#   第 3 次（`--no-run`）→ 由 FAKE_BUILD_FAIL 决定
+#
+# `--list` 必须复现真实 cargo 的一条要命行为：**0 匹配也退出 0**。
+# 脚本因此另用 `--list` 数匹配数（过滤串失效时报「清单腐化」而非「没人守」）。
+FAKE_CARGO = """#!/usr/bin/env python3
+import os, sys, time
+args = sys.argv[1:]
+if "--list" in args:
+    filt = ""
+    if "--" in args:
+        tail = args[args.index("--") + 1:]
+        filt = tail[0] if tail else ""
+    if filt:
+        sys.stdout.write("suite::tests::dummy_%s: test\\n" % filt)
+    sys.stdout.write("0 tests, 0 benchmarks\\n")
+    sys.exit(0)
+
+counter = os.environ["FAKE_CARGO_COUNTER"]
+n = 0
+try:
+    with open(counter) as f:
+        n = int(f.read().strip() or "0")
+except OSError:
+    n = 0
+n += 1
+with open(counter, "w") as f:
+    f.write(str(n))
+
+# 基线恒绿；只有变异后的那次才可能被信号打断（FAKE_HANG=1）。
+if n == 1 or not os.environ.get("FAKE_HANG"):
+    pass
+else:
+    time.sleep(30)
+
+if os.environ.get("FAKE_BUILD_FAIL") and n > 1:
+    sys.stderr.write("error[E0425]: cannot find value in this scope\\n")
+    sys.exit(101)
+if n == 1:
+    sys.stdout.write("test result: ok. 1 passed; 0 failed; 0 measured; 0 filtered out\\n")
+    sys.exit(0)
+if os.environ.get("FAKE_TEST_FAIL"):
+    sys.stdout.write("suite::tests::dummy_a --- FAILED\\n")
+    sys.stdout.write("test result: FAILED. 0 passed; 1 failed; 0 measured; 0 filtered out\\n")
+    sys.exit(101)
+sys.stdout.write("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n")
+sys.exit(0)
+"""
+
+TARGET_RS = "core/src/target.rs"
+TARGET_BODY = (
+    "pub fn f(x: u8) -> u8 {\n"
+    "    // 闭包里的 | 是 REQ-009 B1 的实证：锚点含 | 时不能被分隔符截断\n"
+    "    let g = |y: u8| y + 1;\n"
+    "    g(x)\n"
+    "}\n"
+)
+
+
+def verify_tests_have_teeth() -> bool:
+    """REQ-009 U1–U11：清单校验、注入自证落地、还原保证。
+
+    **全部不需要 cargo**（用假 cargo 桩），故能在 CI 秒级回归 —— 而
+    「还原」是本脚本最危险的一环（一条变异卡住不退出会把工作区留在坏状态），
+    只靠手工验证等于没有验证。
+
+    每个场景都断言**三件事**：退出码、报错措辞、目标文件是否未被改动。
+    只断言退出码会漏掉「以正确的理由失败」这一半。
+    """
+    if not TEETH_SH.exists():
+        print("SKIP  REQ-009_判决性实验脚本: 未找到 verify_tests_have_teeth.sh")
+        return True
+    if not SH:
+        print("SKIP  REQ-009_判决性实验脚本: 未找到 POSIX shell")
+        return True
+
+    ok = True
+
+    def case(tag, manifest_lines, *, untracked=False, dirty=False, elsewhere_dirty=False,
+             env_extra=None, expect_rc=1, expect_out=(), expect_absent=(), untouched=True,
+             body=None, interrupt=False):
+        """跑一次脚本，返回 good。断言三件事，见 docstring。
+
+    `interrupt=True` 时在假 cargo 挂在变异后那次运行的窗口内向脚本发 SIGINT，
+    用来验`trap` 的还原保证（AC-004）。
+    """
+        nonlocal ok
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-R9-{tag}-")) / tag
+        (work / "scripts").mkdir(parents=True)
+        (work / "core" / "src").mkdir(parents=True)
+        (work / "scripts" / "verify_tests_have_teeth.sh").write_text(
+            TEETH_SH.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        manifest = work / "scripts" / "mutation-manifest.txt"
+        manifest.write_text(
+            "\n".join(manifest_lines) + ("\n" if manifest_lines else ""), encoding="utf-8"
+        )
+        target = work / TARGET_RS
+        target.write_text(body or TARGET_BODY, encoding="utf-8")
+
+        bin_dir = work / "fakebin"
+        bin_dir.mkdir()
+        (bin_dir / "cargo").write_text(FAKE_CARGO, encoding="utf-8")
+        (bin_dir / "cargo").chmod(0o755)
+
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "init"],
+            cwd=work, check=True,
+        )
+        if untracked:
+            subprocess.run(["git", "rm", "-q", "--cached", TARGET_RS], cwd=work, check=True)
+        if dirty:
+            target.write_text((body or TARGET_BODY) + "// 本地未提交改动\n", encoding="utf-8")
+        if elsewhere_dirty:
+            (work / "core" / "src" / "other.rs").write_text("// 别处有未提交改动\n")
+        before = target.read_text(encoding="utf-8")
+
+        env = dict(os.environ)
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+        # 假 cargo 按调用次数分场景（基线恒绿、变异后按环境变量），计数器落在
+        # 临时目录里 —— 放仓库内会污染工作区，而本组场景正是在测「工作区是否干净」。
+        env["FAKE_CARGO_COUNTER"] = str(work / "fakebin" / "counter")
+        for k, v in (env_extra or {}).items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        if interrupt:
+            # 起进程 → 等它进入「假 cargo 挂住」的窗口 → 发 SIGINT。
+            # 用轮询读目标文件判断时机：文件被注入 = 已进入注入后那段。
+            proc = subprocess.Popen(
+                [SH, "scripts/verify_tests_have_teeth.sh"], cwd=work,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, env=env, text=True, **RUN_KW,
+            )
+            injected = False
+            for _ in range(300):
+                time.sleep(0.1)
+                if proc.poll() is not None:
+                    break
+                cur = target.read_text(encoding="utf-8")
+                if cur != before:
+                    injected = True
+                    break
+            time.sleep(0.5)   # 让它确实停在 cargo 里再打断
+            proc.send_signal(signal.SIGINT)
+            try:
+                stdout, _ = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, _ = proc.communicate()
+            r = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, "")
+            out = stdout or ""
+            if not injected:
+                # 没等到注入窗口就断了 —— 这本身是失败（场景没测到该测的东西）。
+                # 退出码给一个不可能值，让 good 的首个断言就红，不靠人读日志。
+                out += "\n      ↳ 未捕获到注入窗口，SIGINT 场景无效"
+                r = subprocess.CompletedProcess(proc.args, -999, out, "")
+        else:
+            r = subprocess.run(
+                [SH, "scripts/verify_tests_have_teeth.sh"], cwd=work,
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, **RUN_KW,
+            )
+            out = r.stdout + r.stderr
+        after = target.read_text(encoding="utf-8")
+
+        good = r.returncode == expect_rc
+        for needle in expect_out:
+            if needle not in out:
+                good = False
+                out += f"\n      ↳ 缺少期望输出：{needle}"
+        for needle in expect_absent:
+            if needle in out:
+                good = False
+                out += f"\n      ↳ 出现了不该出现的输出：{needle}"
+        if untouched and after != before:
+            good = False
+            out += f"\n      ↳ 目标文件被改动了（期望未改动）"
+        if not untouched and after == before:
+            good = False
+            out += f"\n      ↳ 目标文件应被改动，但逐字相同（期望已注入）"
+
+        shutil.rmtree(work.parent, ignore_errors=True)
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  R9_{tag}: exit={r.returncode} (期望 {expect_rc})")
+        if not good:
+            print(f"      ↳ {out[:600]}")
+        return good
+
+    def entry(target=TARGET_RS, anchor="pub fn f(x: u8) -> u8 {",
+              repl="return 0;", filt="dummy", reason="夹具判据"):
+        return "\t".join([target, anchor, repl, filt, reason])
+
+    # U1：每行 5 段齐全 —— 少一段即报「清单格式非法」并指出行号
+    case("U1_少一段", [entry(filt="")], expect_out=["清单格式非法"], expect_absent=["理由必填"])
+
+    # U7/AC-011：段内含 TAB（6 段）→ 格式非法，不误当第 6 段
+    case("U7_段内含TAB", ["\t".join([TARGET_RS, "pub fn f(x: u8) -> u8 {", "return\t0;",
+                                    "dummy", "理由"])],
+         expect_out=["清单格式非法"])
+
+    # U2：理由必填
+    case("U2_理由必填", ["\t".join([TARGET_RS, "pub fn f(x: u8) -> u8 {", "return 0;",
+                                    "dummy", ""])],
+         expect_out=["理由必填"])
+
+    # B2/AC-008：替换文本与锚点相同 → 变异无效
+    case("U8_变异无效", [entry(repl="pub fn f(x: u8) -> u8 {")],
+         expect_out=["变异无效"])
+
+    # AC-009：空清单必须明确失败，不能静默通过
+    case("U9_空清单", [], expect_out=["没有变异条目"])
+
+    # U3/AC-003：锚点未命中 —— 用**清单腐化**的措辞，且不得出现 survived。
+    # 只断言 `survived` 不出现：注入器的提示文案里含「不是「判据没人守」」，
+    # 拿「没人守」当禁词会与正确的解释性文案自相矛盾。
+    case("U3_锚点未命中", [entry(anchor="pub fn 根本不存在(x: u8) -> u8 {")],
+         expect_out=["锚点未命中", "清单腐化"], expect_absent=["survived"])
+
+    # B1/AC-007：锚点在目标文件里出现 2 次 → 报歧义并拒绝，不猜改哪一处。
+    # 夹具里 `u8` 出现 3 次（两个参数标注 + 闭包参数），用它当锚点即触发歧义。
+    case("U7_锚点歧义", [entry(anchor="u8")], expect_out=["锚点有歧义"])
+
+    # B1/AC-013：锚点含 `|`（Rust 闭包参数）时不被截断 —— 注入落在正确的行，
+    # 且整份文件与注入前之差恰为 1 行。
+    case("U9_锚点含竖线", [entry(anchor="let g = |y: u8| y + 1;", repl="let g = |y: u8| y + 2;")],
+         env_extra={"FAKE_TEST_FAIL": "1"}, expect_rc=1, expect_out=["killed"], untouched=True)
+
+    # AC-012：目标文件未跟踪 → 拒绝（git checkout 还原不了它）
+    case("U8_目标文件未跟踪", [entry()], untracked=True,
+         expect_out=["目标文件未跟踪"])
+
+    # AC-005：目标文件脏 → 拒绝，且不丢改动
+    case("U6_工作区不干净", [entry()], dirty=True,
+         expect_out=["工作区不干净"])
+
+    # AC-004：Ctrl-C（SIGINT）后工作区已还原。
+    # 必须**真发信号**：让假 cargo 挂在变异后那次运行上，脚本跑到一半时向它发
+    # SIGINT，然后断言目标文件逐字回到注入前。只跑一遍正常路径是测不出 trap 的。
+    # 期望退出码 130 = 128 + SIGINT：脚本 trap 后自己 exit 130，不是被信号打死
+    # （被信号打死的话 trap 里的还原仍会跑，但退出码会是 -2，两种都要能区分）。
+    case("U5_SIGINT后还原", [entry()], env_extra={"FAKE_HANG": "1"},
+         expect_rc=130, interrupt=True, untouched=True)
+
+    # 正常路径：注入 → 跑测试 → 还原，且还原后逐字相同
+    case("E1_正常路径还原", [entry()], env_extra={"FAKE_TEST_FAIL": "1"},
+         expect_rc=1, expect_out=["killed"], untouched=True)
+
+    # AC-014：编译失败 → build_failed，**不计入守住**，退出码非 0。
+    # 禁词用「结果：killed」而不是裸 `killed` —— 汇总行 `killed=0` 里含这个词，
+    # 拿它当禁词会与正确输出自相矛盾。
+    case("U10_编译失败不算守住", [entry()], env_extra={"FAKE_BUILD_FAIL": "1"},
+         expect_rc=1, expect_out=["build_failed", "不计为守住"],
+         expect_absent=["结果：killed"])
+
+    # E2：变异不破坏行为 → survived（这条判据没人守），退出码 1
+    case("E2_变异存活", [entry()], expect_rc=1,
+         expect_out=["survived"], untouched=True)
+
+    return ok
+
+
 ok = ok and verify_multi_gate()
+ok = ok and verify_tests_have_teeth()
 
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)

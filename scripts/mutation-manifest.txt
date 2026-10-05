@@ -1,0 +1,35 @@
+# REQ-009 判决性实验清单 —— 「这些判据必须有人守着」的书面合同
+#
+# 格式：<文件>\t<锚点原文>\t<追加文本>\t<测试过滤串>\t<理由>
+#   - 五个字段以**单个 TAB** 分隔，无转义、无多行。某段里含 TAB 即格式非法。
+#   - 锚点必须能在目标文件里**唯一**命中；0 处 = 清单腐化，≥2 处 = 歧义。
+#   - 「追加文本」是**追加到锚点所在行行尾**的内容，不是整行替换 ——
+#     行数不变是刻意的：`mask_fenced` 的调用方依赖行号。
+#   - 理由**必填**：它是这份清单里最容易随时间丢失的东西。
+#
+# 跑法：bash scripts/verify_tests_have_teeth.sh [--only <行号|理由关键字>]
+#
+# 收录判据的口径（N2）：只收「失效方向最坏」的 —— 即失效时门禁表现为
+# **看起来在拦、实际没拦**。清单只能覆盖已经想到的失效方向；
+# 「没想到的」靠每次复盘追加，不是自动化能解决的。
+
+# ── REQ-008：段落边界判定排除代码围栏 ──
+# 失效形态：四条判定里三条**静默判错段落**，只有 touch-check 报错。
+# 围栏里的 `## xxx` 是示例内容，被当成真标题 → GATE:TOUCH 块「消失」，
+# 而报错（MissingBlock）与真实原因完全无关。
+core/src/section.rs	pub fn mask_fenced(text: &str) -> String {	return text.to_string();	mask_fenced	围栏掩码失效时段落边界被静默判错，报错与真实原因无关
+
+# ── REQ-002：批准绑定内容摘要（已批准段不可偷改）──
+# 失效形态：sum= 形同虚设，批准后正文可被任意改动而无人察觉 ——
+# 那正是「看起来有冻结、实际没有」。
+core/src/requirement.rs	pub fn verify_sums(content: &str) -> Vec<SumIssue> {	return Vec::new();	sum	内容摘要校验失效时已批准段可被偷改而门禁全绿
+
+# ── REQ-003：段落实质正文不得是占位空话 ──
+# 失效形态：三段全留模板占位也能过审 —— 门禁看着在拦（AC 齐全、格式正确），
+# 实际一个字都没验。
+core/src/section.rs	pub fn is_section_empty(content: &str, step: usize, placeholders: &[String]) -> Option<bool> {	return Some(false);	section	空段校验失效时占位清单可过审，形式合规而内容为空
+
+# ── REQ-007：草稿一次只应用一段 ──
+# 失效形态：多段草稿被「应用一段后删掉整份」**无声吃掉其余段** ——
+# 看着应用了、其实丢了内容。
+core/src/requirement.rs	pub fn steps(&self) -> Vec<&str> {	return Vec::new();	P0_多段	多段草稿判据失效时其余段被无声丢弃，看着应用了其实丢了内容

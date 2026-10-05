@@ -78,3 +78,10 @@
 | 2026-10-05 09:59:43 | DERIVE_SOURCE_REFS REQ-011 - -> gui/src,docs/设计 |
 | 2026-10-05 09:59:43 | APPROVE REQ-011 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-05 10:00:01 | APPROVE REQ-011 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 10:14:13 | REJECT REQ-009 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 10:14:13 | COMMENT-ADD REQ-009 id=C001 author=Mike_Zhu blocking=true reply=- channel=interactive tty=1 ai=0 |
+| 2026-10-05 10:20:46 | COMMENT-RESOLVE REQ-009 id=C001 reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 10:21:11 | APPROVE REQ-009 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 10:21:36 | DERIVE_SOURCE_REFS REQ-009 - -> scripts,docs/规范,README.md |
+| 2026-10-05 10:21:36 | APPROVE REQ-009 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 10:21:49 | APPROVE REQ-009 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |

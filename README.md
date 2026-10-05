@@ -269,7 +269,39 @@ cargo fmt --all                        # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查（零警告为门槛）
 cargo test --workspace                 # 单元测试（全 workspace；用例数随迭代增长，以实跑输出为准）
 python scripts/verify_gate.py          # 拦截脚本真机场景（13 固定场景 + 1 个需二进制在 PATH 的条件场景）
+bash scripts/verify_tests_have_teeth.sh   # 判决性实验：确认关键判据真的被测试守着（会临时改工作区文件）
 ```
+
+### 判决性实验：让「测试有效」可机械检查
+
+「测试通过」与「测试有效」是两件无法区分的事 —— 一个断言方向写反的测试照样绿
+（REQ-008 里就有一个）。`verify_tests_have_teeth.sh` 把这条纪律变成命令：对每条
+关键判据注入一个「注入它就坏」的变异，跑对应测试，**测试仍全绿就说明没人守**。
+
+```bash
+bash scripts/verify_tests_have_teeth.sh                 # 全量清单
+bash scripts/verify_tests_have_teeth.sh --only 20       # 只跑第 20 条
+bash scripts/verify_tests_have_teeth.sh --only 围栏      # 只跑理由含「围栏」的条目
+```
+
+三种结果互斥，任一非 `killed` 都让退出码非 0：
+
+| 结果 | 含义 |
+| --- | --- |
+| `killed` | 目标测试跑起来了且有失败 → 这条判据有人守着 |
+| `survived` | 目标测试跑起来了且全绿 → **这条判据没有任何测试守着** |
+| `build_failed` | 编译失败 → **不算守住**（只证明代码与该文件有耦合） |
+
+变异清单在 `scripts/mutation-manifest.txt`，每行 5 段以**单个 TAB** 分隔：
+`<文件>\t<锚点原文>\t<追加文本>\t<测试过滤串>\t<理由>`。用 TAB 而非 `|` 是因为
+锚点是 Rust 源码行，而闭包参数 `|c|`、`||` 在 Rust 里满地都是。
+
+> ⚠️ **脚本会临时修改工作区文件**。三道保证：注入前检查目标文件是否被 git 跟踪
+> 且干净、`trap` 还原、还原后校验内容与注入前逐字一致。任一道失效都以非 0 退出码
+> 报出。运行期间不要在别的终端改同一批文件。
+
+新增一条判据：往清单里加一行（**理由必填** —— 那是这份清单里最容易随时间丢失的
+东西），再跑一次。清单只能覆盖已经想到的失效方向；「没想到的」靠每次复盘追加。
 
 > **Windows + Git Bash 注意**：`/usr/bin/link`（GNU coreutils）会遮蔽 MSVC 的 `link.exe`，
 > 直接 `cargo build` 会失败。需把 MSVC `bin/Hostx64/x64` 前置到 `PATH`，并设置 `LIB`

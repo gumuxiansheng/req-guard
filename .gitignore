@@ -17,3 +17,7 @@ gui/assets/unicodes.txt
 
 # 草稿区（AI 拟改清单内容的暂存处，工作态；apply 消费后即删除）
 /.gates/drafts
+
+# Python 字节码缓存：scripts/ 下的注入器与 verify_gate.py 跑起来会生成，
+# 入库即多一份可再生物（且每次 mtime 不同会让 git status 常带噪声）。
+__pycache__/
