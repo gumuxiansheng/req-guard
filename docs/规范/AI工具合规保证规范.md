@@ -51,6 +51,8 @@ req-guard 是 gates-toolkit 的流程门禁，管"AI **该不该写**"。本规�
 | 各 AI 工具确实加载了注入的 hook | 工具 schema 不识别、已存在配置未合并 → 静默无 hook | L1 静默缺失 |
 | **CI / pre-commit 能取到「本次变更集」** | 多需求仓库下裁决对象是**变更集**（按各清单 `GATE:TOUCH` 声明反查归属）。取不到变更集（CI 漏 `--base`、pre-commit 无暂存集）就无从归因 → 报歧义并拦截 | L3 恒拦（非漏拦，但会表现为"门禁坏了"） |
 | **AI 的写操作能被逐次归因** | 裁决按**单文件**判定；`Bash` 里的 `sed -i`、格式化器批量改写不带 `file_path`，PreToolUse 阶段不可见 | L1 覆盖不到（由 L2/L3 的变更集兜底） |
+| **绕过令牌与审批凭据不会被本机进程重造**（REQ-012 新增，**实测确认不成立**） | 四种凭据来源全部基于环境变量 / 进程属性 / 本地文件哈希，**无密码学机制**：`guard.cfg` 明文可改写、TTY 挑战码由同一进程 stdout→stdin 回读（`pty` 可满足）、`sig` 是公开可复算派生值、`git config user.name` 可伪造身份。故本地只能做到「伪造**可见**」，做不到「伪造**不可能**」 | 须由服务端必需检查 + `CODEOWNERS`（覆盖 `.gates/audit/ledger.md` 与 `.gates/req-guard.yaml`）+ 事后复核兜底 |
+| **门禁自身的配置与脚本不被 AI 改写**（REQ-012 新增） | `.gates/req-guard.yaml`（含 `auth.level`/`enforce.ci`）、`.gates/hooks/*` 一旦可被 AI 改，门禁可被自行调松。现已把 `.gates/**` 豁免收窄为具名清单、配置改动须清单声明 + `install --verify --base` 漂移检测、`install --verify` 改为**实跑**装好的脚本 | 需 CODEOWNERS 覆盖上述两处；`verify_ci` 的「是否执行」判据仍是启发式 |
 
 **设计推论**：要让"每个工具"守规矩，必须做到——
 

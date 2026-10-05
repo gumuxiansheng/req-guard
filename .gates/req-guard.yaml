@@ -50,8 +50,18 @@ bypass:
 
 # 变更范围契约（GATE:TOUCH）
 touch:
+  # REQ-012 T9：`.gates/**` 通配已拆成具名清单。`.gates/req-guard.yaml` 与
+  # `.gates/audit/ledger.md` **刻意不在豁免内** —— 它们是门禁配置与审批轨迹，
+  # 放进豁免区等于允许 AI 自己把门禁调松。改它们须由 REQ-012 声明 + CI 漂移检测兜住。
   exempt:
-    - .gates/**
+    - .gates/hooks/**
+    - .gates/ci/**
+    - .gates/drafts/**
+    - .gates/requirements/**
+    - .gates/README.md
+    - .gates/audit/gate-audit.log
+    - .gates/audit/ledger.md
+    - .gates/audit/DIGEST
     - target/**
     - dist/**
     - Cargo.lock

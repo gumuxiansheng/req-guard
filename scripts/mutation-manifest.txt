@@ -33,3 +33,15 @@ core/src/section.rs	pub fn is_section_empty(content: &str, step: usize, placehol
 # 失效形态：多段草稿被「应用一段后删掉整份」**无声吃掉其余段** ——
 # 看着应用了、其实丢了内容。
 core/src/requirement.rs	pub fn steps(&self) -> Vec<&str> {	return Vec::new();	P0_多段	多段草稿判据失效时其余段被无声丢弃，看着应用了其实丢了内容
+
+# ── REQ-012：绕过令牌的台账交叉核对 ──
+# 失效形态：`printf 'expires_epoch=99999999999\n' > .gates/.bypass` 一行解除全部门禁，
+# 且该文件 gitignore + 台账零记录 —— 门禁被静默关掉，且**事后无从发现**。
+# 这是本清单里唯一一条「绕过门禁本身」的判据，故收录：它的失效方向不是误拦，
+# 而是全盘放行且无痕。
+core/src/resolve.rs	if !ledger_has_bypass_open(root, &actor) {	if false &&	U0_绕过令牌	台账交叉核对失效时伪造令牌即可解除全部门禁，且伪造在 PR 里完全不可见
+
+# ── REQ-012：绕过令牌的身份自证 ──
+# 失效形态：同上，但绕过「actor/email/sig 三字段缺失」这一最小门槛 ——
+# 一行 printf 就能凑出全部字段形状。
+core/src/resolve.rs	crate::gate::audit(root, "BYPASS-REJECT reason=missing-fields");	if false { crate::gate::audit(root, "BYPASS-DEGRADED reason=missing-fields"); } else { return None; };	U0_绕过令牌	缺字段校验失效时随手一个 printf 即可伪造出形状完整的令牌

@@ -26,6 +26,8 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 
 /// 用例收尾：尽力清理，失败不影响断言结果。
 pub fn cleanup(dir: &std::path::Path) {
+    // 绕过令牌已移到工作树之外（REQ-012 设计 2），只删临时根目录会把它留在状态目录里。
+    cleanup_bypass(dir);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -76,4 +78,51 @@ pub fn fill_sections(root: &std::path::Path, id: &str) {
         c = c.replacen(&needle, &format!("{needle}\n{line}\n"), 1);
     }
     std::fs::write(&p, c).expect("清单应可写");
+}
+
+/// 测试用：落一份**通过全部校验**的绕过令牌（REQ-012 设计 1）。
+///
+/// 为什么需要助手：绕过令牌现在必须同时满足三件事才能生效——
+/// ① `sig` 等于按 `actor`/`email` 重算的指纹；② 入库台账有对应 `BYPASS-OPEN` 行；
+/// ③ 未过期。手写令牌的老夹具**只写 `expires_epoch`**（那正是被修掉的漏洞本身），
+/// 故凡是要测"绕过窗口生效"的用例都必须走这个入口，否则测的是一个不存在的状态。
+///
+/// 落盘位置与格式逐字对齐 [`crate::gate::bypass`]，避免夹具与实现漂移。
+pub fn write_valid_bypass(root: &std::path::Path, actor: &str, email_hint: &str, ttl_minutes: u64) {
+    let now = crate::gate::now_epoch();
+    let expires = now + ttl_minutes * 60;
+    // 身份戳**必须走 identity::bind**，不能自己算 sig：`Stamp::sig` 记的是 git 身份的
+    // 指纹，自报名与 git 身份冲突时（L0 放行 + mismatch=1）两者并不相等。
+    // 夹具与生产走同一条绑定路径，才不会出现「夹具能过、真机不过」或反之。
+    let stamp = crate::identity::bind(root, actor).expect("夹具身份应可绑定");
+    let sig = stamp.sig.clone();
+    let email = if stamp.email == crate::identity::UNBOUND_SIG {
+        // 无 git 身份时 bind 给的是 `-`；用调用方给的邮箱走 env 兜底同一套派生，
+        // 保证「有身份」与「无身份」两条合法路径都能被夹具覆盖。
+        let s = crate::identity::fingerprint(root, actor, email_hint);
+        email_hint.to_string().replace("{sig}", &s)
+    } else {
+        stamp.email.clone()
+    };
+    let content = format!(
+        "reason=用例夹具\nactor={actor}\nemail={email}\nsig={sig}\n\
+         created_epoch={now}\nexpires_epoch={expires}\nttl_minutes={ttl_minutes}\n"
+    );
+    let path = crate::gate::bypass_token_path(root);
+    fs::create_dir_all(path.parent().expect("状态目录")).expect("创建状态目录失败");
+    fs::write(&path, content).expect("写入绕过令牌失败");
+    // 第② 道校验读的是**入库台账**，不是本地日志，故夹具必须补这一行。
+    crate::gate::audit_ledger(
+        root,
+        &format!(
+            "BYPASS-OPEN actor={actor} ttl={ttl_minutes}min reason=用例夹具 \
+                  channel=interactive email={email} sig={sig}"
+        ),
+    );
+}
+
+/// 清掉绕过令牌（用例之间互不干扰；状态目录按仓库路径哈希，临时目录名不重复）。
+pub fn cleanup_bypass(root: &std::path::Path) {
+    let _ = fs::remove_file(crate::gate::bypass_token_path(root));
+    let _ = fs::remove_file(root.join(crate::gate::BYPASS_REL));
 }

@@ -19,23 +19,37 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 版本号走**仓库变量**，不在本文件里写死：写死就得每仓手工改一次，
+  # 漏改就会静默用旧版二进制判新格式的清单（且没人会发现）。
+  # 设置：gh variable set REQ_GUARD_VERSION --body 0.1.5
+  REQ_GUARD_VERSION: ${{ vars.REQ_GUARD_VERSION }}
 
 jobs:
   req-guard-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `--base origin/xxx` 需要完整历史。默认 depth=1 下 origin/main 根本不存在，
+          # 两条 --base 步骤会以 `fatal: ambiguous argument` 硬失败 —— 而失败原因
+          # 与「门禁判定」毫无关系，排查成本极高。故这里必须显式 0。
+          fetch-depth: 0
 
       # 取得 req-guard 二进制（三选一）：
       #   A. 从官方 Release 拉取（推荐）：版本号与仓库 .gates 所需版本对齐
       - name: 下载 req-guard（Release）
         run: |
-          VER=0.1.5   # TODO: 改为你要使用的版本（见 Cargo.toml version / Release tag）
+          # 未设版本变量就**立刻失败并说清怎么设**，而不是 curl 静默失败或用错版本。
+          : "${REQ_GUARD_VERSION:?未设置仓库变量 REQ_GUARD_VERSION：gh variable set REQ_GUARD_VERSION --body <版本>}"
           curl -fsSL -o req-guard \
-            "https://github.com/<owner>/<repo>/releases/download/v${VER}/req-guard-x86_64-unknown-linux-musl"
+            "https://github.com/<owner>/<repo>/releases/download/v${REQ_GUARD_VERSION}/req-guard-x86_64-unknown-linux-musl"
           chmod +x req-guard
+          # 版本自证：二进制必须与声明版本一致。`req-guard -V` 输出编译期版本，
+          # 于是「本机 0.1.5 / CI 0.1.4」这类静默错配会在合并前变红。
+          req-guard -V | grep -q "$REQ_GUARD_VERSION" || {
+            echo "版本不符：声明 $REQ_GUARD_VERSION，实际 $(req-guard -V)"; exit 1; }
 
-      #   B. 或用 cargo 从源码构建：
+      #   B. 或用 cargo 从源码构建（天然与仓库版本一致，无需版本变量）：
       #   - name: 构建 req-guard
       #     run: cargo install --path . --locked
       #

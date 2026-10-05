@@ -85,3 +85,11 @@
 | 2026-10-05 10:21:36 | DERIVE_SOURCE_REFS REQ-009 - -> scripts,docs/规范,README.md |
 | 2026-10-05 10:21:36 | APPROVE REQ-009 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-05 10:21:49 | APPROVE REQ-009 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 11:52:10 | APPROVE REQ-012 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 11:52:24 | DERIVE_SOURCE_REFS REQ-012 - -> core/src,cli/src,templates/ci,packaging/templates/ci,packaging/scripts,.github/workflows,.cnb.yml,scripts,.gates,docs/规范,packaging/docs,packaging,README.md |
+| 2026-10-05 11:52:24 | APPROVE REQ-012 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 11:52:32 | APPROVE REQ-012 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 12:34:25 | APPROVE REQ-013 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 12:34:34 | DERIVE_SOURCE_REFS REQ-013 - -> gui/src,gui,Cargo.lock,docs/设计 |
+| 2026-10-05 12:34:35 | APPROVE REQ-013 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 12:34:50 | APPROVE REQ-013 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |

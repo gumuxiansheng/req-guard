@@ -41,7 +41,7 @@ if ($stdinData.Trim()) {
 # 镜像负债之所以只剩这一处，正是因为第 1 段之后的一切裁决都已下沉到 core。
 if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
     Write-GateAudit "BLOCK no-binary"
-    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。"
+    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）。"
     exit 1
 }
 if ($stdinData.Trim()) {

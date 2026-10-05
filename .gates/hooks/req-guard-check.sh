@@ -61,7 +61,7 @@ if ! command -v req-guard >/dev/null 2>&1; then
   echo "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。" >&2
   echo "          判定在 core，缺二进制即无从判定 —— fail-closed，不猜。" >&2
   echo "          请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。" >&2
-  echo "          确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。" >&2
+  echo "          确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）" >&2
   exit 1
 fi
 if [ -n "${STDIN_DATA:-}" ]; then

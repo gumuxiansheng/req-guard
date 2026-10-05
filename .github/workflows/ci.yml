@@ -90,9 +90,15 @@ jobs:
           set -euo pipefail
           BIN=$PWD/target/release/req-guard
           P=$(mktemp -d); trap 'rm -rf "$P"' EXIT
-          "$BIN" init -p "$P" >/dev/null
+          # --for-ci：自举要脚本化审批（L0 + 放弃 L3）；真实仓库用裸 init。
+          "$BIN" init --for-ci -p "$P" >/dev/null
           test -f "$P/.gates/ci/req-guard-ci.yml"   # 接入样例随 install 生成
           test -f "$P/.gates/hooks/req-guard-deny.sh"
+
+          # --for-ci 关掉了 enforce.ci（沙箱里确实没有 CI），但本 job 恰恰要验
+          # 「未接 CI 必须红」。故在此**显式打开**：让这条断言不依赖 init 的默认值，
+          # 测试意图写在代码里，而不是靠某个默认值的副作用。
+          sed -i.bak 's/^  ci: false/  ci: true/' "$P/.gates/req-guard.yaml" && rm -f "$P/.gates/req-guard.yaml.bak"
 
           # L3 fail-closed 双向自举：init **有意不替用户写 CI 编排**（那是仓库配置，
           # core/src/gate.rs 安装流程有明确注释），而 enforce.ci 默认 true ——
@@ -111,6 +117,11 @@ jobs:
 
           # 2) 创建并三段通过 → check 放行
           "$BIN" create -t "CI 自举" -p "$P" >/dev/null
+          # create 出来的是模板（占位勾选框），approve 会跑段落实质性校验（REQ-003）
+          # 而拒绝它 —— 与 auth.level 无关的第二个根因，故自举必须先填实质正文。
+          REQ_F="$(ls "$P"/.gates/requirements/REQ-001*.md | head -1)"
+          awk '/^## [0-9]+\. / && !d[$0]++ { print; print "- 自举夹具：本段已填入实质正文。"; next } { print }' \
+            "$REQ_F" > "$REQ_F.tmp" && mv "$REQ_F.tmp" "$REQ_F"
           "$BIN" approve REQ-001 --step decomposition --reviewer 张三 -p "$P" >/dev/null
           "$BIN" approve REQ-001 --step solution      --reviewer 张三 -p "$P" >/dev/null
           "$BIN" approve REQ-001 --step testplan      --reviewer 张三 -p "$P" >/dev/null

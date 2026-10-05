@@ -511,6 +511,26 @@ fn git_names(root: &Path, args: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
+/// 是否有任一**未归档**清单的 `GATE:TOUCH` 声明覆盖了 `path`。
+///
+/// 供 [`crate::gate::config_drift_undeclared`] 用：判断「改了门禁配置」这件事
+/// 是否有清单为之背书。复用 [`collect_declarations`] 而不是另写一套解析 ——
+/// 声明口径只应有一处，否则「touch-check 认得的声明」与「漂移检测认得的声明」
+/// 会漂移，而那正是本函数要防的那类失效。
+pub fn declared_by_any_live_req(root: &Path, path: &str) -> bool {
+    let target = normalize_path(path);
+    // 退化路径：读不到声明时**不**宣称「已声明」—— 宁可误报要求评审，
+    // 也不放行一次无背书的门禁配置改动（fail-closed 方向）。
+    let Ok(decls) = collect_declarations(root, TouchScope::Union, None) else {
+        return false;
+    };
+    decls.iter().any(|(_id, globs)| {
+        globs
+            .iter()
+            .any(|g| glob_match(&normalize_path(g), &target) || normalize_path(g) == target)
+    })
+}
+
 /// 收集参与比对的声明（按口径）。
 fn collect_declarations(
     root: &Path,
@@ -1226,17 +1246,57 @@ mod tests {
     }
 
     #[test]
-    fn exempt默认含gates与target() {
+    fn exempt默认含构建产物与门禁运行态() {
         let d = vec![decl("REQ-001", &["core/**"])];
-        assert!(check_changes(
-            Path::new("."),
-            &d,
-            &[".gates/requirements/REQ-001-ac.md".into()]
-        )
-        .is_empty());
+        // 构建产物与门禁自己的运行态：AI 不该为它们建 REQ。
         assert!(check_changes(Path::new("."), &d, &["target/debug/req-guard".into()]).is_empty());
         // 门禁自己写的 .gitignore 不能被自己拦（append_gitignore 的产物）
         assert!(check_changes(Path::new("."), &d, &[".gitignore".into()]).is_empty());
+        for rel in [
+            ".gates/hooks/req-guard-check.sh",
+            ".gates/ci/req-guard-ci.yml",
+            ".gates/drafts/REQ-001.draft.md",
+            ".gates/audit/gate-audit.log",
+            ".gates/audit/DIGEST",
+        ] {
+            assert!(
+                check_changes(Path::new("."), &d, &[rel.into()]).is_empty(),
+                "{rel} 是门禁运行态，应豁免"
+            );
+        }
+    }
+
+    /// REQ-012 T9 的**核心**：`touch.exempt` 默认集收窄后，门禁配置与清单正文
+    /// 不再落在 `.gates/**` 这条大通配里 —— 否则 AI 可以自改 auth.level /
+    /// enforce.ci 而 `touch-check` 报「✅ 合规」（实测过）。
+    #[test]
+    fn exempt不再含gates通配_配置与台账须声明() {
+        let d = vec![decl("REQ-001", &["core/**"])];
+        // 只剩门禁**配置**不在豁免区。台账（ledger.md）刻意豁免：
+        // 它是工具每次审批自动追加的入库产物，不豁免会让每次 approve 都触发 NotDeclared，
+        // 团队必然改用 --no-verify 或加回豁免 —— 摩擦大到被绕开的设计不是设计。
+        // auth.level / enforce.ci / touch.exempt 都在这一个文件里 ——
+        // 它在豁免区 = AI 可以自改门禁强度而 touch-check 报「✅ 合规」。
+        let bad = check_changes(Path::new("."), &d, &[".gates/req-guard.yaml".into()]);
+        assert_eq!(
+            1,
+            bad.len(),
+            ".gates/req-guard.yaml 未在 GATE:TOUCH 声明时应报 NotDeclared（收窄后必须会失败）"
+        );
+        // 清单正文**仍在豁免内**：AI 要在任何清单被批准之前就把它写出来，
+        // 且清单改动必须能提交，否则「先有正文还是先有批准」成死循环。
+        assert!(
+            check_changes(
+                Path::new("."),
+                &d,
+                &[".gates/requirements/REQ-001-ac.md".into()]
+            )
+            .is_empty(),
+            "清单正文必须豁免（其完整性由 GATE 行比对 + sum= + hsum= 兜，不由 touch 兜）"
+        );
+        // 声明之后即放行（证明上一步不是恒拦）
+        let d2 = vec![decl("REQ-001", &[".gates/req-guard.yaml"])];
+        assert!(check_changes(Path::new("."), &d2, &[".gates/req-guard.yaml".into()]).is_empty());
     }
 
     #[test]

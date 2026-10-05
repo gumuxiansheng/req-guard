@@ -75,12 +75,27 @@ else
 fi
 
 step "3. init 接入门禁"
-if "${BIN}" init -p "${TMP}" >/dev/null 2>&1; then ok "init 成功"; else bad "init 失败"; fi
+# --for-ci：沙箱自检要脚本化审批，故用 L0 + 放弃 L3 的配置（真实项目用裸 init）。
+if "${BIN}" init --for-ci -p "${TMP}" >/dev/null 2>&1; then ok "init 成功"; else bad "init 失败"; fi
 
 step "4. create 建需求"
 OUT="$("${BIN}" create -p "${TMP}" -t "自检需求" 2>&1)"
 echo "     $(printf '%s' "${OUT}" | head -1)"
 case "${OUT}" in *REQ-001*) ok "创建 REQ-001" ;; *) bad "未创建 REQ-001：${OUT}" ;; esac
+
+step "4b. 填三段实质正文（段落实质性校验会拒模板占位）"
+# create 出来的是**模板**（占位勾选框），而 `approve` 会跑段落实质性校验（REQ-003）：
+# 只有占位/空行/注释/标题的段一律拒绝。故自检必须先填实质正文 ——
+# 这是与 auth.level 无关的**第二个**根因（曾让本脚本 3 个 approve 全红）。
+REQ_FILE="$(ls "${TMP}"/.gates/requirements/REQ-001*.md 2>/dev/null | head -1)"
+if [ -n "${REQ_FILE}" ] && awk '
+  /^## [0-9]+\. / && !done[$0]++ { print; print "- 自检夹具：本段已填入实质正文，用于验证门禁的段落实质性校验。"; next }
+  { print }
+' "${REQ_FILE}" > "${REQ_FILE}.tmp" 2>/dev/null && mv "${REQ_FILE}.tmp" "${REQ_FILE}"; then
+  ok "三段已填实质正文"
+else
+  bad "填充三段正文失败：${REQ_FILE}"
+fi
 
 step "5. 未批准时应拦截（期望退出码 1）"
 "${BIN}" check -p "${TMP}" >/dev/null 2>&1; RC=$?

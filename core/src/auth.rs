@@ -7,8 +7,13 @@
 //!   "没标记 = 人类"即 **fail-open** —— 2026-09-29 Firedit 事故根因。只作开发期加固。
 //! - **方案 B**（静态令牌）：`req-guard token issue` 签发短期令牌，原文由人类带外持有。
 //!   库文件只存 SHA-256 哈希于 `~/.config/req-guard/guard.cfg`。
-//! - **方案 D**（人类在场证明）：在**真实终端**打印一次性挑战码并要求回读。AI 的执行通道
-//!   是管道（实测 stdin/stdout 均非 TTY），既看不到交互提示也无法回读 → 天然被拒。
+//!   ⚠️ **该文件无完整性保护**（明文 key=value，无 MAC）：同用户进程改写 `hash=` 即可伪造。
+//!   与 [`crate::token`] 的自述一致 —— 它是**保密**问题，这里是**完整性**问题，后者更要命。
+//! - **方案 D**（人类在场证明）：在**真实终端**打印一次性挑战码并要求回读。朴素 AI 的执行通道
+//!   是管道（实测 stdin/stdout 均非 TTY），既看不到交互提示也无法回读 → 被拒。
+//!   ⚠️ 但挑战码打在 **stdout**、由**同一进程**从 stdin 读回，故 `pty.spawn` / `script` /
+//!   `expect` 一类分配了伪终端的调用即可满足 [`is_tty`]（实测）。它是**人类在场启发式**，
+//!   不是密码学证明 —— 与本模块开头「不要当安全边界用」的告诫一致。
 //! - **L3 一次性范围票据**（2026-09-30 新增）：见 [`crate::token`]，绑定需求+步骤、用后即废。
 //!
 //! ## 审批严格等级（`auth.level`，0–3）——本模块的判定主轴
@@ -27,6 +32,15 @@
 //! **为什么 L2 要断环境变量**：`export REQ_GUARD_TOKEN=…` 会被同一 shell 会话里的
 //! AI 子进程**继承**，等于把令牌交给 AI；改为进程内传入后，凭据不出人类进程。
 //! **为什么 L3 用一次性票据**：静态令牌在 TTL 内可被重放、且与审批对象无关。
+//!
+//! ## 本模块**不是**安全边界（措辞纪律）
+//! 四种凭据来源全部基于「环境变量 / 进程属性 / 本地文件哈希」，**无任何密码学机制**
+//! （全仓无 HMAC、无签名、无密钥）。它们防的是「AI 顺手自批」与「人类误操作」，
+//! **不防**有动机的对抗：能改 `git config`、能写 `~/.config/req-guard/guard.cfg`、
+//! 能分配伪终端的同用户进程都能通过。
+//! 本模块的文档过去在方案 D 上写「天然被拒」，与上述事实不符，已按实测改写 ——
+//! **治理工具的可信度取决于这类注释与实现之间的差距为零。**
+//! 真正的兜底在服务端：必需状态检查 + CODEOWNERS + 事后复核。
 //!
 //! 鉴权点放在 core（而非 CLI），TUI / GUI 与 CLI 自动获得同一约束。
 
@@ -304,20 +318,55 @@ pub fn authorize(
 /// 注：GUI / TUI 的进程内签发**不走本函数**——它们是人类亲手启动的界面进程，
 /// 由界面里的确认弹窗充当在场证明（见 [`crate::token::issue_scoped`] 的调用方）。
 pub fn ensure_token_admin(action: &str, root: &Path) -> Result<()> {
+    ensure_token_admin_opts(action, root, false)
+}
+
+/// [`ensure_token_admin`] 的带选项版本。
+///
+/// `i_lost_it` = 操作者**承认自己弄丢了当前凭据原文**，据此走恢复路径。
+///
+/// 为什么需要它（REQ-012 T6）：凭据一旦启用，重签/撤销就要求出示当前凭据。
+/// 于是「凭据丢了」= **永久锁死**——实测下来唯一的解法是手工删
+/// `~/.config/req-guard/guard.cfg`，而那不留任何痕迹，等于给了一条无审计的绕道。
+///
+/// 恢复路径刻意做得**比正常路径更贵**：`ensure_human`（人类在场）+ 强制留痕。
+/// 即「我承认丢凭据」这件事本身必须由人来做、且必须进**入库台账**，
+/// 不能是一个 AI 能悄悄自选的旁路。
+pub fn ensure_token_admin_opts(action: &str, root: &Path, i_lost_it: bool) -> Result<()> {
     let level = effective_level(root);
     if is_ai_context() {
         return Err(ai_ctx_err(action));
     }
     if crate::token::token_mode() {
-        return if admin_credential_ok(level) {
-            Ok(())
-        } else {
-            Err(GateError::Validation(format!(
-                "{}：本机已存在生效审批凭据，重签/撤销必须出示当前凭据（--token <当前凭据>）。\n\
-                 该限制用于阻止 AI 会话静默替换凭据后自批。",
-                action
-            )))
-        };
+        if admin_credential_ok(level) {
+            return Ok(());
+        }
+        if i_lost_it {
+            // 恢复路径：**不能**走 `ensure_human`——那会要求出示恰好已经丢掉的那枚凭据，
+            // 于是恢复通道自我堵死。改为要求**真实终端在场**（TTY 挑战码，与 L1 同款证明），
+            // 并强制留痕。两道缺一不可：挑战码挡管道里的自动化，REVOKE-FORCED 挡事后无痕。
+            if !is_tty() || !prove_presence(action) {
+                return Err(GateError::Validation(format!(
+                    "{} --i-lost-it：恢复路径必须由人类在**真实终端**执行。\n\
+                     （在管道/脚本里无法证明操作者是人类，故拒绝——这正是本路径存在的理由。）",
+                    action
+                )));
+            }
+            let who = crate::identity::bind(root, "unknown")
+                .map(|s| s.audit_fields())
+                .unwrap_or_default();
+            // 记台账而非只记本地日志：这是「承认弄丢了管理员凭据」的唯一可复核痕迹。
+            crate::gate::audit_ledger(root, &format!("REVOKE-FORCED action={action} {who}"));
+            crate::gate::audit(root, &format!("REVOKE-FORCED action={action}"));
+            return Ok(());
+        }
+        return Err(GateError::Validation(format!(
+            "{}：本机已存在生效审批凭据，重签/撤销必须出示当前凭据（--token <当前凭据>）。\n\
+             该限制用于阻止 AI 会话静默替换凭据后自批。\n\
+             若当前凭据原文确已丢失：加 --i-lost-it 走恢复路径（须人类在场，且会记入\
+             入库台账 REVOKE-FORCED 事件）。",
+            action
+        )));
     }
     if level >= 1 {
         return if is_tty() && prove_presence(action) {

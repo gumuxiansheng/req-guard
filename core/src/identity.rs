@@ -95,13 +95,20 @@ pub struct Stamp {
     pub mismatch: bool,
 }
 
+/// 无身份可用时降级戳里的 `sig`/`email` 占位值。
+///
+/// 公开出来是为了让读侧（`resolve::active_bypass`）能识别"这枚指纹根本不是算出来的、
+/// 而是占位符"，从而**显式降级**而不是把它当成一个算错的指纹去拒。
+/// 静默降级不可接受，所以读侧降级时必须留审计痕迹（见 REQ-012 设计 1）。
+pub const UNBOUND_SIG: &str = "-";
+
 impl Stamp {
-    /// 无身份可用时的降级戳（`email`/`sig` 均为 `-`）。
+    /// 无身份可用时的降级戳（`email`/`sig` 均为 [`UNBOUND_SIG`]）。
     fn unbound(reviewer: &str) -> Self {
         Stamp {
             reviewer: reviewer.to_string(),
-            email: "-".into(),
-            sig: "-".into(),
+            email: UNBOUND_SIG.into(),
+            sig: UNBOUND_SIG.into(),
             mismatch: false,
         }
     }

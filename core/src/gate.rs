@@ -415,12 +415,64 @@ pub fn validate_tools(tools: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `install` 的可选项。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstallOpts {
+    /// 沙箱/CI 自检模式（`init --for-ci`）：审批等级降到 L0，并显式声明放弃 L3。
+    ///
+    /// **为什么需要它**：门禁机制自检（发布包 selfcheck、CI 自举、CNB 主流程）
+    /// 要验的是「未过审必拦 / 已过审必放行」，按理可脚本化跑完；但模板默认
+    /// `auth.level: 3` 要求一次性范围票据，于是**任何脚本化 approve 都被拒**——
+    /// 表现为 selfcheck 7 PASS/7 FAIL、CI 自举 job 中止，即门禁自己过不了自己的门禁。
+    ///
+    /// **为什么不改默认值**：真实仓库就该保持最严。故这是显式场景开关，
+    /// 把「自检环境」与「生产环境」分开，而不是降低标准。
+    pub for_ci: bool,
+}
+
+/// 按 [`InstallOpts`] 派生沙箱版 YAML：**派生而非手写**（同 REQ-005 的口径）。
+///
+/// 手写第二份模板等于把这个文件未来的每次改动复制一遍，漏抄一处就表现为
+/// 「自检环境与真实环境行为不一致」——那正是本函数要消灭的问题。
+fn yaml_for(opts: InstallOpts) -> String {
+    if !opts.for_ci {
+        return REQ_GUARD_YAML.to_string();
+    }
+    let banner = concat!(
+        "# ⚠️ 本文件由 `req-guard init --for-ci` 生成：审批等级为 L0，且**声明放弃 L3**。\n",
+        "# 仅适用于「门禁机制自检 / 临时沙箱」——那里要验的是拦截逻辑，审批本就该脚本化。\n",
+        "# 真实项目请用裸 `req-guard init`（auth.level: 3 + enforce.ci: true）。\n",
+    );
+    let mut s = REQ_GUARD_YAML.replacen("version: 1\n", &format!("{banner}version: 1\n"), 1);
+    // 两处替换都锚在完整行上，避免误伤注释里出现的同名字样。
+    s = s.replace(
+        "  ci: true             # CI 侧拦截",
+        "  ci: false            # --for-ci：沙箱内没有真 CI，故显式声明放弃 L3",
+    );
+    s = s.replacen(
+        "  level: 3\n",
+        "  level: 0             # --for-ci：沙箱自检需脚本化审批\n",
+        1,
+    );
+    s
+}
+
 /// 安装 AI 需求门禁：生成脚本与声明文件 → 注入 AI 工具 hook → 追加 git pre-commit。
 ///
 /// 幂等：已含 `req-guard-check` 的配置/钩子不会重复写入；
 /// 已存在但不含门禁配置的 AI 工具配置文件**不会被覆盖**（避免破坏用户既有配置），
 /// 改为在 `notes` 中提示手工合并。
 pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathBuf>> {
+    install_with(root, tools, verbose, InstallOpts::default())
+}
+
+/// 安装（同 [`install`]，但可带 [`InstallOpts`]）。
+pub fn install_with(
+    root: &Path,
+    tools: &[String],
+    verbose: bool,
+    opts: InstallOpts,
+) -> Result<Vec<PathBuf>> {
     validate_tools(tools)?;
     let mut created = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -428,15 +480,19 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
     created.push(write_decl(
         root,
         ".gates/req-guard.yaml",
-        REQ_GUARD_YAML,
+        &yaml_for(opts),
         &mut notes,
     )?);
-    created.push(write_decl(
-        root,
-        ".gates/README.md",
-        &req_guard_readme(),
-        &mut notes,
-    )?);
+    let readme = if opts.for_ci {
+        format!(
+            "{}\n> ⚠️ 本仓库由 `init --for-ci` 生成：审批等级 L0、已声明放弃 L3。\n\
+             > 真实项目请用裸 `req-guard init`。\n",
+            req_guard_readme()
+        )
+    } else {
+        req_guard_readme()
+    };
+    created.push(write_decl(root, ".gates/README.md", &readme, &mut notes)?);
     ensure_readme_section(root, &mut notes)?;
     created.push(write_file(root, HOOK_SH_REL, HOOK_SH)?);
     created.push(write_file(root, HOOK_TOUCH_SH_REL, HOOK_TOUCH_SH)?);
@@ -995,7 +1051,55 @@ pub fn audit_kind(line: &str) -> AuditKind {
     }
 }
 
-/// 生成有时效的应急绕过令牌（写入 `.gates/.bypass`，并记审计）。
+/// 绕过令牌的**旧**位置（工作树内）。保留仅为迁移期读取，见 [`bypass_token_path`]。
+pub const BYPASS_REL: &str = ".gates/.bypass";
+
+/// 绕过窗口的 TTL 硬上限（分钟）。
+///
+/// 为什么必须有上限：`active_bypass` 只认 `expires_epoch`，故
+/// `expires_epoch=99999999999` 等价于**永不过期**的开关。加上限后这种模式不可能出现，
+/// 且因为 `bypass` 本身有 `ensure_human`，加上限只坑 AI、不影响人。
+/// 破坏性变更：`bypass --ttl 241` 从「接受」变为「拒绝」（CHANGELOG 已记 breaking）。
+pub const MAX_BYPASS_TTL_MINUTES: u64 = 240;
+
+/// 绕过令牌路径：**工作树之外**的用户级状态目录。
+///
+/// 为什么移出工作树（REQ-012 设计 2）：
+/// - 旧路径 `.gates/.bypass` 落在 `.gates/**` 豁免区内，且被 gitignore，
+///   于是它处于「隐形」状态——既不在 PR 里、也不受变更范围契约约束；
+/// - 绕过令牌本就是**运行态**（每次 `bypass` 覆写、过期即废），不该出现在
+///   「要评审的变更」里。移出后也不再与豁免集语义纠缠。
+///
+/// 目录按仓库绝对路径哈希隔离：同一台机器上多个 clone 互不干扰。
+/// XDG 未设置时逐级回落，且**回落必须可用**（REQ-012 B-05）。
+pub fn bypass_token_path(root: &Path) -> PathBuf {
+    let digest = crate::digest::sha256_hex(root.display().to_string().as_bytes());
+    let key = &digest[..16];
+    if let Some(base) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(base)
+            .join("req-guard")
+            .join(key)
+            .join("bypass");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home)
+                .join("Library/Application Support/req-guard")
+                .join(key)
+                .join("bypass");
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".local/state/req-guard")
+        .join(key)
+        .join("bypass")
+}
+
+/// 生成有时效的应急绕过令牌（写入状态目录，并记审计）。
 pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Result<PathBuf> {
     // 审批锁（§4.4）：绕过同样是审批类动作，AI 会话内禁止自助开启。
     crate::auth::ensure_human("bypass", root, crate::token::ScopeCheck::Exact("bypass"))?;
@@ -1003,6 +1107,16 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         return Err(GateError::Validation(
             "应急绕过必须填写原因（--reason），否则无法追溯".into(),
         ));
+    }
+    // TTL 硬上限：挡 `expires_epoch=99999999999` 这类"实质永不过期"的令牌（REQ-012 T2）。
+    if ttl_minutes == 0 || ttl_minutes > MAX_BYPASS_TTL_MINUTES {
+        return Err(GateError::Validation(format!(
+            "绕过窗口 ttl 必须在 1..={} 分钟之间（收到 {}）。\n\
+             应急绕过不是长期通道：单行 typo / 文档笔误 / 线上热修可用它，\n\
+             但功能开发、架构改动等会长期存在的代码必须建 REQ 走三段审核。\n\
+             若本次确需更长的窗口，请分段重新开启（每次都会独立留痕）。",
+            MAX_BYPASS_TTL_MINUTES, ttl_minutes
+        )));
     }
     let now = now_epoch();
     let expires = now + ttl_minutes.saturating_mul(60);
@@ -1034,12 +1148,34 @@ pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Resul
         stamp.audit_fields()
     );
     audit(root, &bypass_event);
-    // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）
+    // 关键事件入**入库台账**：绕过必须 PR 可见（§4.6）。
+    // active_bypass 的第② 道校验正是拿它交叉核对，所以必须与令牌同事务写入。
     audit_ledger(root, &bypass_event);
-    let written = write_file(root, ".gates/.bypass", &content)?;
+    let path = bypass_token_path(root);
+    // 旧路径令牌已失效（迁移后不再被读侧信任），清掉以免留下"看起来有效"的假令牌。
+    let legacy = root.join(BYPASS_REL);
+    if legacy.exists() {
+        let _ = fs::remove_file(&legacy);
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| GateError::Io {
+            path: Some(dir.to_path_buf()),
+            source: e,
+        })?;
+    }
+    let written = write_file_abs(&path, &content)?;
     // L3：绕过已生效 → 消费一次性票据（否则同一张票可在 TTL 内反复开绕过）。
     crate::auth::consume_credential_if_scoped();
     Ok(written)
+}
+
+/// 写绝对路径文件（[`write_file`] 只处理仓库内相对路径）。
+fn write_file_abs(path: &Path, content: &str) -> Result<PathBuf> {
+    fs::write(path, content).map_err(|e| GateError::Io {
+        path: Some(path.to_path_buf()),
+        source: e,
+    })?;
+    Ok(path.to_path_buf())
 }
 
 // ===================== 注入实现 =====================
@@ -1278,14 +1414,65 @@ req-guard touch-check || exit 1
 pub fn touch_exempt_patterns(root: &Path) -> Vec<String> {
     // `.gitignore` 必须在里面：`append_gitignore` 是**门禁自己**写它的，
     // 不豁免等于工具每次 `install` 都给自己下一个未声明文件的判。
-    const DEFAULT: [&str; 5] = [
-        ".gates/**",
-        "target/**",
-        "dist/**",
-        "Cargo.lock",
-        ".gitignore",
-    ];
+    const DEFAULT: [&str; 4] = ["target/**", "dist/**", "Cargo.lock", ".gitignore"];
     let mut out: Vec<String> = DEFAULT.iter().map(|s| s.to_string()).collect();
+
+    // 门禁自己的**运行态**：install / audit 会写，AI 不该为它们建 REQ（REQ-012 T9）。
+    //
+    // 为什么从 `.gates/**` 收窄成具名清单：`.gates/**` 把**门禁配置本身**也圈了进去 ——
+    // `.gates/req-guard.yaml`（含 auth.level / enforce.ci / touch.exempt）与
+    // `.gates/audit/ledger.md`。实测：AI 改掉 `auth.level` 与 `enforce.ci` 后，
+    // `touch-check` 报「✅ 变更范围合规」，即**门禁可被自改且无人告知**。
+    //
+    // 刻意**不进**本清单的项（各有专门机制兜）：
+    // - `.gates/.bypass`：已迁出工作树（[`bypass_token_path`]）；
+    // - `.gates/requirements/**`：AI 本就需写清单正文，纳入会产生大量假阳性
+    //   （非目标 N5），其完整性改由 `sum=` 摘要 + 头部摘要覆盖；
+    // - `.gates/req-guard.yaml` / `ledger.md`：必须走变更范围声明 + 服务端漂移检测
+    //   （[`config_drift_undeclared`]），这样「改了配置」会在 PR 里变成一条明确的失败。
+    // `.gates/requirements/**` **仍在豁免内**，这是刻意的（实测踩过）：
+    // 清单正文是 AI 的正常工作产物，且**在任何清单被批准之前**它就得先写出来 ——
+    // 若要求声明，就陷入「要声明先得有已批清单 approve，而 approve 又要先有正文」的循环；
+    // 连带后果是清单改动无法提交，AI 永远无法把填好的清单 commit 上去。
+    // 它的完整性**不由 touch 兜**，而由另外三道承担：
+    //   ① GATE 标记行必须与磁盘逐行一致（`doc_write_guard`，防伪造审批状态）；
+    //   ② 已批准段的 `sum=` 内容冻结（防偷改正文）；
+    //   ③ 头部摘要 `hsum=`（REQ-012 T14，覆盖 frontmatter 与审核记录）。
+    //
+    // 刻意**不进**本清单的项（各有专门机制兜）：
+    // - `.gates/.bypass`：已迁出工作树（[`bypass_token_path`]）；
+    // - `.gates/req-guard.yaml`：含 auth.level / enforce.ci / touch.exempt。
+    //   放进豁免区等于**允许 AI 自己把门禁调松**（实测 touch-check 报「✅ 合规」）。
+    //   改它必须走变更范围声明 + 服务端漂移检测（[`config_drift_undeclared`]），
+    //   于是「改门禁配置」会在 PR 里变成一条明确的 CI 失败。
+    // - `.gates/audit/ledger.md`：**本条是实施期发现的设计错误，改为豁免**（见下）。
+    //
+    //   最初把台账也移出豁免区，理由是「审批轨迹不该被 AI 改」。实施后立刻撞上：
+    //   台账是 req-guard 在**每次审批时自动追加**的工具产物，把它移出豁免区等于
+    //   「每次 approve 都让工作区变成 NotDeclared」，于是团队只有三条路 ——
+    //   ① 给自己加回豁免（等于绕开，净收益为 0）；② `--no-verify`；③ 停止用台账。
+    //   **摩擦大到必然被绕开的设计，不是设计。**
+    //   而台账的真正保护从来不是 touch：它**已入库**，任何篡改都是 PR 里可见的 diff，
+    //   配上 CODEOWNERS 即为有效评审。REQ-012 设计 1 第② 道校验依赖的也正是
+    //   「台账在版本控制里」，不可提交会让那个设计自相矛盾。
+    //
+    //   结论：台账与清单正文同属「工具写的、必须可提交的状态」，一并豁免；
+    //   门禁**配置**（`req-guard.yaml`）不同 —— 改它会静默改变执行强度，故不豁免。
+    const RUNTIME: [&str; 8] = [
+        ".gates/hooks/**",
+        ".gates/ci/**",
+        ".gates/drafts/**",
+        ".gates/requirements/**",
+        ".gates/README.md",
+        ".gates/audit/gate-audit.log",
+        ".gates/audit/ledger.md",
+        ".gates/audit/DIGEST",
+    ];
+    for p in RUNTIME {
+        if !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    }
 
     // **派生源**（REQ-005 G1）：install 往哪些路径写 AI 工具 hook 配置，豁免就跟着
     // 放行哪些 —— 与 install 共用同一份 [`TOOL_PROFILES`]，不手写第二条清单。
@@ -1470,19 +1657,124 @@ fn verify_ci(root: &Path) -> Vec<String> {
         );
         return problems;
     }
-    if !orchs.iter().any(|p| {
-        fs::read_to_string(p)
-            .map(|c| c.contains("req-guard"))
-            .unwrap_or(false)
-    }) {
+    // 真正调用 req-guard 的编排文件（不是「恰好提到 req-guard」）。
+    // 分界标准：必须**执行**门禁子命令，而不是在注释里提到它——
+    // 旧判据 `contains("req-guard")` 太宽，本仓自己的 ci.yml 就能靠注释通过。
+    let calling: Vec<&PathBuf> = orchs
+        .iter()
+        .filter(|p| {
+            fs::read_to_string(p)
+                .map(|c| calls_gate(&c))
+                .unwrap_or(false)
+        })
+        .collect();
+    if calling.is_empty() {
         let names: Vec<String> = orchs.iter().map(|p| p.display().to_string()).collect();
         problems.push(format!(
-            "存在 CI 编排（{}）但未调用 req-guard——L3 缺口：本机绕过（含 --no-verify）\
-             服务端无人抵消；把 .gates/ci/req-guard-ci.yml 复制进编排并设为必需状态检查",
+            "存在 CI 编排（{}）但未**执行** req-guard 子命令——L3 缺口：本机绕过（含 --no-verify）\
+             服务端无人抵消；把 .gates/ci/req-guard-ci.yml 复制进编排并设为必需状态检查\
+             （仅在注释里提到 req-guard 不算接入）",
             names.join(", ")
         ));
+        return problems;
+    }
+
+    // 逐条检查「接入了，但接法会静默失效」（REQ-012 T7b）。
+    // 这三条都是实测过的真实失效形态，且**失败原因与门禁判定毫无关系**，
+    // 排查成本极高 —— 所以必须在 verify 阶段就拦住，而不是让人去猜。
+    for p in &calling {
+        let Ok(text) = fs::read_to_string(p) else {
+            continue;
+        };
+        let name = p.display().to_string();
+        let uses_base = text.contains("check --base") || text.contains("touch-check --base");
+
+        // ① GitHub Actions 的 checkout 默认 depth=1 → origin/main 不存在 → --base 硬失败。
+        //    只对 actions/checkout@v4 这类 Actions 模板要求（GitLab/CNB 默认完整历史）。
+        if text.contains("actions/checkout") && !text.contains("fetch-depth") && uses_base {
+            problems.push(format!(
+                "{name}：用了 `--base` 但 checkout 未设 `fetch-depth: 0`。\
+                 默认 depth=1 下 origin/<默认分支> 在本地不存在，两条 --base 步骤会以\
+                 `fatal: ambiguous argument` 硬失败，且报错与门禁判定无关。"
+            ));
+        }
+        // ② `--base` 必须带非空 ref。裸 `--base`（或紧跟注释/行尾）会让变更集解析失败。
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if !t.starts_with('#')
+                && (t.contains(" check --base") || t.contains("touch-check --base"))
+            {
+                let after = t.split("--base").nth(1).unwrap_or("").trim();
+                let has_ref = !after.is_empty()
+                    && !after.starts_with('#')
+                    && after
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|r| !(r.starts_with('"') && r.len() == 1));
+                if !has_ref {
+                    problems.push(format!(
+                        "{name}:{}：`--base` 后缺 ref。裁决对象是「本次变更集」，\
+                         裸 `--base` 无变更集可依，在多需求仓库下会恒拦（L3 静默失效）。",
+                        i + 1
+                    ));
+                }
+            }
+        }
+        // ③ 版本必须自证：`req-guard -V` 与声明版本比对，避免「本机新 / CI 旧」静默错配。
+        if text.contains("download/") && !text.contains("-V") {
+            problems.push(format!(
+                "{name}：从 Release 下载二进制但缺版本自证（加一步 \
+                 req-guard -V 并与声明版本比对）。\
+                 否则本机与 CI 版本错配时，门禁会用旧二进制判新格式清单且无人察觉。"
+            ));
+        }
     }
     problems
+}
+
+/// CI 编排是否**执行**了 req-guard 子命令（而非仅在注释/名称里提到）。
+///
+/// 判据刻意收窄到「行内出现 `./req-guard ` / `req-guard ` + 已知子命令」：
+/// 只判 `contains("req-guard")` 会让「文件名叫 req-guard-ci.yml」或
+/// 「注释里写了 req-guard」都算接入，那正是「看着在拦、其实没拦」的同族。
+fn calls_gate(text: &str) -> bool {
+    const SUBS: &[&str] = &[
+        "check",
+        "touch-check",
+        "ac",
+        "ids",
+        "install",
+        "bypass-audit",
+    ];
+    /// 去掉包裹用的引号/行尾标点，让 `./req-guard"` 与 `./req-guard,` 也能识别。
+    fn bare(w: &str) -> &str {
+        w.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';')
+    }
+    text.lines().any(|raw| {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            return false;
+        }
+        // 两个条件都要满足，否则「提到但没执行」会被误判成已接入：
+        // ① **相邻**：`req-guard` 后面紧跟子命令（否则 `echo "req-guard check 很重要"`
+        //    里那个 check 只是被 split 出来的普通词）；
+        // ② **命令位**：`req-guard` 前一个词必须是命令位（`-` / `run:` / `&&` / `|` …），
+        //    而不能是 `echo` 这类「把它当参数」的动词 —— 后者是引用，不是执行。
+        //
+        // 诚实说明：这仍是**启发式**（不解析 shell 语法），只挡已知的两种误接形态，
+        // 不宣称能证明「真的执行了」。真正的兜底在服务端：让本 job 成为必需状态检查。
+        const CMD_POS: &[&str] = &["-", "run:", "&&", "||", "|", ";", "then", "do", "else"];
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        toks.windows(2).enumerate().any(|(i, w)| {
+            if bare(w[0]).trim_start_matches("./") != "req-guard" || !SUBS.contains(&bare(w[1])) {
+                return false;
+            }
+            match i.checked_sub(1).map(|j| bare(toks[j])) {
+                None => true,
+                Some(prev) => CMD_POS.contains(&prev),
+            }
+        })
+    })
 }
 
 /// `req-guard install --verify`：校验门禁是否真正就位（§4.5，供 CI 使用）。
@@ -1509,6 +1801,16 @@ fn read_hook(root: &Path, rel: &str) -> Option<String> {
 }
 
 pub fn verify_install(root: &Path) -> Vec<String> {
+    verify_install_with(root, None, true)
+}
+
+/// [`verify_install`] 的带选项版本。
+///
+/// - `base` = 服务端比对的基线 ref（CI 传 `origin/<默认分支>`）。给了才做配置漂移检测；
+///   本地不给即跳过（本地没有「PR 视角」，硬判只会误报）。
+/// - `semantic` = 是否实跑装好的拦截脚本做语义自检（REQ-012 T11）。
+///   `--quick` 时关掉，只保留子串快筛。
+pub fn verify_install_with(root: &Path, base: Option<&str>, semantic: bool) -> Vec<String> {
     let mut problems = Vec::new();
 
     for rel in [
@@ -1528,20 +1830,8 @@ pub fn verify_install(root: &Path) -> Vec<String> {
     // 主门禁脚本改为「只取参 + 委托 req-guard check」之后，下列任一不满足都意味着
     // 裁决逻辑仍留在脚本里（= 判定有两处真相）或 CI 拿不到变更集（L3 静默失效）。
     if let Some(sh) = read_hook(root, HOOK_SH_REL) {
-        for (needle, why) in [
-            (
-                "req-guard check --stdin",
-                "主门禁脚本未委托 core 判定（PreToolUse 侧）",
-            ),
-            (
-                "req-guard check --staged",
-                "主门禁脚本未委托 core 判定（pre-commit 侧）",
-            ),
-        ] {
-            if !sh.contains(needle) {
-                problems.push(format!("{HOOK_SH_REL} {why}（缺 `{needle}`）"));
-            }
-        }
+        // 反向子串检查（禁止脚本自建判定）保留为 **Error**：它防的是「判定散落到第二处」，
+        // 那种失效无法靠实跑覆盖（REQ-006 遗产）。
         for (needle, why) in [
             (
                 "sort -r",
@@ -1667,7 +1957,188 @@ pub fn verify_install(root: &Path) -> Vec<String> {
         }
     }
 
+    // 配置漂移检测（REQ-012 T10）：`.gates/req-guard.yaml` 不再在豁免集内，
+    // 但 touch-check 只在**本机**跑，且 AI 可以顺手把自己要改的文件声明进去。
+    // 真正站得住的是「PR 可见性」：用 `--base` 比对，改了配置又没有任何清单
+    // 为它背书 → 在 CI 里变成一条明确的失败，交由 CODEOWNERS 评审。
+    if let Some(b) = base {
+        problems.extend(config_drift_undeclared(root, Some(b)));
+    }
+
+    // 语义自检：实跑装好的脚本，而不是看它「长得像不像」（REQ-012 T11）。
+    if semantic {
+        problems.extend(verify_hook_behaviour(root));
+    }
+
     problems
+}
+
+/// **语义自检**：实跑装好的拦截脚本，验「未过审必拦 / 已过审必放行」。
+///
+/// 为什么必须实跑（REQ-012 T11，问题 5 的本体）：原来的 `verify_install` 只做
+/// 子串存在性检查（`sh.contains("req-guard check --stdin")`）。实测在脚本顶部插入
+/// 一行 `exit 0`（保留后面的委托行）后，`install --verify` 报 **PASS** ——
+/// 而 hook 已永久放行。存在性 ≠ 行为，那道墙当时等于没有。
+///
+/// 两个方向都必须验，缺一即等于没测：
+/// - 「未过审未拦截」= 门禁失效（本工具最坏的失效方向）；
+/// - 「已过审误拦」= 同族的另一半（恒拦截），同样让门禁不可用且原因难查。
+///
+/// 验的是**装好的那份脚本**（从 `root` 拷进沙箱），不是 `HOOK_SH` 常量 ——
+/// 否则测的是「我们发布的常量」，而 CI 关心的是「这个仓库里装着的那个文件」。
+fn verify_hook_behaviour(root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let installed = root.join(HOOK_SH_REL);
+    if fs::metadata(&installed).is_err() {
+        return problems; // 缺资产已由 verify_install 单独报，不重复
+    }
+
+    // 必须先找到**真的** req-guard 可执行文件：脚本内部要 `command -v req-guard`，
+    // 找不到就只会以「二进制不在 PATH」恒拦 —— 那是 fail-closed 的正确行为，
+    // 但会让本自检两个方向都得到假的结论（比不测更坏：看着在测，其实在测别的东西）。
+    let Some(bin) = resolve_gate_binary(root) else {
+        return problems;
+    };
+
+    // 沙箱：git init + 装上**这一份**脚本 + 一份未过审清单。
+    let sandbox = match sandbox_repo("verify-semantic") {
+        Ok(d) => d,
+        Err(e) => return vec![format!("语义自检无法搭建沙箱：{e}")],
+    };
+    let req_id = match stage_hook_and_req(&sandbox, &installed) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&sandbox);
+            return vec![format!("语义自检无法准备夹具：{e}")];
+        }
+    };
+
+    // 方向一：未过审 → 必须拦。
+    if run_installed_hook(&sandbox, &bin).is_ok() {
+        problems.push(
+            "语义自检：装好的拦截脚本对「未过审」场景**未拦截**（实跑退出码 0）——\
+             门禁在该拦的地方放行了。常见成因：脚本被加了提前 exit、被替换成恒 0，\
+             或判定被摘掉。"
+                .into(),
+        );
+    }
+
+    // 方向二：三段已批 → 必须放行（防「恒拦截」这一同族失效）。
+    // 沙箱里降到 L0：这里要验的是「判定逻辑」，审批本就该脚本化（同 init --for-ci 的理由）。
+    let _ = fs::write(
+        sandbox.join(".gates/req-guard.yaml"),
+        "auth:\n  level: 0\ntouch:\n  exempt: [\"**\"]\n",
+    );
+    // 批准**同一份**清单（方向一用的那份）。
+    // 刻意不新建：多需求仓库下 `check` 按变更集反查归属并要求**候选清单全部过审**，
+    // 留一份 pending 清单在仓里会让方向二恒拦 —— 那是夹具自造的真失败，不是门禁缺陷。
+    let approved = (|| -> std::result::Result<(), String> {
+        for step in ["decomposition", "solution", "testplan"] {
+            // review(root, id, step, reviewer, pass, reason, strict)
+            crate::requirement::review(&sandbox, &req_id, step, "semantic", true, "", false)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = approved {
+        problems.push(format!("语义自检：夹具准备失败（{e}），该方向未验证"));
+    } else if run_installed_hook(&sandbox, &bin).is_err() {
+        problems.push(
+            "语义自检：装好的拦截脚本对「已过审」场景**误拦**（实跑非 0 退出码）——\
+             门禁恒拦截，同样不可用。"
+                .into(),
+        );
+    }
+    let _ = fs::remove_dir_all(&sandbox);
+    problems
+}
+
+/// 把装好的脚本 + 一份未过审清单摆进沙箱（不依赖 `install`，避免自证）。
+fn stage_hook_and_req(sandbox: &Path, installed: &Path) -> std::result::Result<String, String> {
+    let hooks = sandbox.join(".gates/hooks");
+    fs::create_dir_all(&hooks).map_err(|e| e.to_string())?;
+    let dst = hooks.join("req-guard-check.sh");
+    fs::copy(installed, &dst).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&dst).map_err(|e| e.to_string())?.permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&dst, perm).map_err(|e| e.to_string())?;
+    }
+    let r = crate::requirement::create(sandbox, None, "语义自检夹具").map_err(|e| e.to_string())?;
+    fill_sections_for_fixture(sandbox, &r.id);
+    Ok(r.id)
+}
+
+/// 实跑沙箱里那份脚本（stdin 喂 PreToolUse payload；非 TTY → 走 hook 的 payload 分支）。
+///
+/// 把当前可执行文件所在目录加进子进程 PATH —— 脚本内部要调 `req-guard`，
+/// 沙箱里没有它就只会报「二进制不在 PATH」而恒拦，那测的是另一件事。
+fn run_installed_hook(sandbox: &Path, bin: &Path) -> std::result::Result<(), String> {
+    let bin_dir = bin.parent().ok_or("可执行文件无父目录")?.to_path_buf();
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    path.insert_str(0, &format!("{}:", bin_dir.display()));
+    let mut cmd = Command::new("sh");
+    cmd.current_dir(sandbox)
+        .arg(sandbox.join(".gates/hooks/req-guard-check.sh"))
+        .env("PATH", path)
+        // 刻意**清掉** AI 会话标记：沙箱里是「人类装了门禁、CI 在跑」的场景，
+        // 而审批锁标记会让 approve 被拒，导致方向二恒拦、结论变成假的。
+        .env_remove(crate::auth::AI_CTX_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    if let Some(mut si) = child.stdin.take() {
+        use std::io::Write;
+        let _ =
+            si.write_all(br#"{"tool_name":"Write","tool_input":{"file_path":"core/src/x.rs"}}"#);
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// 门禁声明文件相对仓库根的路径（配置漂移检测的守卫对象）。
+pub const GATE_YAML_REL: &str = ".gates/req-guard.yaml";
+
+/// 服务端检测「改了门禁配置但无清单背书」。
+///
+/// 为什么需要它：T9 把 `.gates/req-guard.yaml` 从豁免集里摘出来后，touch-check
+/// 确实会报 `NotDeclared` —— 但那只发生在**本机**，而 AI 可以顺手把
+/// `.gates/req-guard.yaml` 写进自己的 `GATE:TOUCH` 把判据消掉。于是仍需要一个
+/// **服务端独立**的判据：本次 PR 改了配置，而没有任何未归档清单声明它。
+///
+/// 这不是密码学保证（AI 也可以给清单补一条声明再改配置），但它把
+/// 「改门禁配置」变成 PR 里**必然被评审看到**的一条变更 —— 在信任模型不变的前提下，
+/// 这是唯一能跨过边界的机制（同设计 1 的第② 道校验）。
+fn config_drift_undeclared(root: &Path, base: Option<&str>) -> Vec<String> {
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let Ok(changed) = crate::touch::diff_files(root, base) else {
+        // 取不到差异集（浅克隆 / ref 不存在）→ **不静默放行**，但也不误报为漂移：
+        // 报一条可操作的提示，把「--base 需要完整历史」这件事在 verify 阶段就说出来。
+        return vec![format!(
+            "无法比对基线 `{base}`（浅克隆或 ref 不存在）——配置漂移检测已跳过。\
+             CI 侧须设 `fetch-depth: 0`，否则该检测形同虚设。"
+        )];
+    };
+    if !changed.iter().any(|p| p == GATE_YAML_REL) {
+        return Vec::new();
+    }
+    if crate::touch::declared_by_any_live_req(root, GATE_YAML_REL) {
+        return Vec::new();
+    }
+    vec![format!(
+        "{GATE_YAML_REL} 在本次变更（相对 {base}）中被修改，但没有任何未归档清单的 \
+         GATE:TOUCH 声明它。该文件含 auth.level / enforce.ci / touch.exempt / multi.mode ——\
+         改它等于改门禁自身的强度，须由评审人复核（建议同时挂 CODEOWNERS）。"
+    )]
 }
 
 /// 追加 git pre-commit（幂等；不覆盖 gates-toolkit 已写入的内容）。
@@ -1736,8 +2207,10 @@ fn append_pre_commit(
 
 /// 追加 `.gitignore` 条目（幂等；只追加，不覆盖用户既有内容）。
 ///
-/// 绕行令牌 `.gates/.bypass` 与审计日志是**本机运行态**，入库会造成误导
-/// （别人 clone 后拿到一个已过期的绕行窗口），必须在生成时就把它们忽略掉。
+/// 审计日志是**本机运行态**，入库会造成误导（别人 clone 后拿到一份别人的日志），
+/// 必须在生成时忽略。
+/// 绕行令牌**已不再写入工作树**（REQ-012 设计 2：迁到用户级状态目录），但条目保留：
+/// 存量仓库里可能还有迁移前的旧文件，忽略它可免得升级后凭空冒出一个未跟踪文件。
 fn append_gitignore(
     root: &Path,
     created: &mut Vec<PathBuf>,
@@ -1968,8 +2441,22 @@ multi:
 touch:
   # 不参与比对的前缀（门禁自身运行态与构建产物）。
   # 刻意**不含** .github/workflows/**：改 CI 编排就该被声明。
+  # 刻意**不含** .gates/** 通配（REQ-012 T9）：那会把 .gates/req-guard.yaml
+  # （auth.level / enforce.ci 都在这里）与 .gates/audit/ledger.md 一起圈进豁免区，
+  # 导致 AI 可以自改门禁配置而无人告知。故逐项列出。
   exempt:
-    - .gates/**          # 门禁自身运行态 + 需求清单（AI 必须能改自己的文档）
+    - .gates/hooks/**               # 拦截脚本（install 写）
+    - .gates/ci/**                  # L3 接入样例（install 写）
+    - .gates/drafts/**              # 草稿区（AI 工作态）
+    - .gates/requirements/**        # 清单正文：AI 必须能写自己的文档，且改动要能提交；
+                                     # 完整性由 GATE 标记行逐行比对 + sum= 内容冻结 + hsum= 头部摘要保证
+    - .gates/README.md              # install 生成的说明
+    - .gates/audit/gate-audit.log   # 本机审计日志（运行态，不入库）
+    - .gates/audit/ledger.md        # 入库审批台账：工具每次审批自动追加，必须可提交；
+                                     # 其保护是「已入库 → 篡改是 PR 里可见的 diff」+ CODEOWNERS
+    - .gates/audit/DIGEST           # 审计摘要（audit-digest 写）
+    # 注意：.gates/req-guard.yaml **不在**豁免内 —— 改门禁配置会静默改变执行强度
+    # （auth.level / enforce.ci），必须走变更范围声明 + CI 侧漂移检测。
     - target/**          # 构建产物
     - dist/**            # 发布产物
     - Cargo.lock         # 锁文件
@@ -2126,8 +2613,10 @@ resolve / done / bypass` 检测到该标记即**拒绝执行**——AI 经 Shell
 req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 ```
 
-绕过窗口内放行，但**每次都写审计日志** `.gates/audit/gate-audit.log`。
-`.gates/.bypass` 已被 `.gitignore` 忽略，不会入库。
+绕过窗口内放行，但**每次都写审计日志** `.gates/audit/gate-audit.log`，
+并把事件写入**入库台账** `.gates/audit/ledger.md`（PR 可复核）。
+令牌本体在工作树之外的用户级状态目录（不入库、不进 PR）；且它须通过
+身份自证 + 台账交叉核对两道校验才生效 —— 手写一个 `expires_epoch` 已无法解除门禁。
 
 **人肉开发场景**：typo 修正、文档笔误、线上热修、临时试改等不值得建 REQ 的改动，
 可直接 `bypass --reason <原因> --ttl <分钟>`（默认 60 分钟，到期自动失效）。
@@ -2242,7 +2731,7 @@ if ! command -v req-guard >/dev/null 2>&1; then
   echo "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。" >&2
   echo "          判定在 core，缺二进制即无从判定 —— fail-closed，不猜。" >&2
   echo "          请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。" >&2
-  echo "          确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。" >&2
+  echo "          确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）" >&2
   exit 1
 fi
 if [ -n "${STDIN_DATA:-}" ]; then
@@ -2296,7 +2785,7 @@ if ($stdinData.Trim()) {
 # 镜像负债之所以只剩这一处，正是因为第 1 段之后的一切裁决都已下沉到 core。
 if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
     Write-GateAudit "BLOCK no-binary"
-    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。"
+    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）。"
     exit 1
 }
 if ($stdinData.Trim()) {
@@ -2341,6 +2830,114 @@ exit 0
 "#;
 
 // ===================== 单元测试 =====================
+
+/// `install --verify` 的**告警**项（不阻断；`--quick` 下也只有这些）。
+///
+/// 为什么把「正向子串检查」从 Error 降为告警（REQ-012 T12，问题 5 的本体）：
+/// 那道判据问的是「脚本里有没有某行字」，而**存在性 ≠ 行为**。实测在脚本顶部插入
+/// `exit 0`（保留后面的委托行）后，它报 PASS —— 门禁已永久放行而自检全绿。
+/// 真正的判据是 [`verify_hook_behaviour`] 的实跑语义。
+///
+/// 保留它作为告警仍有价值：它是**免费**的（不 spawn 进程），
+/// 且能精确指出「少了哪一行」，在实跑之前就给出方向。
+pub fn verify_warnings(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(sh) = read_hook(root, HOOK_SH_REL) else {
+        return out;
+    };
+    for (needle, why) in [
+        (
+            "req-guard check --stdin",
+            "主门禁脚本未委托 core 判定（PreToolUse 侧）",
+        ),
+        (
+            "req-guard check --staged",
+            "主门禁脚本未委托 core 判定（pre-commit 侧）",
+        ),
+    ] {
+        if !sh.contains(needle) {
+            out.push(format!(
+                "{HOOK_SH_REL} {why}（缺 `{needle}`）——存在性检查仅供参考，\
+                 行为由实跑语义自检判定"
+            ));
+        }
+    }
+    out
+}
+
+/// 造一个 `git init` 过的空仓库沙箱（语义自检夹具用；故放在生产代码而非 `testutil`）。
+fn sandbox_repo(tag: &str) -> std::io::Result<PathBuf> {
+    let mut p = std::env::temp_dir();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    p.push(format!("req-guard-{tag}-{}-{}", std::process::id(), n));
+    let _ = fs::remove_dir_all(&p);
+    fs::create_dir_all(&p)?;
+    let ok = Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(&p)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = fs::remove_dir_all(&p);
+        return Err(std::io::Error::other(
+            "git init 失败（语义自检需要 git 仓库）",
+        ));
+    }
+    Ok(p)
+}
+
+/// 给夹具清单的三段各填一行实质正文（段落实质性校验会拒模板占位）。
+fn fill_sections_for_fixture(root: &Path, id: &str) {
+    let Ok(r) = crate::requirement::find(root, id) else {
+        return;
+    };
+    let Ok(mut c) = fs::read_to_string(&r.path) else {
+        return;
+    };
+    for (heading, line) in [
+        ("## 1. 需求分解", "- 语义自检夹具：本段已填入实质正文。"),
+        ("## 2. 技术方案", "- 语义自检夹具：本段已填入实质正文。"),
+        ("## 3. 测试计划", "- 语义自检夹具：本段已填入实质正文。"),
+    ] {
+        let needle = format!("{heading}\n");
+        if c.contains(&format!("{needle}\n{line}")) {
+            continue;
+        }
+        c = c.replacen(&needle, &format!("{needle}\n{line}\n"), 1);
+    }
+    let _ = fs::write(&r.path, c);
+}
+
+/// 找到一个可用的 `req-guard` 可执行文件，供语义自检放进子进程 PATH。
+///
+/// 查找顺序（覆盖 CI 与本地两种真实形态）：
+/// 1. `root/req-guard` —— CI 模板把 Release 二进制下在这里（`./req-guard`）；
+/// 2. `root/target/{release,debug}/req-guard` —— 本地开发；
+/// 3. PATH 上的 `req-guard`。
+///
+/// **找不到就返回 None（跳过自检），绝不拿「找不到」当「判失败」**：
+/// 那样两个方向都会得到恒拦的假结论，自检就成了摆设。
+fn resolve_gate_binary(root: &Path) -> Option<PathBuf> {
+    let mut cands = vec![
+        root.join("req-guard"),
+        root.join("target/release/req-guard"),
+        root.join("target/debug/req-guard"),
+    ];
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            cands.push(Path::new(dir).join("req-guard"));
+            cands.push(Path::new(dir).join("req-guard.exe"));
+        }
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2405,13 +3002,22 @@ mod tests {
         let root = temp_dir("exempt-derive");
         install(&root, &["none".to_string()], false).unwrap();
         let set = touch_exempt_patterns(&root);
-        // 默认 5 条一条不少（漏一条就是把门禁自己的运行态变成未声明文件）
+        // 默认集一条不少（漏一条就是把门禁自己的运行态变成未声明文件）。
+        // REQ-012 T9 后 `.gates/**` 拆成具名清单 —— 刻意**不含**
+        // `.gates/req-guard.yaml` 与 `.gates/audit/ledger.md`（见下方断言）。
         for d in [
-            ".gates/**",
             "target/**",
             "dist/**",
             "Cargo.lock",
             ".gitignore",
+            ".gates/hooks/**",
+            ".gates/ci/**",
+            ".gates/drafts/**",
+            ".gates/requirements/**",
+            ".gates/README.md",
+            ".gates/audit/gate-audit.log",
+            ".gates/audit/ledger.md",
+            ".gates/audit/DIGEST",
         ] {
             assert!(set.iter().any(|p| p == d), "默认项缺失：{d}\n{set:?}");
         }
@@ -2460,17 +3066,35 @@ mod tests {
             "配置项须生效：{set:?}"
         );
         for d in [
-            ".gates/**",
             "target/**",
             "dist/**",
             "Cargo.lock",
             ".gitignore",
+            ".gates/hooks/**",
+            ".gates/requirements/**",
         ] {
             assert!(
                 set.iter().any(|p| p == d),
                 "配置不得覆盖默认项 {d}（替换语义是陷阱）：{set:?}"
             );
         }
+        // 收窄的**核心断言**：`.gates/**` 大通配与门禁**配置**不得回到豁免区。
+        // 配置在豁免区 = AI 可以自改 auth.level / enforce.ci 而 touch-check 报「✅ 合规」。
+        //
+        // 注意 `.gates/audit/ledger.md` **刻意豁免**（实施期修正）：它是 req-guard 每次
+        // 审批自动追加的入库台账，不豁免会让「每次 approve」都触发 NotDeclared ——
+        // 那种摩擦必然被 --no-verify 绕开，反而使设计失效。
+        for forbidden in [".gates/**", ".gates/req-guard.yaml"] {
+            assert!(
+                !set.iter().any(|p| p == forbidden),
+                "{forbidden} 不该在豁免集内（REQ-012 T9）：{set:?}"
+            );
+        }
+        // 台账必须在豁免集内（实施期修正的理由，见上面注释）。
+        assert!(
+            set.iter().any(|p| p == ".gates/audit/ledger.md"),
+            "入库台账必须可提交（否则每次 approve 都触发 NotDeclared）：{set:?}"
+        );
         assert_eq!(
             1,
             set.iter().filter(|p| *p == "custom/**").count(),
@@ -3634,5 +4258,100 @@ mod tests {
                 def
             );
         }
+    }
+
+    // ===================== REQ-012 T7b：L3 接入质量可判定 =====================
+
+    /// 造一个「已接 L3」的最小编排（裸 init → enforce.ci: true），写入指定内容。
+    fn ci_repo(tag: &str, body: &str) -> std::path::PathBuf {
+        let root = temp_dir(tag);
+        install(&root, &["none".to_string()], false).unwrap();
+        let d = root.join(".github/workflows");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("req-guard-ci.yml"), body).unwrap();
+        root
+    }
+
+    const GOOD_CI: &str = "name: x
+jobs:
+  j:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: curl -fsSL -o r https://x/releases/download/v1/r
+      - run: ./req-guard -V
+      - run: ./req-guard check --base origin/main
+";
+
+    /// U-29 缺 fetch-depth：用了 --base 却在 depth=1 下跑 → 报缺口。
+    #[test]
+    fn u29_检出缺fetch_depth() {
+        let root = ci_repo(
+            "u29",
+            "jobs:\n  j:\n    steps:\n      - uses: actions/checkout@v4\n      - run: ./req-guard check --base origin/main\n",
+        );
+        let ps = verify_ci(&root);
+        assert!(
+            ps.iter().any(|p| p.contains("fetch-depth")),
+            "应检出缺 fetch-depth：{ps:?}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-30 裸 `--base` 无 ref → 报缺口（裁决对象是变更集，裸 base 会恒拦）。
+    #[test]
+    fn u30_检出裸base无ref() {
+        let root = ci_repo(
+            "u30",
+            "jobs:\n  j:\n    steps:\n      - run: ./req-guard check --base\n",
+        );
+        let ps = verify_ci(&root);
+        assert!(
+            ps.iter().any(|p| p.contains("缺 ref")),
+            "应检出裸 --base：{ps:?}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// 下载二进制却无版本自证 → 报缺口（本机新 / CI 旧的静默错配）。
+    #[test]
+    fn verify_ci_检出缺版本自证() {
+        let root = ci_repo(
+            "vci",
+            "jobs:\n  j:\n    steps:\n      - run: curl -fsSL -o r https://x/releases/download/v1/r\n      - run: ./req-guard check --base origin/main\n",
+        );
+        let ps = verify_ci(&root);
+        assert!(
+            ps.iter().any(|p| p.contains("版本自证")),
+            "应检出缺版本自证：{ps:?}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// 「只在注释/echo 里提到 req-guard」不算接入 —— 旧的 `contains("req-guard")`
+    /// 会被这两类骗过（那正是本仓自己的 ci.yml 曾过的形态）。
+    #[test]
+    fn verify_ci_注释或echo提到不算接入() {
+        for (tag, body) in [
+            ("vcic", "jobs:\n  j:\n    steps:\n      - run: |\n          # 记得跑 req-guard check --base origin/main\n          echo hi\n"),
+            ("vcie", "jobs:\n  j:\n    steps:\n      - run: echo \"req-guard check --base origin/main 很重要\"\n"),
+        ] {
+            let root = ci_repo(tag, body);
+            let ps = verify_ci(&root);
+            assert!(
+                ps.iter().any(|p| p.contains("未**执行** req-guard")),
+                "{tag}: 提到但未执行应报缺口：{ps:?}"
+            );
+            crate::testutil::cleanup(&root);
+        }
+    }
+
+    /// U-21 / AC-020 合规接法**不得**误报（加固不能把对的判成错的）。
+    #[test]
+    fn verify_ci_合规接法不误报() {
+        let root = ci_repo("vciok", GOOD_CI);
+        assert_eq!(verify_ci(&root), Vec::<String>::new(), "合规接法不应报缺口");
+        crate::testutil::cleanup(&root);
     }
 }

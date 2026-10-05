@@ -100,7 +100,8 @@ if (-not $gitInited) {
 }
 
 Step '3. init 接入门禁'
-$r = Invoke-Guard @('init', '-p', $tmp)
+# --for-ci：沙箱自检要脚本化审批，故用 L0 + 放弃 L3 的配置（真实项目用裸 init）。
+$r = Invoke-Guard @('init', '--for-ci', '-p', $tmp)
 if ($r.Code -eq 0) { Ok 'init 成功' } else { Bad "init 失败（exit $($r.Code)）" }
 
 Step '4. create 建需求'

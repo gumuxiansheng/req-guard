@@ -111,6 +111,14 @@ pub struct Args {
     pub oob: bool,
     /// `install --verify`：只校验门禁就位情况（CI 用），不写入任何文件。
     pub verify: bool,
+    /// `init --for-ci`：沙箱/自检模式——审批等级降到 L0 且显式声明放弃 L3。
+    /// 仅供「门禁机制自检」用；真实项目用裸 `init`（保持 L3）。
+    pub for_ci: bool,
+    /// `install --verify --quick`：只跑子串快筛，跳过实跑语义自检（本地高频调用）。
+    pub quick: bool,
+    /// `token revoke --i-lost-it`：承认当前凭据原文已丢失，走恢复路径
+    /// （须人类在场，且强制记入入库台账 REVOKE-FORCED）。
+    pub i_lost_it: bool,
     /// `ids --check`：执行编号防冲突三类检测（而非仅列出编号）。
     pub check: bool,
     /// `ui --gui`：强制图形界面。
@@ -183,6 +191,9 @@ fn default_args(action: Action) -> Args {
         token: None,
         oob: false,
         verify: false,
+        for_ci: false,
+        quick: false,
+        i_lost_it: false,
         check: false,
         gui: false,
         tui: false,
@@ -302,6 +313,9 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--blocking" => a.blocking = true,
             "--refresh-anchors" => a.refresh_anchors = true,
             "--verify" => a.verify = true,
+            "--for-ci" => a.for_ci = true,
+            "--quick" => a.quick = true,
+            "--i-lost-it" => a.i_lost_it = true,
             "--check" => a.check = true,
             "--gui" => a.gui = true,
             "--tui" => a.tui = true,

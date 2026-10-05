@@ -12,7 +12,10 @@ stages:
   - gate
 
 variables:
-  REQ_GUARD_VERSION: "0.1.5"   # TODO: 与仓库 .gates 所需版本对齐
+  # 版本号走 CI 变量（Settings → CI/CD → Variables），不在本文件里写死：
+  # 写死就得每仓手改一次，漏改会静默用旧版二进制判新格式清单。
+  # 设为空即视为未配置 → 下面会**立刻失败并说清怎么设**。
+  REQ_GUARD_VERSION: ""
 
 req-guard-gate:
   stage: gate
@@ -22,14 +25,25 @@ req-guard-gate:
     # 取得 req-guard 二进制（三选一）
     #   A. 从制品库/Release 下载（推荐）
     - |
+      : "${REQ_GUARD_VERSION:?未设置 CI 变量 REQ_GUARD_VERSION（Settings → CI/CD → Variables）}"
       curl -fsSL -o req-guard \
         "${REQ_GUARD_URL:-https://example.com/req-guard/releases/download/v${REQ_GUARD_VERSION}/req-guard-x86_64-unknown-linux-musl}"
       chmod +x req-guard
+      # 版本自证：二进制必须与声明版本一致（-V 输出编译期版本）。
+      ./req-guard -V | grep -q "$REQ_GUARD_VERSION" || {
+        echo "版本不符：声明 $REQ_GUARD_VERSION，实际 $(./req-guard -V)"; exit 1; }
     #   B. 或用 cargo 从源码构建：
     #   - cargo build --release && mv target/release/req-guard ./req-guard
   script:
     # L3：硬拦截判定。三段未全批 / 有未解决阻塞评论 / 无清单 → 退出码 1，流水线红。
-    - ./req-guard check
+    #
+    # `--base` **不可省**：裁决对象是「本次变更集」，裸 check 在多份未归档清单下
+    # 会因无法归因而恒拦（规范 §4.3）。GitLab 的 MR 流水线默认已 fetch 完整历史。
+    - ./req-guard check --base "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}"
+    # 变更范围契约的服务端对应物：抵消本机 --no-verify（删掉这步 = 闭环不成立）。
+    - ./req-guard touch-check --base "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}"
+    # 验收标准机械校验（core/src/ac.rs A1–A12）：approve 时已跑过，这里是服务端兜底。
+    - ./req-guard ac check --all
     # 编号防冲突（规范 §8 P1）：同 id 多文件 / 前缀歧义 → 硬伤退出码 1；
     # 并行开发团队必挂，单人序贯仓库可删去本行。
     - ./req-guard ids --check

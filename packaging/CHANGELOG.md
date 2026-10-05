@@ -8,6 +8,75 @@
 
 ## 未发布
 
+### ⚠️ 破坏性变更（升级前必读）
+
+- **`bypass --ttl` 上限 240 分钟**：`bypass --ttl 0` 或 `> 240` 从「接受」变为「拒绝」。
+  动机：`active_bypass` 只认 `expires_epoch`，故 `expires_epoch=99999999999` 等价于
+  **永不过期**的全部门禁开关。加上限后该模式不可能出现。合法用法是分段重新开启
+  （每次独立留痕）。参见 REQ-012。
+- **应急绕过令牌迁出工作树**：从 `.gates/.bypass` 移到用户级状态目录
+  （`$XDG_STATE_HOME/req-guard/<仓库路径哈希>/bypass`，未设则回落
+  `~/Library/Application Support/...`（macOS）或 `~/.local/state/...`）。
+  迁移期读旧路径并**自愈重写**，存量仓库无需手工处理。`.gitignore` 里保留旧条目。
+- **绕过令牌须通过两道校验才生效**（见下）。手写 `expires_epoch` 的绕过方式已完全失效。
+- **`touch.exempt` 默认集收窄**：不再默认豁免 `.gates/**` 通配，改为具名清单。
+  `.gates/req-guard.yaml`（含 `auth.level` / `enforce.ci`）与 `.gates/audit/ledger.md`
+  **不再豁免** —— 改它们须由清单的 `GATE:TOUCH` 声明。
+  若你的流程依赖旧行为，在 `req-guard.yaml` 的 `touch.exempt` 里显式加回 `.gates/**`。
+
+### 安全修复（REQ-012：门禁自身可被本地禁用与自改）
+
+- **伪造应急绕过令牌不再生效**。原实现只读 `expires_epoch`，故一行
+  `printf 'expires_epoch=99999999999\n' > .gates/.bypass` 即可解除全部门禁，
+  且该文件被 gitignore、`audit_ledger.md` **零痕迹**。现在令牌必须：
+  ① 通过身份自证（`sig` 等于**此刻**把 `actor` 绑到生效身份上得到的 `sig`）；
+  ② 与**入库台账** `ledger.md` 里的 `BYPASS-OPEN` 事件对得上。
+  被拒时写审计：`BYPASS-REJECT reason=missing-fields|sig-mismatch|no-ledger-entry`。
+- **发布脚本自检恢复**。`init` 默认 `auth.level: 3`，而模板要求一次性范围票据，
+  于是**任何脚本化 `approve` 都被拒** —— 表现为发布包 `selfcheck.sh` 7 PASS/7 FAIL、
+  `.github/workflows/ci.yml` 自举 job 中止、`.cnb.yml` 主流程变红，
+  即**门禁自己过不了自己的门禁**。修复分两处（第二个根因此前未被识别）：
+  - 新增 `req-guard init --for-ci`：沙箱/CI 自检用（`auth.level: 0` + `enforce.ci: false`），
+    **裸 `init` 的默认值不变（仍 L3）**；
+  - `selfcheck` / CI 自举此前**从未填过三段实质正文**，而 `approve` 会跑段落实质性校验
+    （REQ-003）拒绝模板占位 —— 这是与 `auth.level` 无关的**第二个**根因。
+  - 结果：`selfcheck.sh` 由 7 PASS/7 FAIL 变为 **15 PASS/0 FAIL**。
+- **L3 接入质量可被机械判定**。原 `verify_ci` 只做子串匹配（编排里含 `req-guard` 字样即算接入
+  —— 本仓自己的 `ci.yml` 曾靠注释通过）。现在要求 `req-guard` 处于**命令位**且**紧跟子命令**，
+  并逐条检出三种「接了但会静默失效」的接法：缺 `fetch-depth: 0`、`--base` 缺 ref、
+  下载二进制缺版本自证。
+- **发布的 CI 模板此前跑不通**：`actions/checkout@v4` 缺 `fetch-depth`，
+  depth=1 下 `origin/main` 不存在，两条 `--base` 步骤以
+  `fatal: ambiguous argument` 硬失败。现已补 `fetch-depth: 0`；版本改走仓库/CI 变量
+  （未设即失败并说明怎么设）并加 `req-guard -V` 版本自证；
+  GitLab 模板补上 `--base`（此前用裸 `check`，规范 §4.3 明令禁止）。
+- **`install --verify` 不再说谎**。原判据是子串存在性检查，实测在脚本顶部插入 `exit 0`
+  （保留后面的委托行）后报 **PASS**，而 hook 已永久放行。现在改为**实跑装好的脚本**验
+  「未过审必拦 / 已过审必放行」两个方向（`--quick` 可退回快筛）；
+  语义自检找不到可执行文件时**如实跳过**，不拿「找不到」当「判失败」。
+  存在性检查降级为告警（`⚠️`），反向检查（禁止脚本自建判定）仍为 Error。
+- **`token revoke` 不再锁死**。凭据启用后撤销需出示当前凭据，凭据丢失即无路可走
+  （此前只能手工删 `~/.config/req-guard/guard.cfg`，且不留痕）。新增
+  `token revoke --i-lost-it`：须真实终端在场（TTY 挑战码），并强制记入入库台账
+  `REVOKE-FORCED`。
+- **新增** `install --verify --base <ref>`：检出「改了 `.gates/req-guard.yaml` 但无清单背书」，
+  把「AI 调松门禁」变成 PR 里必然被评审看到的一条失败。
+
+### 已知残留（不要当成密码学保证）
+
+- 绕过令牌的 `sig` 是**公开可复算**的派生值；第① 道校验挡随手伪造，第② 道（台账交叉核对）
+  把伪造变成**PR 可见**而非不可伪造。同用户进程若肯重算 sig 并改台账，仍可伪造。
+  真正的兜底是服务端必需检查 + `ledger.md` 挂 CODEOWNERS。
+- 绕过窗口生效期间**不做内容篡改检测**（短路顺序本期未改）。
+- `install --verify` 的实跑自检仍信任被测脚本本身；若 hook 与 core 同时被替换，实跑看不出。
+- `verify_ci` 的「是否执行了 req-guard」仍是**启发式**（不解析 shell 语法），
+  只挡已知的两种误接形态。
+- **审批凭据无密码学保证**（本次未改变）：`~/.config/req-guard/guard.cfg` 是明文 key=value、
+  无完整性保护；TTY 挑战码打在 stdout 由同一进程读回，`pty` 可满足。
+  本产品防的是「顺手自批」与「格式塌方」，不是有动机的对抗。
+
+---
+
 **多需求并行（REQ-006）—— 门禁裁决对象从「抽一份清单」改为「本次变更集」**
 
 - 修复**漏拦**：待审清单与已批清单并存时，抽中已批那份即放行 —— AI 可以在零审批的需求上写代码，

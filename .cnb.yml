@@ -28,7 +28,11 @@ main:
             # 说明：本镜像无 powershell；run_hook 已按编译平台选解释器 → 此处走 sh。
             BIN=$PWD/target/release/req-guard
             P=$(mktemp -d); trap 'rm -rf "$P"' EXIT
-            "$BIN" init -p "$P" >/dev/null
+            # --for-ci：流水线自举要脚本化审批（L0 + 放弃 L3）；真实仓库用裸 init。
+            "$BIN" init --for-ci -p "$P" >/dev/null
+            # --for-ci 关掉了 enforce.ci（沙箱无 CI），但本 job 要验「未接 CI 必须红」，
+            # 故显式打开：断言不依赖 init 的默认值，测试意图写在代码里。
+            sed -i.bak 's/^  ci: false/  ci: true/' "$P/.gates/req-guard.yaml" && rm -f "$P/.gates/req-guard.yaml.bak"
             "$BIN" install --verify -p "$P"            # 刚 init 完应全绿
             "$BIN" ids --check -p "$P"                 # 编号防冲突：空目录应全绿
             "$BIN" ac check --all -p "$P"              # AC 校验：空目录应全绿
@@ -37,6 +41,11 @@ main:
             if "$BIN" touch-check -p "$P" 2>/dev/null; then echo "空暂存集应放行却拦"; exit 1; fi
             if "$BIN" check -p "$P" 2>/dev/null; then echo "未建需求应拦截却放行"; exit 1; fi
             "$BIN" create -t "CNB 自举" -p "$P" >/dev/null
+            # create 出来的是模板（占位勾选框），approve 会跑段落实质性校验（REQ-003）
+            # 而拒绝它 —— 与 auth.level 无关的第二个根因，故自举必须先填实质正文。
+            REQ_F="$(ls "$P"/.gates/requirements/REQ-001*.md | head -1)"
+            awk '/^## [0-9]+\. / && !d[$0]++ { print; print "- 自举夹具：本段已填入实质正文。"; next } { print }' \
+              "$REQ_F" > "$REQ_F.tmp" && mv "$REQ_F.tmp" "$REQ_F"
             "$BIN" approve REQ-001 --step decomposition --reviewer 张三 -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step solution      --reviewer 张三 -p "$P" >/dev/null
             "$BIN" approve REQ-001 --step testplan      --reviewer 张三 -p "$P" >/dev/null

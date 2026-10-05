@@ -42,7 +42,7 @@
 //!
 //! - `judge` 多一个 `exempt` 参数：豁免集来自 `.gates/req-guard.yaml`，由薄壳读出后传入，
 //!   而不是让 `judge` 自己去碰配置文件 —— 否则「纯函数」名不副实，R5 也测不了。
-//! - 应急绕过窗口（R2）**不在** `judge` 里判：它要读 `.gates/.bypass` 与当前时间，
+//! - 应急绕过窗口（R2）**不在** `judge` 里判：它要读绕过令牌与当前时间，
 //!   属薄壳的事。`judge` 只负责「谁获准写」。
 
 use std::path::{Path, PathBuf};
@@ -534,7 +534,7 @@ pub fn owned_by<'a>(
 
 /// 端到端裁决：读 live 快照 + 取变更集 + 判 + 写审计。
 ///
-/// **绕过窗口在这里判**（`.gates/.bypass` 与当前时间是薄壳的事，`judge` 不碰）。
+/// **绕过窗口在这里判**（令牌与当前时间是薄壳的事，`judge` 不碰）。
 pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
     let live = live_snapshot(root)?;
     let verdict = if live.is_empty() {
@@ -753,14 +753,121 @@ fn collect_paths(root: &Path, source: &PathSource) -> Result<Vec<String>> {
 }
 
 /// 当前是否命中应急绕过窗口；返回过期时刻。
+///
+/// **令牌必须自证身份，且与入库台账交叉核对**（REQ-012 设计 1）。
+///
+/// 背景：本函数原先只读 `expires_epoch`，于是
+/// 手写一个只含 `expires_epoch=99999999999` 的令牌文件，一行 shell 就能解除全部门禁，
+/// 且旧路径被 gitignore —— 伪造在 PR 里**完全不可见**。这不是"绕过审计"，
+/// 是"审计本身被静默关掉"，属本项目最坏失效那一类。
+///
+/// 两道校验，缺一不可（各挡不同的东西）：
+/// - ① `sig` 必须等于按令牌自带的 `actor`/`email` 重算的指纹。挡随手伪造。
+/// - ② 入库台账（**committed**）必须有对应的 `BYPASS-OPEN` 行。挡"改了本地隐形文件就想生效"，
+///   把伪造的代价从"改一个 gitignore 文件"提升为"改一个会出现在 PR diff 里的文件"——
+///   后者可由 CODEOWNERS 评审拦截，这是当前信任模型下唯一能跨过边界的机制。
+///
+/// **残留（必须如实告知，不得当密码学保证卖）**：`identity::fingerprint` 是公开可复算的
+/// 派生值，故 ① 挡不住肯重算的进程；② 也不是签名，只是把篡改**变可见**而非**不可能**。
+/// 见 REQ-012 §7 残留风险第 1 条。
 fn active_bypass(root: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(root.join(".gates/.bypass")).ok()?;
+    // 迁移期回落：旧路径（工作树内）令牌仍可用，但读到即自愈搬到新路径（REQ-012 T3/U-10）。
+    // 两处都有时以新路径为准（U-11）——新路径是当前唯一被写入的位置。
+    let path = crate::gate::bypass_token_path(root);
+    let legacy = root.join(crate::gate::BYPASS_REL);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => match std::fs::read_to_string(&legacy) {
+            Ok(t) => {
+                let _ = std::fs::create_dir_all(path.parent().unwrap_or(root));
+                if std::fs::write(&path, &t).is_ok() {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+                t
+            }
+            Err(_) => return None,
+        },
+    };
     let exp = key_value(&text, "expires_epoch")?;
-    if crate::gate::now_epoch() < exp {
-        Some(exp)
-    } else {
-        None
+    if crate::gate::now_epoch() >= exp {
+        return None;
     }
+
+    // ① 身份自证：令牌的 `sig` 必须等于**此刻**把 actor 绑到生效身份上得到的 sig。
+    //
+    //    为什么不能简单地 `fingerprint(root, actor, email)` 重算：`Stamp::sig` 记的是
+    //    **git 身份**的指纹，不是 (自报名, email) 的指纹。L0 下自报名与 git 身份冲突
+    //    仍会放行（`mismatch=1`），此时 actor="tester" 而 sig 来自 git 身份的 name
+    //    —— 按 (actor, email) 重算必然对不上，会把**合法**绕过误杀（实测踩到）。
+    //    改用 `identity::bind` 重跑一遍绑定，三条合法路径（正常 / REQ_GUARD_REVIEWER_EMAIL
+    //    兜底 / 无身份降级）就都覆盖到了，且语义就是「这枚令牌是当前身份签发的」。
+    let (Some(actor), Some(email), Some(sig)) = (
+        str_field(&text, "actor"),
+        str_field(&text, "email"),
+        str_field(&text, "sig"),
+    ) else {
+        crate::gate::audit(root, "BYPASS-REJECT reason=missing-fields");
+        return None;
+    };
+    match crate::identity::bind(root, &actor) {
+        Ok(stamp) => {
+            if stamp.sig != sig || stamp.email != email {
+                crate::gate::audit(root, "BYPASS-REJECT reason=sig-mismatch");
+                return None;
+            }
+            // `Stamp::unbound` 的占位值：无 git 身份且 L0 时合法 bypass 落盘就是 `sig=-`
+            // （L0 兼容旧项目的既定行为，不可判它为伪造）。此时**降级为只查第② 道**——
+            // 台账交叉核对才是拦 forged token 的主力。降级必须留痕，
+            // 否则「静默降级」正是本函数要消灭的那类问题。
+            if sig == crate::identity::UNBOUND_SIG {
+                crate::gate::audit(root, "BYPASS-DEGRADED reason=unbound-sig actor");
+            }
+        }
+        // 绑定本身失败（等级不够 / 取不到身份且 L≥1）→ 令牌不可信。
+        Err(_) => {
+            crate::gate::audit(root, "BYPASS-REJECT reason=identity-bind-failed");
+            return None;
+        }
+    }
+
+    // ② 与入库台账交叉核对（只读尾部，避免大台账拖慢每次裁决 —— 见 REQ-012 B-04）。
+    if !ledger_has_bypass_open(root, &actor) {
+        crate::gate::audit(root, "BYPASS-REJECT reason=no-ledger-entry");
+        return None;
+    }
+    Some(exp)
+}
+
+/// 入库台账里是否存在该 actor 的 `BYPASS-OPEN` 事件。
+///
+/// 只读尾部 [`LEDGER_TAIL_LIMIT`] 字节：台账只追加，事件在末尾；
+/// 全量读会让每次裁决都付出 O(台账大小) 的代价（裁决在 PreToolUse 路径上，敏感）。
+fn ledger_has_bypass_open(root: &Path, actor: &str) -> bool {
+    let text = read_tail(&root.join(crate::gate::LEDGER_REL), LEDGER_TAIL_LIMIT);
+    // 与 gate::bypass 落盘的台账事件前缀逐字对齐（含 actor 后的空格，
+    // 避免 `actor=alice` 误配 `actor=alice2`）。
+    text.contains(&format!("BYPASS-OPEN actor={actor} "))
+}
+
+/// 台账尾部读取上限（REQ-012 B-04）。
+const LEDGER_TAIL_LIMIT: u64 = 256 * 1024;
+
+/// 读文件尾部最多 `limit` 字节为字符串（读不到 / 非 UTF-8 时按已有内容尽力返回）。
+fn read_tail(path: &Path, limit: u64) -> String {
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    let skip = len.saturating_sub(limit);
+    let mut file = file;
+    if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(skip)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut file, &mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// 从 `key=value` 文本里取一个 u64 字段（文件格式与 `gate::bypass` 落盘一致）。
@@ -770,6 +877,20 @@ fn key_value(text: &str, key: &str) -> Option<u64> {
             let v = v.trim();
             if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
                 return v.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// 从 `key=value` 文本里取一个非空字符串字段（身份自证用，见 [`active_bypass`]）。
+fn str_field(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix(&prefix) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
     }
@@ -1795,14 +1916,7 @@ mod tests {
         let dir = root.join(".gates/requirements");
         std::fs::create_dir_all(&dir).unwrap();
         write_req(&dir, "REQ-001", "draft", "pending", &["core/**"]);
-        std::fs::write(
-            root.join(".gates/.bypass"),
-            format!(
-                "reason=t\nactor=t\ncreated_epoch=0\nexpires_epoch={}\n",
-                crate::gate::now_epoch() + 3600
-            ),
-        )
-        .unwrap();
+        crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
         let v = resolve(
             &root,
             &Ctx {
@@ -2035,5 +2149,232 @@ mod tests {
             audit_tail(&root)
         );
         crate::testutil::cleanup(&root);
+    }
+
+    // ===================== REQ-012 T1/T2/T3：绕过令牌加固 =====================
+    //
+    // 修的是「`printf 'expires_epoch=99999999999\n' > .gates/.bypass` 一行解除全部门禁、
+    // 且入库台账零痕迹」。断言分两类，缺一不可：
+    //   拒绝路径（U-01/02/03/05/07/09）——只有通过路径的用例等于没测；
+    //   放行路径（U-04/06/08/10/11）——加固不能把合法绕过也堵死。
+
+    /// 手工落一份令牌（用于构造"部分字段缺失"与"字段自造"这两类非法态）。
+    fn forge_token(root: &std::path::Path, body: &str) {
+        let p = crate::gate::bypass_token_path(root);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn bypass_token_body(root: &std::path::Path, actor: &str, ttl: u64) -> String {
+        let now = crate::gate::now_epoch();
+        let stamp = crate::identity::bind(root, actor).expect("夹具身份应可绑定");
+        format!(
+            "reason=forge\nactor={actor}\nemail={}\nsig={}\ncreated_epoch={now}\nexpires_epoch={}\n\
+             ttl_minutes={ttl}\n",
+            stamp.email,
+            stamp.sig,
+            now + ttl * 60
+        )
+    }
+
+    fn audit_of(root: &std::path::Path) -> String {
+        std::fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap_or_default()
+    }
+
+    /// U-01 只有 expires_epoch 的令牌（**问题 1 的原始复现**）→ 拒绝，且留下 missing-fields。
+    #[test]
+    fn U01_仅expires字段的令牌被拒() {
+        let root = crate::testutil::temp_dir("u01");
+        forge_token(&root, "expires_epoch=99999999999\n");
+        assert_eq!(active_bypass(&root), None);
+        assert!(
+            audit_of(&root).contains("BYPASS-REJECT reason=missing-fields"),
+            "{}",
+            audit_of(&root)
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-02 sig 与当前身份绑定不一致 → 拒绝 + sig-mismatch。
+    #[test]
+    fn U02_sig不匹配被拒() {
+        let root = crate::testutil::temp_dir("u02");
+        let mut body = bypass_token_body(&root, "tester", 60);
+        // 只动 sig，actor/email 保持合法形状 → 精确定位到指纹这一道
+        body = body.replace(
+            &format!(
+                "sig={}",
+                crate::identity::bind(&root, "tester").unwrap().sig
+            ),
+            "sig=deadbeefdead",
+        );
+        forge_token(&root, &body);
+        crate::gate::audit_ledger(&root, "BYPASS-OPEN actor=tester ttl=60min reason=x");
+        assert_eq!(
+            active_bypass(&root),
+            None,
+            "台账齐了也不该放行：指纹是唯一身份凭据"
+        );
+        assert!(
+            audit_of(&root).contains("BYPASS-REJECT reason=sig-mismatch"),
+            "{}",
+            audit_of(&root)
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-03 指纹合法但台账无对应事件 → 拒绝 + no-ledger-entry。
+    /// 这是设计 1 的**主力**防线：伪造必须留下入库痕迹。
+    #[test]
+    fn U03_台账无对应事件被拒() {
+        let root = crate::testutil::temp_dir("u03");
+        forge_token(&root, &bypass_token_body(&root, "tester", 60));
+        assert_eq!(
+            active_bypass(&root),
+            None,
+            "无台账条目 = 没人签发过这枚令牌"
+        );
+        assert!(
+            audit_of(&root).contains("BYPASS-REJECT reason=no-ledger-entry"),
+            "{}",
+            audit_of(&root)
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-05 台账里是**别的** actor → 拒绝（防 actor 前缀误配）。
+    #[test]
+    fn U05_台账actor不符被拒() {
+        let root = crate::testutil::temp_dir("u05");
+        forge_token(&root, &bypass_token_body(&root, "tester2", 60));
+        // 故意只写 tester（token 的 actor 是 tester2）——前缀不得误配
+        crate::gate::audit_ledger(&root, "BYPASS-OPEN actor=tester ttl=60min reason=x");
+        assert_eq!(
+            active_bypass(&root),
+            None,
+            "actor=tester 不得匹配 actor=tester2"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-09 永不过期的伪造令牌（`expires_epoch=99999999999`）→ 拒绝。
+    #[test]
+    fn U09_永不过期令牌被拒() {
+        let root = crate::testutil::temp_dir("u09");
+        forge_token(
+            &root,
+            &bypass_token_body(&root, "tester", 60).replace(
+                &format!("expires_epoch={}", crate::gate::now_epoch() + 3600),
+                "expires_epoch=99999999999",
+            ),
+        );
+        assert_eq!(active_bypass(&root), None);
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-04 合法路径：指纹 + 台账齐备 → 放行（证明加固没堵死合法绕过）。
+    #[test]
+    fn U04_合法令牌放行() {
+        let root = crate::testutil::temp_dir("u04");
+        crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
+        assert!(active_bypass(&root).is_some(), "合法绕过必须仍能生效");
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-06 过期后失效（TTL 到期行为不回归）。
+    #[test]
+    fn U06_过期令牌不生效() {
+        let root = crate::testutil::temp_dir("u06");
+        crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
+        let p = crate::gate::bypass_token_path(&root);
+        let body = std::fs::read_to_string(&p).unwrap();
+        // 把 created 改晚、expires 改早 → 已过期
+        std::fs::write(
+            &p,
+            body.replace(
+                &format!("expires_epoch={}", crate::gate::now_epoch() + 3600),
+                &format!(
+                    "expires_epoch={}",
+                    crate::gate::now_epoch().saturating_sub(1)
+                ),
+            ),
+        )
+        .unwrap();
+        assert_eq!(active_bypass(&root), None);
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-10 旧路径（工作树内）令牌仍可用，但读到即**自愈**搬到新路径。
+    #[test]
+    fn U10_旧路径令牌回落并自愈() {
+        let root = crate::testutil::temp_dir("u10");
+        let legacy = root.join(crate::gate::BYPASS_REL);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let stamp = crate::identity::bind(&root, "tester").unwrap();
+        std::fs::write(
+            &legacy,
+            format!(
+                "reason=legacy\nactor=tester\nemail={}\nsig={}\ncreated_epoch=0\nexpires_epoch={}\n\
+                 ttl_minutes=60\n",
+                stamp.email,
+                stamp.sig,
+                crate::gate::now_epoch() + 3600
+            ),
+        )
+        .unwrap();
+        crate::gate::audit_ledger(&root, "BYPASS-OPEN actor=tester ttl=60min reason=legacy");
+        assert!(active_bypass(&root).is_some(), "迁移期不得让存量绕过失效");
+        assert!(
+            crate::gate::bypass_token_path(&root).exists(),
+            "应自愈写到新路径"
+        );
+        assert!(!legacy.exists(), "旧文件应被清掉，不留看起来有效的假令牌");
+        crate::testutil::cleanup(&root);
+    }
+
+    /// U-11 两处都有时以**新路径**为准（新路径是当前唯一被写入的位置）。
+    #[test]
+    fn U11_两处都有以新路径为准() {
+        let root = crate::testutil::temp_dir("u11");
+        // 新路径：合法、过期 → 不应生效
+        crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
+        let p = crate::gate::bypass_token_path(&root);
+        std::fs::write(
+            &p,
+            std::fs::read_to_string(&p).unwrap().replace(
+                &format!("expires_epoch={}", crate::gate::now_epoch() + 3600),
+                &format!(
+                    "expires_epoch={}",
+                    crate::gate::now_epoch().saturating_sub(1)
+                ),
+            ),
+        )
+        .unwrap();
+        // 旧路径：未过期 → 也不该被采信
+        std::fs::create_dir_all(root.join(".gates")).unwrap();
+        std::fs::write(
+            root.join(crate::gate::BYPASS_REL),
+            format!("expires_epoch={}\n", crate::gate::now_epoch() + 3600),
+        )
+        .unwrap();
+        assert_eq!(active_bypass(&root), None, "新路径优先，不得回落到旧路径");
+        crate::testutil::cleanup(&root);
+    }
+
+    /// B-01 畸形令牌不得 panic（B-01/B-02）。
+    #[test]
+    fn B01_畸形令牌不panic() {
+        for body in [
+            "",
+            "\n\n",
+            "expires_epoch=",
+            "expires_epoch=abc",
+            "no_equals_here",
+        ] {
+            let root = crate::testutil::temp_dir("b01");
+            forge_token(&root, body);
+            assert_eq!(active_bypass(&root), None, "body={body:?} 应被拒");
+            crate::testutil::cleanup(&root);
+        }
     }
 }

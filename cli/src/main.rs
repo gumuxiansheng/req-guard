@@ -49,9 +49,15 @@ fn run(a: &cli::Args) -> Result<()> {
         Action::Init | Action::Install => {
             // --verify：只校验不写入（CI 步骤；§4.5 消除 L1 静默缺口）
             if a.verify {
-                let problems = gate::verify_install(root);
+                let problems = gate::verify_install_with(root, a.base.as_deref(), !a.quick);
+                for w in gate::verify_warnings(root) {
+                    eprintln!("⚠️  {}", w);
+                }
                 if problems.is_empty() {
                     println!("✅ 门禁校验通过：核心资产 / AI 工具 hook / pre-commit 全部就位");
+                    if !a.quick {
+                        println!("   （含语义自检：已实装脚本验「未过审必拦 / 已过审必放行」）");
+                    }
                     return Ok(());
                 }
                 for p in &problems {
@@ -68,15 +74,23 @@ fn run(a: &cli::Args) -> Result<()> {
             } else {
                 a.tools.clone()
             };
-            let created = gate::install(root, &tools, true)?;
+            let created =
+                gate::install_with(root, &tools, true, gate::InstallOpts { for_ci: a.for_ci })?;
             println!("✅ AI 需求门禁已安装：{}", root.display());
             for f in &created {
                 println!("   - {}", f.display());
             }
             println!("   拦截：AI 工具 Write/Edit（PreToolUse）+ git pre-commit（fail-closed）");
-            println!(
-                "   CI  ：enforce.ci 默认 true——流水线须调用 req-guard check 并设为必需状态检查"
-            );
+            if a.for_ci {
+                println!(
+                    "   沙箱：--for-ci 已生效（auth.level=0、enforce.ci=false）——\
+                     仅供门禁机制自检，真实项目请用裸 init"
+                );
+            } else {
+                println!(
+                    "   CI  ：enforce.ci 默认 true——流水线须调用 req-guard check 并设为必需状态检查"
+                );
+            }
         }
         Action::Create => {
             let title = a.title.as_deref().unwrap_or("");
@@ -627,7 +641,7 @@ fn run_token(_root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
         }
         "revoke" => {
             // 同 issue：撤销凭据同样是审批类动作（AI 撤销后再自签即为绕过）。
-            req_guard_core::auth::ensure_token_admin("token revoke", _root)?;
+            req_guard_core::auth::ensure_token_admin_opts("token revoke", _root, a.i_lost_it)?;
             let path = token::revoke()?;
             println!("✅ 已撤销并禁用审批凭据：{}", path.display());
             println!("   审批鉴权回退到本机严格等级决定的其他通道。");
