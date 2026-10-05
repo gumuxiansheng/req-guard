@@ -13,6 +13,13 @@ const NOTO_SC: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
 
 /// 装载字体：把中文放到 Proportional 首位（拉丁字形仍由其后字体兜底）。
 pub fn setup(cc: &eframe::CreationContext<'_>) {
+    cc.egui_ctx.set_fonts(definitions());
+}
+
+/// 字体定义。窗口启动与**离屏渲染测试**共用这一份：
+/// 没有字形时长出来的 galley 尺寸全是 0，几何类断言会拿到 NaN
+/// （`markdown.rs` 里"一项一行""表宽等于版心"这类断言就靠它才立得住）。
+pub fn definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "noto_sc".into(),
@@ -30,5 +37,5 @@ pub fn setup(cc: &eframe::CreationContext<'_>) {
         .or_default()
         .push("noto_sc".into());
 
-    cc.egui_ctx.set_fonts(fonts);
+    fonts
 }

@@ -18,6 +18,12 @@
 //! 不支持的语法一律按**纯文本原样显示**（不吞、不报错）——
 //! 渲染只是"更好读"的叠加层，宁可显示成原文，也不能让人看不到清单里的某句话。
 //!
+//! 两条被真实缺陷教出来的纪律，改渲染代码前先读 [`cells_of`] 与 [`table`] 的注释：
+//! - **竖线只在真的分列时才是分隔符**：代码段内的 `` `a|b` ``、转义的 `\|` 都算内容，
+//!   见 [`cells_of`]；
+//! - **宽度只有版心一个来源**：段落 / 列表 / 标题 / 表格共用同一栏宽度，
+//!   表格列宽也由它分配，见 [`show`] 与 [`distribute`]。
+//!
 //! 分层：解析（[`parse`] / [`parse_inlines`]，纯函数、不碰 egui、可单测）与渲染
 //! （[`show`]）分离，测试断言的是"解析出的结构"，不需要跑窗口。
 
@@ -601,11 +607,83 @@ fn inlines_of_row(t: &str) -> Vec<Vec<Inline>> {
 }
 
 /// 拆分表格行：去掉首尾竖线后按 `|` 切，逐格 trim。
+///
+/// **`|` 不是见到就切**。两种竖线必须放过，否则 AI 写的表格会被切碎：
+/// - 反斜杠转义的 `\|`（GFM 明确支持把竖线写进单元格里）；
+/// - 反引号代码段里的竖线 —— 清单里"字段用 `file|anchor|replacement` 分隔"这类
+///   行几乎都这么写，按列切开就变成多出好几列、内容整体错位（`预估工时` 被甩到最后）。
+///
+/// 单元格原文**不剥反斜杠**，原样交给 [`parse_inlines`]：GFM 里反斜杠转义在代码段内
+/// 不生效，这条规则该由行内解析器解释一次；拆列与行内各解释一遍，迟早会对不上。
 fn cells_of(t: &str) -> Vec<String> {
     let t = t.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
     let t = t.strip_suffix('|').unwrap_or(t);
-    t.split('|').map(|c| c.trim().to_string()).collect()
+    let cs: Vec<char> = t.chars().collect();
+    let mut cells = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' if i + 1 < cs.len() => {
+                // 转义对：两个字符一起进本格，`\` 留给行内解析器去解释。
+                buf.push('\\');
+                buf.push(cs[i + 1]);
+                i += 2;
+            }
+            '`' => {
+                let n = tick_run(&cs, i);
+                match tick_close(&cs, i + n, n) {
+                    // 有等长闭合 → 整段代码原样进本格（段内竖线不切）。
+                    Some(end) => {
+                        buf.extend(&cs[i..end + n]);
+                        i = end + n;
+                    }
+                    // 没有等长闭合 → 这几个反引号只是普通字符（GFM：不成对就不是代码段）。
+                    None => {
+                        buf.push('`');
+                        i += 1;
+                    }
+                }
+            }
+            '|' => {
+                cells.push(buf.trim().to_string());
+                buf.clear();
+                i += 1;
+            }
+            c => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    cells.push(buf.trim().to_string());
+    cells
+}
+
+/// 从 `i` 起连续反引号的个数。
+fn tick_run(c: &[char], i: usize) -> usize {
+    1 + c[i + 1..].iter().take_while(|x| **x == '`').count()
+}
+
+/// 从 `start` 起找**恰好 n 个**反引号的闭合段，返回其起始下标。
+///
+/// 长度不同的反引号串不算闭合（GFM 代码段按等长成对闭合）：`` `a``b` `` 里的
+/// `` `` `` 不该结束单个反引号开头的代码段。
+fn tick_close(c: &[char], start: usize, n: usize) -> Option<usize> {
+    let mut i = start;
+    while i < c.len() {
+        if c[i] == '`' {
+            let run = tick_run(c, i);
+            if run == n {
+                return Some(i);
+            }
+            i += run;
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 渲染缓存：同一段、同一份原文只解析一次。
@@ -637,6 +715,12 @@ impl Cache {
 // ===================== 渲染 =====================
 
 /// 渲染块序列（垂直流式排布；纵向滚动交给外层 `ScrollArea`）。
+///
+/// **版心宽度是整篇正文唯一的宽度基准**：进来时 `ui.available_width()` 就是版心，
+/// 往下每一层只能是"上层宽度减去一个固定量"（引用块的边框留白、列表符号的缩进），
+/// 不能有哪一层自己另问一个宽度——那样同段里就会出现"这段行数多、那段行数少"。
+/// 两处最容易破这条的地方：列表（一项一行，见 [`list_block`]）与表格
+/// （列宽由版心分配，见 [`table`]）。
 pub fn show(ui: &mut egui::Ui, blocks: &[Block]) {
     // 正文允许框选复制：审核人常要摘一段回评论里，渲染不能把这条路堵死。
     ui.style_mut().interaction.selectable_labels = true;
@@ -688,10 +772,17 @@ fn block(ui: &mut egui::Ui, b: &Block) {
     }
 }
 
+/// 列表：**一项一行**。
+///
+/// 用 `ui.horizontal_top` 而不是 `ui.horizontal_wrapped`：项内文字由内层 `ui.vertical`
+/// 自己折行，外层并不需要 wrap 布局；而 wrap 布局会把"这一行还剩多少宽度"掺进折行与
+/// 对齐（egui 的 `Label` 在 wrap 布局里还会额外按首行缩进重排）—— 万一两项被排到同一行，
+/// 第二项的折行宽度就成了"版心 − 上一项宽度"，同一列表里每行字数不一样。
+/// 规则写死成一行一项，这个自由度就不要了（宽度基准见 [`show`]）。
 fn list_block(ui: &mut egui::Ui, list: &List) {
     for (i, item) in list.items.iter().enumerate() {
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(if list.ordered { 20.0 } else { 16.0 });
+        ui.horizontal_top(|ui| {
+            ui.add_space(LIST_INDENT_W);
             match item.checked {
                 // 任务项渲染成灰色只读勾选框：`[x]` 已完成 / `[ ]` 未完成。
                 // 只读是刻意的：正文由 AI / 编辑器维护，界面只做审核决策，不代改清单。
@@ -741,8 +832,9 @@ fn code_block(ui: &mut egui::Ui, lang: &str, text: &str) {
         });
 }
 
-/// 表格：**先量后排**——逐格用 egui 自己的排版器出 `Galley`，量出尺寸定列宽，
-/// 再把每个 `Galley` 贴到该列的固定 `x` 上。
+/// 表格：**先量后排**——每格先用 egui 的排版器出一份"不折行"的 `Galley` 量自然宽，
+/// 把自然宽按比例摊到**版心宽度**上得到列宽（见 [`distribute`]），再把放不下的格子
+/// 按列宽折行排第二遍，最后把每个 `Galley` 贴到该列的固定 `x` 上。
 ///
 /// 这块踩过三个坑，都写在这儿免得再犯：
 /// 1. `egui::Grid` 的 `num_columns` 会让**最后一列吃掉剩余宽度**——右对齐的「风险 / 工期」
@@ -755,8 +847,12 @@ fn code_block(ui: &mut egui::Ui, lang: &str, text: &str) {
 ///    它给子 ui 的 `max_rect` 是 w，但父游标是按子 ui 的 `min_rect`（= 内容实际宽度）推进的，
 ///    于是每一行的列起点都跟着自己的内容跑——表头与数据反而错位（这正是"不像表格"的成因）。
 ///
-/// 现在这条路两头都躲开：宽度来自真实排版结果（不猜），位置来自 `allocate_space` 的精确矩形
-/// （不由内容反推），同一帧内所有行列起点完全一致。
+/// 宽度这条单独记一笔（GUI 上"表格忽宽忽窄、每行字数忽多忽少"就是它）：
+/// **表宽只能由版心宽度决定，不能由内容决定。** 早先列宽上限写死 300px、整表又按内容收缩，
+/// 于是两列短表只有 200px 宽、三列长表顶到面板边缘还带横向滚动条——同一篇正文里表格
+/// 一会儿贴左、一会儿满宽，单元格每行能显示的字数也跟着变。现在列宽 = 自然宽按比例摊到
+/// 版心宽度上：表与正文同宽、右边缘对齐，放不下时才压缩（压缩优先短列，长列折行）。
+///
 /// 代价：单元格文字是直接画的，**不能框选复制**——要整段复制切顶栏「原文」视图即可。
 fn table(ui: &mut egui::Ui, t: &Table) {
     let cols = t
@@ -768,51 +864,84 @@ fn table(ui: &mut egui::Ui, t: &Table) {
     }
     let style = ui.style().clone();
 
-    // ---- 1) 逐格排版（超长文本在 MAX_COL_W 处折行），顺手拿到每格尺寸 ----
-    // `Painter::layout_job` 走 egui 的 galley 缓存，同一文本每帧只真排一次，代价可忽略。
-    let header_cells: Vec<Arc<egui::Galley>> = (0..cols)
-        .map(|i| cell_galley(ui, t.header.get(i), true, &style))
+    // ---- 1) 逐格按"不折行"排一遍，量出各列自然宽 ----
+    // `Painter::layout_job` 走 egui 的 galley 缓存，同样的 job 每帧只真排一次，代价可忽略。
+    let head_nat: Vec<Arc<egui::Galley>> = (0..cols)
+        .map(|i| cell_galley(ui, t.header.get(i), true, &style, f32::INFINITY))
         .collect();
-    let data_rows: Vec<Vec<Arc<egui::Galley>>> = t
+    let rows_nat: Vec<Vec<Arc<egui::Galley>>> = t
         .rows
         .iter()
         .map(|r| {
             (0..cols)
-                .map(|i| cell_galley(ui, r.get(i), false, &style))
+                .map(|i| cell_galley(ui, r.get(i), false, &style, f32::INFINITY))
                 .collect()
         })
         .collect();
 
-    // ---- 2) 列宽 = 该列所有格（含表头）里最宽的一格，全表统一 ----
-    let mut widths = vec![0.0f32; cols];
-    for cells in std::iter::once(&header_cells).chain(data_rows.iter()) {
-        for (i, g) in cells.iter().enumerate() {
-            widths[i] = widths[i].max(g.size().x);
-        }
-    }
-    for w in &mut widths {
-        *w = (*w + CELL_PAD_X * 2.0).clamp(MIN_COL_W, MAX_COL_W);
-    }
-
-    // ---- 3) 画：每行先按精确宽度占位，再把各格贴到本列的对齐位置 ----
+    // ---- 2) 列宽 = 自然宽按比例摊到版心宽度上 ----
     let spacing = ui.spacing().item_spacing.x;
-    let total_w: f32 = widths.iter().sum::<f32>() + spacing * cols.saturating_sub(1) as f32;
+    let gaps = spacing * cols.saturating_sub(1) as f32;
+    // 表头是粗体、必须按粗体量（细体量出来的宽度偏小，标题会被挤出列外）。
+    let natural: Vec<f32> = (0..cols)
+        .map(|i| {
+            std::iter::once(&head_nat[i])
+                .chain(rows_nat.iter().map(|r| &r[i]))
+                .map(|g| g.size().x)
+                .fold(0.0f32, f32::max)
+                + CELL_PAD_X * 2.0
+        })
+        .collect();
+    let widths = distribute(
+        &natural,
+        (ui.available_width() - gaps).max(MIN_COL_W),
+        MIN_COL_W,
+    );
+    let total_w: f32 = widths.iter().sum::<f32>() + gaps;
+
+    // ---- 3) 定稿：列宽放得下的格子沿用自然宽那份（不白排两遍），放不下的按列宽折行 ----
+    let header_cells: Vec<Cell> = (0..cols)
+        .map(|i| {
+            fit_cell(&head_nat[i], widths[i], |w| {
+                cell_galley(ui, t.header.get(i), true, &style, w)
+            })
+        })
+        .collect();
+    let data_rows: Vec<Vec<Cell>> = t
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            (0..cols)
+                .map(|i| {
+                    fit_cell(&rows_nat[r][i], widths[i], |w| {
+                        cell_galley(ui, row.get(i), false, &style, w)
+                    })
+                })
+                .collect()
+        })
+        .collect();
+
+    // ---- 4) 画：每行先按精确宽度占位，再把各格贴到本列的对齐位置 ----
     egui::ScrollArea::horizontal()
         .id_salt(ui.id().with("md_table_scroll"))
         .auto_shrink([true, false])
         .show(ui, |ui| {
-            // 表比面板宽时横向滚动（列宽上限 300，窄面板也不会把表撑破）。
             ui.set_min_width(total_w);
             let rows =
                 std::iter::once((true, &header_cells)).chain(data_rows.iter().map(|r| (false, r)));
             for (row_no, (header, cells)) in rows.enumerate() {
-                let row_h =
-                    cells.iter().map(|g| g.size().y).fold(0.0f32, f32::max) + CELL_PAD_Y * 2.0;
+                let row_h = cells
+                    .iter()
+                    .map(|c| c.galley().size().y)
+                    .fold(0.0f32, f32::max)
+                    + CELL_PAD_Y * 2.0;
                 let (_id, rect) = ui.allocate_space(egui::vec2(total_w, row_h));
                 paint_row_bg(ui, rect, header, row_no);
                 let mut x = rect.min.x;
-                for (i, g) in cells.iter().enumerate() {
+                for (i, c) in cells.iter().enumerate() {
                     let w = widths[i];
+                    let g = c.galley();
                     let gw = g.size().x;
                     let gx = match align_of(t, i) {
                         Align::Left => x + CELL_PAD_X,
@@ -828,31 +957,99 @@ fn table(ui: &mut egui::Ui, t: &Table) {
         });
 }
 
-/// 单元格排版：`wrap_width` 封顶 → 长文本折行而不是把表撑出面板。
+/// 单元格最终用哪份排版：列宽够宽就用不折行那份，放不下才折行。
+enum Cell {
+    /// 不折行的排版（列宽放得下时直接用它，省一次重排）。
+    Plain(Arc<egui::Galley>),
+    /// 按列宽折行后的排版。
+    Wrapped(Arc<egui::Galley>),
+}
+
+impl Cell {
+    fn galley(&self) -> &Arc<egui::Galley> {
+        match self {
+            Cell::Plain(g) | Cell::Wrapped(g) => g,
+        }
+    }
+}
+
+fn fit_cell(
+    natural: &Arc<egui::Galley>,
+    col_w: f32,
+    layout: impl FnOnce(f32) -> Arc<egui::Galley>,
+) -> Cell {
+    let w = col_w - CELL_PAD_X * 2.0;
+    if natural.size().x <= w {
+        Cell::Plain(natural.clone())
+    } else {
+        Cell::Wrapped(layout(w))
+    }
+}
+
+/// 把各列自然宽按比例摊成 `target` 总宽（减去列间距后的可用宽度）。
+///
+/// - 自然宽合计 ≤ `target`（表比版心窄）：按比例放大到**刚好填满版心**。
+///   表与正文同宽、右边缘对齐，视线不会因为"这张表只占半屏"而横向跳。
+/// - 合计 > `target`（表比版心宽）：按比例压缩，压到 `min_w` 的列就钉在下限，
+///   剩下的预算在还能压的列里再按比例分——**短列先保住完整内容，长列去折行**。
+/// - 连下限都放不下（列多且面板窄）：每列都是 `min_w`，此时表比面板还宽，
+///   交给横向滚动条，别把字挤成一列竖条。
+fn distribute(natural: &[f32], target: f32, min_w: f32) -> Vec<f32> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    let sum: f32 = natural.iter().sum();
+    if sum <= target {
+        let k = if sum > 0.0 { target / sum } else { 0.0 };
+        return natural.iter().map(|w| w * k).collect();
+    }
+    // 压缩：每轮都从**原始自然宽**重新按比例缩放，被压到下限的列退出，预算重分。
+    let mut out = natural.to_vec();
+    let mut active: Vec<usize> = (0..natural.len()).collect();
+    let mut budget = target;
+    loop {
+        let total: f32 = active.iter().map(|&i| natural[i]).sum();
+        if total <= f32::EPSILON {
+            break;
+        }
+        for &i in &active {
+            out[i] = natural[i] * budget / total;
+        }
+        let clamped: Vec<usize> = active.iter().copied().filter(|&i| out[i] < min_w).collect();
+        if clamped.is_empty() {
+            break;
+        }
+        for &i in &clamped {
+            out[i] = min_w;
+        }
+        active.retain(|i| !clamped.contains(i));
+        budget -= min_w * clamped.len() as f32;
+        if budget <= 0.0 {
+            // 剩下的列连下限都分不到：全部按下限收尾（总宽超了版心 → 交给横向滚动）。
+            for &i in &active {
+                out[i] = min_w;
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// 单元格排版：`wrap_w` 为 `f32::INFINITY` 表示不折行（量自然宽时用）。
 fn cell_galley(
     ui: &egui::Ui,
     content: Option<&Vec<Inline>>,
     header: bool,
     style: &egui::Style,
-) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob {
-        wrap: egui::text::TextWrapping {
-            max_width: MAX_COL_W,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    for i in content.map(Vec::as_slice).unwrap_or_default() {
-        let rt = rt_of(ui, i);
-        let rt = if header { rt.strong() } else { rt };
-        rt.append_to(
-            &mut job,
-            style,
-            egui::FontSelection::Default,
-            egui::Align::Center,
-        );
-    }
-    ui.painter().layout_job(job)
+    wrap_w: f32,
+) -> Arc<egui::Galley> {
+    ui.painter().layout_job(inline_job(
+        ui,
+        content.map(Vec::as_slice).unwrap_or_default(),
+        wrap_w,
+        style,
+        |rt| if header { rt.strong() } else { rt },
+    ))
 }
 
 /// 底色分带：表头一条实底、数据行隔行浅底（不画横线，靠色带分，读起来更像表）。
@@ -867,12 +1064,13 @@ fn paint_row_bg(ui: &egui::Ui, rect: egui::Rect, header: bool, row_no: usize) {
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
-/// 列宽下限 / 上限（像素）：下限让空列也点得着，上限让超长单元格折行。
-const MIN_COL_W: f32 = 40.0;
-const MAX_COL_W: f32 = 300.0;
+/// 列宽下限：至少放得下一小段文字加两侧留白（空列也点得着，宽表不至于挤成竖条）。
+const MIN_COL_W: f32 = 56.0;
 /// 单元格留白：文字不贴着隔壁列。
 const CELL_PAD_X: f32 = 8.0;
 const CELL_PAD_Y: f32 = 3.0;
+/// 列表符号前的缩进（有序无序同宽，两种列表看起来才是一套的）。
+const LIST_INDENT_W: f32 = 16.0;
 
 fn align_of(t: &Table, i: usize) -> Align {
     t.aligns.get(i).copied().unwrap_or(Align::Left)
@@ -883,18 +1081,40 @@ fn align_of(t: &Table, i: usize) -> Align {
 /// egui 0.36 的 `RichText` 只能带**一种**样式，不再支持旧版的 `push` 拼多段；
 /// 段内混排（`**粗**`、`` `码` ``）必须靠 `append_to` 累加进同一个 job，
 /// 否则一行里每个片段各占一个 label，折行位置与基线都会散掉。
-fn inline_label(ui: &mut egui::Ui, v: &[Inline]) {
-    let style = ui.style().clone();
-    let mut job = egui::text::LayoutJob::default();
+///
+/// `wrap_w` 是折行宽度：表格单元格给列宽，标签给 `available_width()`。
+/// 注意 `ui.label` 会用自己的 `available_width()` 覆盖 job 里的折行宽度
+/// （egui `Label::layout_in_ui`），所以标签这条路只能靠"块内宽度本身一致"来保证版心统一。
+fn inline_job(
+    ui: &egui::Ui,
+    v: &[Inline],
+    wrap_w: f32,
+    style: &egui::Style,
+    deco: impl Fn(egui::RichText) -> egui::RichText,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width: wrap_w,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     for i in v {
-        rt_of(ui, i).append_to(
+        deco(rt_of(ui, i)).append_to(
             &mut job,
-            &style,
+            style,
             egui::FontSelection::Default,
             egui::Align::Center,
         );
     }
-    ui.label(job);
+    job
+}
+
+/// 段落 / 列表项：按当前可用宽度折行（可用宽度由块内布局保证一致，见 [`show`]）。
+fn inline_label(ui: &mut egui::Ui, v: &[Inline]) {
+    let style = ui.style().clone();
+    let w = ui.available_width();
+    ui.label(inline_job(ui, v, w, &style, |rt| rt));
 }
 
 /// 单个行内元素 → `RichText`；`Link` / `Image` 一律降级成**不可点**的纯文本（见模块注释）。
@@ -969,6 +1189,32 @@ mod tests {
 
     fn bs_text(blocks: &[Block]) -> String {
         blocks.iter().map(block_text).collect::<Vec<_>>().join("\n")
+    }
+
+    /// 离屏跑一帧的上下文，**必须**带内嵌字体。
+    ///
+    /// `Context::default()` 里没有可用的中文字形，长出来的 galley 尺寸全是 0，
+    /// 任何几何断言都会拿到 NaN —— 也就是说没装字体的离屏测试只能验"有没有画东西"，
+    /// 验不了"画在哪、画多宽"。窗口启动用的是同一份定义（[`crate::fonts`]）。
+    fn ctx_with_fonts() -> eframe::egui::Context {
+        let ctx = eframe::egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions());
+        ctx
+    }
+
+    /// 离屏跑帧的输入：**给一个正常大小的窗口**。
+    ///
+    /// `RawInput::default()` 的屏幕是两万点宽的"无限大"画布，任何宽度断言都会因为
+    /// "怎么都不换行"而失去意义（表宽、折行宽度看起来都对，其实没被考验）。
+    /// 800×600 与窗口默认的 1000×680 同量级。
+    fn raw() -> eframe::egui::RawInput {
+        eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::pos2(0.0, 0.0),
+                eframe::egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1046,6 +1292,165 @@ mod tests {
         };
         assert_eq!(t.rows.len(), 1);
         assert_visible(&b, "a");
+    }
+
+    #[test]
+    fn 表格单元格内的竖线不切列() {
+        // 真实缺陷：清单里"字段用 `file|anchor|replacement` 分隔"这类行，
+        // 按 `|` 硬切就变成多出好几列、内容整体错位（列数还会被数据行顶大）。
+        let b = parse(
+            "| 编号 | 子任务 | 预估工时 |\n| --- | --- | --- |\n\
+             | T1 | 变异清单文件格式（`file|anchor|replacement|test-filter|理由`） | 2h |\n",
+        );
+        let Block::Table(t) = &b[0] else {
+            panic!("应为表格：{:?}", b[0])
+        };
+        assert_eq!(t.header.len(), 3);
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].len(), 3);
+        // `inline_text` 是结构文本化（代码段不加反引号），列内容一格都没丢。
+        assert_eq!(inline_text(&t.rows[0][0]), "T1");
+        assert_eq!(
+            inline_text(&t.rows[0][1]),
+            "变异清单文件格式（file|anchor|replacement|test-filter|理由）"
+        );
+        assert_eq!(inline_text(&t.rows[0][2]), "2h");
+    }
+
+    #[test]
+    fn 表格里转义的竖线也不切列() {
+        // GFM：`\|` 与代码段内的竖线同义，都是"内容里的竖线"。
+        let cells = cells_of(r"| a\|b | `c|d` | e |");
+        assert_eq!(cells, vec!["a\\|b", "`c|d`", "e"]);
+        // 反斜杠由行内解析器解释（GFM 里代码段内不解释转义）。
+        assert_eq!(inline_text(&parse_inlines(&cells[0])), "a|b");
+        assert_eq!(inline_text(&parse_inlines(&cells[1])), "c|d");
+    }
+
+    #[test]
+    fn 未闭合的反引号仍按列分隔() {
+        // 不成对的反引号不是代码段（GFM），否则整行会被并成一格、后面几列全丢。
+        assert_eq!(cells_of("| a | b`c | d |"), vec!["a", "b`c", "d"]);
+    }
+
+    #[test]
+    fn 列宽按自然宽比例摊到版心宽度() {
+        // 比版心窄 → 放大到刚好填满（表与正文同宽、右边缘对齐）。
+        assert_eq!(distribute(&[100.0, 200.0], 600.0, 56.0), vec![200.0, 400.0]);
+        // 比版心宽 → 压缩，短列钉在下限保内容，剩下的宽度长列自己承担（长列去折行）。
+        let w = distribute(&[1000.0, 100.0], 200.0, 56.0);
+        assert_eq!(w, vec![144.0, 56.0], "{w:?}");
+        // 等比压缩时不超版心、也不低于下限。
+        let w = distribute(&[400.0, 400.0], 600.0, 56.0);
+        assert!((w.iter().sum::<f32>() - 600.0).abs() < 0.5, "{w:?}");
+        assert!(w.iter().all(|x| *x >= 56.0), "{w:?}");
+        // 连下限都放不下 → 每列都是下限（表比面板还宽，交给横向滚动）。
+        assert_eq!(
+            distribute(&[300.0, 300.0, 300.0], 100.0, 56.0),
+            vec![56.0, 56.0, 56.0]
+        );
+        assert!(distribute(&[], 100.0, 56.0).is_empty());
+    }
+
+    #[test]
+    fn 表格宽度等于版心而不是等于内容() {
+        // 两列短表曾经只有百来 px 宽（列宽上限 300px + 整表按内容收缩），
+        // 与同页段落不齐；表头底色的宽度就是整表宽度，拿它跟版心比最直接。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("一段正文。\n\n| 项 | 值 |\n| --- | --- |\n| a | 1 |\n");
+        let measure = std::cell::Cell::new(0.0f32);
+        let mut out = ctx.run_ui(raw(), |ui| {
+            measure.set(ui.available_width());
+            show(ui, &blocks);
+        });
+        out.textures_delta.clear();
+        let table_w = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Rect(r) => Some(r.rect.width()),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            (table_w - measure.get()).abs() < 1.0,
+            "表宽 {table_w} 应等于版心宽 {}（表与正文同宽）",
+            measure.get()
+        );
+        // 段落与表格是**同一个**版心：正文的折行宽度也就是版心宽度。
+        let para_wrap = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("一段正文") => {
+                    Some(t.galley.job.wrap.max_width)
+                }
+                _ => None,
+            })
+            .expect("应画出段落文字");
+        assert!(
+            (para_wrap - measure.get()).abs() < 1.0,
+            "段落折行宽度 {para_wrap} 应等于版心宽 {}",
+            measure.get()
+        );
+        // 单元格文字不得越出版心右边缘（列宽分配错了就会越界）。
+        let right = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.visual_bounding_rect().max.x),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            right <= measure.get() + 1.0,
+            "文字右边缘 {right} 不应越出版心宽 {}",
+            measure.get()
+        );
+    }
+
+    #[test]
+    fn 列表一项占一行且折行宽度一致() {
+        // 守住的不变量（不是复现某个旧缺陷）：两项必须在两行上，且折行宽度完全一致。
+        // 若列表改回 `horizontal_wrapped`，两项一旦排到同一行，第二项的折行宽度就是
+        // "版心 − 上一项宽度"，这条断言会先炸。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("- 甲\n- 乙\n");
+        let mut out = ctx.run_ui(raw(), |ui| show(ui, &blocks));
+        out.textures_delta.clear();
+        let rows: Vec<(String, f32, f32)> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some((
+                    t.galley.text().to_string(),
+                    t.visual_bounding_rect().min.y,
+                    t.galley.job.wrap.max_width,
+                )),
+                _ => None,
+            })
+            .collect();
+        let item = |name: &str| {
+            rows.iter()
+                .find(|(t, _, _)| t.trim() == name)
+                .unwrap_or_else(|| panic!("没画出行内文本 {name}：{rows:?}"))
+        };
+        let (y_a, wrap_a) = {
+            let (_, y, w) = item("甲");
+            (y, w)
+        };
+        let (y_b, wrap_b) = {
+            let (_, y, w) = item("乙");
+            (y, w)
+        };
+        assert!(
+            (y_a - y_b).abs() >= 8.0,
+            "两项应在两行上（y {y_a} vs {y_b}）：{rows:?}"
+        );
+        assert!(
+            (wrap_a - wrap_b).abs() < 0.5,
+            "两项的折行宽度应一致：{wrap_a} vs {wrap_b}"
+        );
     }
 
     #[test]
@@ -1138,7 +1543,8 @@ mod tests {
         // egui 可以脱离窗口跑一帧：用来守住"渲染代码在真实 egui 调用下不炸"这条底线。
         let src = "## 1. 需求分解\n\n> 提示 **加粗** 与 `代码`\n\n\
                    - [x] 已完成\n- [ ] 未完成\n  - 嵌套项\n\n1. 第一\n2. 第二\n\n\
-                   | 项 | 值 |\n| :--- | ---: |\n| 工时 | 2d |\n\n\
+                   | 项 | 值 |\n| :--- | ---: |\n| 工时 | 2d |\n\
+                   | 超长单元格 | 这一格很长很长很长很长很长很长很长很长很长很长很长很长，用来逼出折行路径 |\n\n\
                    ```bash\nreq-guard approve REQ-001\n```\n\n---\n\n\
                    见 [文档](https://a.tld) 与 ~~废弃~~ 条目\n";
         let ctx = egui::Context::default();
