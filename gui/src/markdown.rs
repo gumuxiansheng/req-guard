@@ -1176,7 +1176,12 @@ fn table(ui: &mut egui::Ui, t: &Table) {
     // ---- 4) 画：每行先按精确宽度占位，再把各格贴到本列的对齐位置 ----
     egui::ScrollArea::horizontal()
         .id_salt(ui.id().with("md_table_scroll"))
-        .auto_shrink([true, false])
+        // ⚠ **`auto_shrink` 的纵向必须是 `true`**（高度跟着内容走）。
+        // 早先写 `[true, false]`：本 ScrollArea 没开纵向滚动，而 egui 里
+        // `方向未开 + auto_shrink=false` 对应 `inner_size.y = max(可用高, 内容高)`
+        // —— 短表格也会**占满整屏高度**，其后的段落被顶到视口外（实测：整屏空白，
+        // 滚下去才看见下一段）。
+        .auto_shrink([true, true])
         .show(ui, |ui| {
             ui.set_min_width(total_w);
             let rows =
@@ -2105,6 +2110,43 @@ mod tests {
             content_h.get() > 600.0,
             "ScrollArea 量到的内容高度 {} 应超过视口 600，否则滚不动",
             content_h.get()
+        );
+    }
+
+    #[test]
+    fn 短表格不留大片空白() {
+        // 复现：短表格后面跟一段文字时，中间出现一整屏空白。
+        // 成因：`table()` 里的横向 ScrollArea 用了 `auto_shrink([true, false])` ——
+        // 纵向 `auto_shrink = false` 且该方向没开滚动，egui 会按"填满可用高度"排版，
+        // 于是表格占掉整屏高度，其后的段落被顶到屏幕外（滚下去才看见）。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("| 项 | 值 |\n| --- | --- |\n| 工时 | 2d |\n\n紧跟表格的一段文字。\n");
+        let mut out = ctx.run_ui(raw(), |ui| show(ui, &blocks));
+        out.textures_delta.clear();
+        let y_of = |needle: &str| {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => {
+                        Some(t.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .fold(None::<egui::Rect>, |acc: Option<egui::Rect>, r| {
+                    Some(acc.map_or(r, |a| a.union(r)))
+                })
+                .unwrap_or_else(|| {
+                    panic!("没画出 {needle}：它被顶到视口外了（表格下方留了一整屏空白）")
+                })
+        };
+        let table = y_of("工时");
+        let para = y_of("紧跟表格");
+        let gap = para.min.y - table.max.y;
+        assert!(
+            gap < 30.0,
+            "短表格与下一段之间不应有大片空白，实得 {gap}px（表格底部 {} → 段落顶部 {}）",
+            table.max.y,
+            para.min.y
         );
     }
 

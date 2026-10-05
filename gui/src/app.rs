@@ -77,6 +77,12 @@ pub struct App {
     pub input_comment: String,
     /// 新增评论是否阻塞（未 resolve 即拦截编码）。
     pub input_blocking: bool,
+    /// 上一帧渲染时展开的是哪一段（[`Self::step`] 的上一帧值）。
+    ///
+    /// 存在的唯一理由：切段时要把**新段的开头**滚进视口（见 [`render_center`]），
+    /// 而"是否发生过切段"只能靠跨帧比较才看得出来。不用它而每次都滚，
+    /// 会把用户手动滚到的位置每帧拽回去。
+    last_step_shown: usize,
     last_refresh: Instant,
 }
 
@@ -103,6 +109,7 @@ impl App {
             comment_sel: 0,
             input_comment: String::new(),
             input_blocking: false,
+            last_step_shown: 0,
             last_refresh: Instant::now(),
         };
         app.reload();
@@ -828,113 +835,164 @@ fn render_center(parent: &mut egui::Ui, app: &mut App) {
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, s) in req.steps.iter().enumerate() {
-                let (mark, tone) = match s.state {
-                    StepState::Approved => ("✓", Tone::Success),
-                    StepState::Rejected => ("✗", Tone::Danger),
-                    // 修订与打回都要重新批准，色调一致；标记用 `~` 示"这是改稿不是否决"
-                    // （与 TUI 的 `[~]` 同一套语义，别让两个界面看起来不一样）。
-                    StepState::Amended => ("~", Tone::Danger),
-                    StepState::Pending => ("○", Tone::Muted),
-                };
-                let who = s
-                    .reviewer
-                    .clone()
-                    .map(|v| format!("  审核人 {} ", v))
-                    .unwrap_or_default();
-                // 冻结异常（未绑定 / 被改动 / 无法校验）直接写进段标题——
-                // 审核人扫一眼三段就该知道哪段不能放行，而不是要点开才知道。
-                let seal_note = match seal_badge(s.seal) {
-                    Some((m, _)) => format!("  {} {}", m, s.seal.hint()),
-                    None => String::new(),
-                };
-                let header = egui::RichText::new(format!(
-                    "[{}] {}. {}  {}{}{}",
-                    mark,
-                    i + 1,
-                    s.label,
-                    s.state.label(),
-                    who,
-                    seal_note
-                ))
-                .color(tone.color(ui));
+        egui::ScrollArea::vertical()
+            // ⚠ `id_salt` 必须给：不加时用的是"本 ui 里第几个控件"推出来的自动 id，
+            // 而控件数会随段数 / 按钮数变化 —— 偏移记忆跟着漂，动一下就跳位。
+            // 带上需求 id：不同需求各记各的滚动位置，切回来还在原处。
+            .id_salt(("steps", req.id.as_str()))
+            .show(ui, |ui| {
+                let mut selected_header: Option<(egui::Response, bool)> = None;
+                for (i, s) in req.steps.iter().enumerate() {
+                    let (mark, tone) = match s.state {
+                        StepState::Approved => ("✓", Tone::Success),
+                        StepState::Rejected => ("✗", Tone::Danger),
+                        // 修订与打回都要重新批准，色调一致；标记用 `~` 示"这是改稿不是否决"
+                        // （与 TUI 的 `[~]` 同一套语义，别让两个界面看起来不一样）。
+                        StepState::Amended => ("~", Tone::Danger),
+                        StepState::Pending => ("○", Tone::Muted),
+                    };
+                    let who = s
+                        .reviewer
+                        .clone()
+                        .map(|v| format!("  审核人 {} ", v))
+                        .unwrap_or_default();
+                    // 冻结异常（未绑定 / 被改动 / 无法校验）直接写进段标题——
+                    // 审核人扫一眼三段就该知道哪段不能放行，而不是要点开才知道。
+                    let seal_note = match seal_badge(s.seal) {
+                        Some((m, _)) => format!("  {} {}", m, s.seal.hint()),
+                        None => String::new(),
+                    };
+                    let header = egui::RichText::new(format!(
+                        "[{}] {}. {}  {}{}{}",
+                        mark,
+                        i + 1,
+                        s.label,
+                        s.state.label(),
+                        who,
+                        seal_note
+                    ))
+                    .color(tone.color(ui));
 
-                // open(Some(..)) 会每帧强制开合状态：折叠交互本身展不开非选中段，
-                // 所以这里把"点击标题"接管为"选中该段"，选中段下一帧即被展开。
-                let resp = egui::CollapsingHeader::new(header)
-                    .open(Some(i == app.step))
-                    .show(ui, |ui| {
-                        // 只显示**这一段**（需求分解 / 技术方案 / 测试计划），而不是整篇清单：
-                        // 展开哪一段就看到哪一段，审核人不必自己在全文里找对应节，避免看错段点错批准。
-                        // 切段规则在 core（与 TUI 同一条规则），定位失败时回退整篇。
-                        let text = requirement::section_of(&app.body, i);
-                        if app.render_md {
-                            markdown::show(ui, app.md.get(i, &text));
-                        } else {
-                            add_raw_text(ui, &text);
-                        }
-                    });
-                if resp.header_response.clicked() {
-                    app.step = i;
-                }
-
-                // 当前段的冻结异常 → 直接给出「绑定摘要」入口：
-                // 这条动作的正当理由就写在标题上，摆在旁边免得审核人再去想"该怎么办"。
-                if i == app.step
-                    && s.seal.needs_action()
-                    && ui
-                        .button("绑定本段内容摘要")
-                        .on_hover_text(s.seal.hint())
-                        .clicked()
-                {
-                    app.input_reason.clear();
-                    app.dialog = Dialog::Seal;
-                }
-
-                // 当前段的审核按钮（已通过的段无需再审，不显示，避免误导）
-                if i == app.step && s.state != StepState::Approved {
-                    let can = req.can_review(s.key);
-                    if ui
-                        .add_enabled(can, egui::Button::new("批准"))
-                        .on_hover_text(if can {
-                            "批准当前段（需要审核人姓名）"
-                        } else {
-                            "顺序不满足：请先批准更早的步骤"
-                        })
-                        .clicked()
-                    {
-                        app.dialog = Dialog::Approve;
-                        app.input_reviewer.clear();
+                    // open(Some(..)) 会每帧强制开合状态：折叠交互本身展不开非选中段，
+                    // 所以这里把"点击标题"接管为"选中该段"，选中段下一帧即被展开。
+                    let resp = egui::CollapsingHeader::new(header)
+                        .open(Some(i == app.step))
+                        .show(ui, |ui| {
+                            // 只显示**这一段**（需求分解 / 技术方案 / 测试计划），而不是整篇清单：
+                            // 展开哪一段就看到哪一段，审核人不必自己在全文里找对应节，避免看错段点错批准。
+                            // 切段规则在 core（与 TUI 同一条规则），定位失败时回退整篇。
+                            let text = requirement::section_of(&app.body, i);
+                            if app.render_md {
+                                markdown::show(ui, app.md.get(i, &text));
+                            } else {
+                                add_raw_text(ui, &text);
+                            }
+                        });
+                    if i == app.step {
+                        selected_header = Some((resp.header_response.clone(), resp.fully_open()));
                     }
-                    if ui
-                        .add_enabled(can, egui::Button::new("打回"))
-                        .on_hover_text("打回当前段（审核人 + 原因必填）")
-                        .clicked()
+                    if resp.header_response.clicked() {
+                        app.step = i;
+                    }
+
+                    // 当前段的冻结异常 → 直接给出「绑定摘要」入口：
+                    // 这条动作的正当理由就写在标题上，摆在旁边免得审核人再去想"该怎么办"。
+                    if i == app.step
+                        && s.seal.needs_action()
+                        && ui
+                            .button("绑定本段内容摘要")
+                            .on_hover_text(s.seal.hint())
+                            .clicked()
                     {
-                        app.dialog = Dialog::Reject;
+                        app.input_reason.clear();
+                        app.dialog = Dialog::Seal;
+                    }
+
+                    // 当前段的审核按钮（已通过的段无需再审，不显示，避免误导）
+                    if i == app.step && s.state != StepState::Approved {
+                        let can = req.can_review(s.key);
+                        if ui
+                            .add_enabled(can, egui::Button::new("批准"))
+                            .on_hover_text(if can {
+                                "批准当前段（需要审核人姓名）"
+                            } else {
+                                "顺序不满足：请先批准更早的步骤"
+                            })
+                            .clicked()
+                        {
+                            app.dialog = Dialog::Approve;
+                            app.input_reviewer.clear();
+                        }
+                        if ui
+                            .add_enabled(can, egui::Button::new("打回"))
+                            .on_hover_text("打回当前段（审核人 + 原因必填）")
+                            .clicked()
+                        {
+                            app.dialog = Dialog::Reject;
+                            app.input_reviewer.clear();
+                            app.input_reason.clear();
+                        }
+                    }
+
+                    // 「修订」对**已通过**的段同样有意义：正文冻结之后，"方向没错、只是漏个约束"
+                    // 这种反馈最常发生在刚批准的段上，而已通过段上恰恰没有"打回"按钮。
+                    if i == app.step
+                        && s.state == StepState::Approved
+                        && ui
+                            .button("请求修订")
+                            .on_hover_text("方向没错、只是要改：回退待审 + 清空摘要，仍需重新批准")
+                            .clicked()
+                    {
+                        app.dialog = Dialog::Amend;
                         app.input_reviewer.clear();
                         app.input_reason.clear();
                     }
+                    ui.separator();
                 }
-
-                // 「修订」对**已通过**的段同样有意义：正文冻结之后，"方向没错、只是漏个约束"
-                // 这种反馈最常发生在刚批准的段上，而已通过段上恰恰没有"打回"按钮。
-                if i == app.step
-                    && s.state == StepState::Approved
-                    && ui
-                        .button("请求修订")
-                        .on_hover_text("方向没错、只是要改：回退待审 + 清空摘要，仍需重新批准")
-                        .clicked()
-                {
-                    app.dialog = Dialog::Amend;
-                    app.input_reviewer.clear();
-                    app.input_reason.clear();
+                // **切段后把该段开头滚进视口**（审核人的心智是"点哪一段就从哪一段开始看"）。
+                //
+                // 为什么必须管：切段使上一段正文收起（内容变矮），而滚动偏移会被 ScrollArea
+                // 原样保留 —— 视口于是停在"新段正文中段"（实测：偏移 1800 时第 2 段标题被推到
+                // 屏幕 y=2144，视口只有 600 高，正文开头根本不在视口内）。
+                //
+                // ⚠ **必须一直校正到动画结束，不能只在切段那一帧请求一次**：开合是带动画的，
+                // 那一帧算出的目标位置按**旧布局**定，动画把内容挪完之后目标就偏了
+                // （实测：请求落在 y≈5000，收完动画视口停在 y=1873 —— 仍是正文中段）。
+                // 所以"本帧切过段"或"选中段还没完全展开"就再校正一次；动画一停就不再请求，
+                // 用户手动滚到的位置不会被长期拽回去（这条由 [`take_viewport_fix`] 守住：
+                // 判定与"上次展开的段"的推进必须同时发生，少了推进就会每帧都校正）。
+                if let Some((h, fully_open)) = selected_header {
+                    if take_viewport_fix(&mut app.last_step_shown, app.step, fully_open) {
+                        h.scroll_to_me(Some(egui::Align::Min));
+                    }
                 }
-                ui.separator();
-            }
-        });
+            });
     });
+}
+
+/// 该不该在这一帧校正视口（把选中段的开头顶回视口顶部），并把"上次展开的段"推进到当前段。
+///
+/// 形参 `last_shown` 是**进出同一趟**的：判定与状态推进必须绑在一起。
+///
+/// - 本帧刚切段（`last_shown != step`）→ 校正；
+/// - 选中段的开合动画还没结束 → 继续校正。只在切段那一帧校正是不够的：那一帧的目标位置
+///   是按**旧布局**算的，动画把内容挪完之后目标就偏了（实测偏到视口下方 1873px 处，
+///   仍是正文中段）。
+/// - 动画结束且没切段 → 不校正，用户手动滚到的位置不被拽回去。
+///
+/// ⚠ **为什么把状态推进收进这个函数**：此前判定与状态更新是分开放的两处，中间隔着
+/// 一个大循环；重构时"更新 `last_step_shown`"那一行被漏掉，于是 `step_changed`
+/// **每帧都为真**、每帧都发一次 `scroll_to_me` —— 症状是"滚到下方后自动跳回第一行"
+/// （审核人实测）。合在一起就没有"漏掉更新"这种形态，而"稳定之后不再校正"这条
+/// 由 [`take_viewport_fix_稳定后不再校正`] 单测守住。
+///
+/// 拆成纯函数（不碰 egui）也是为了能单测：离屏 `run_ui` 里滚轮不生效
+/// （egui 只在指针悬于滚动区上时才吃滚轮，见 `scroll_area.rs` 的 `is_hovering_outer_rect`），
+/// "用户已经滚下去"这个起点在自动化里造不出来 —— 渲染结果的断言无法成为判决。
+fn take_viewport_fix(last_shown: &mut usize, step: usize, selected_fully_open: bool) -> bool {
+    let changed = *last_shown != step;
+    *last_shown = step;
+    changed || !selected_fully_open
 }
 
 /// 段状态的可读标记（`Seal` 弹窗里逐段列状态时复用，避免两处各写一套符号）。
@@ -1587,6 +1645,151 @@ mod tests {
             "提示要写明「仍需重审」：{:?}",
             app.message
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 三段都塞进足够长的正文（每段 60 条），让第 2 段的标题被顶到视口之外。
+    ///
+    /// 复现"切段后视口停在正文中段"的前提：第 1 段展开时正文很高，
+    /// 后面的段标题自然落在 600px 视口之外。
+    fn long_doc(root: &Path) {
+        requirement::create(root, None, "滚动复现").expect("创建需求");
+        let p = requirement::find(root, "REQ-001").expect("清单应存在").path;
+        let mut c = std::fs::read_to_string(&p).expect("清单应可读");
+        for heading in ["## 1. 需求分解", "## 2. 技术方案", "## 3. 测试计划"] {
+            let needle = format!("{heading}\n");
+            assert!(c.contains(&needle), "模板结构变了：{heading}");
+            let filler: String = (0..60)
+                .map(|i| format!("- 第 {i} 条：{}\n", "内容".repeat(30)))
+                .collect();
+            c = c.replacen(&needle, &format!("{needle}{filler}"), 1);
+        }
+        std::fs::write(&p, c).expect("写入应成功");
+        for step in ["decomposition", "solution", "testplan"] {
+            requirement::review(root, "REQ-001", step, "寇工", true, "", false)
+                .expect("三段都应批得过");
+        }
+    }
+
+    /// 离屏渲染一帧中央面板，返回该帧画出的全部文字（原文 + y）。
+    ///
+    /// `wheel` 非零时该帧带一笔滚轮事件。指针必须悬在面板上：egui 的 ScrollArea 只在
+    /// `is_hovering_outer_rect` 时才吃滚轮（`scroll_area.rs`），少了它就滚不动。
+    fn center_frame(app: &mut App, ctx: &egui::Context, wheel: f32) -> Vec<(String, f32)> {
+        let mut events = vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))];
+        if wheel != 0.0 {
+            events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, wheel),
+                modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::Move,
+            });
+        }
+        let raw = eframe::egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| render_center(ui, app));
+        // 离屏没有渲染器消费纹理增量，必须显式 clear，否则 epaint 在 Drop 时 panic。
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => {
+                    Some((t.galley.text().to_string(), t.visual_bounding_rect().min.y))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 只匹配**段标题**，不匹配正文里的 `## 2. 技术方案`：两者都含"技术方案"，
+    /// 混用会把"正文开头恰好可见"误判成"标题已滚进视口"，测试就恒真了。
+    const NEEDLE_HEADER: &str = "] 2. 技术方案";
+
+    fn min_y_of(texts: &[(String, f32)], needle: &str) -> Option<f32> {
+        texts
+            .iter()
+            .filter(|(t, _)| t.contains(needle))
+            .map(|(_, y)| *y)
+            .fold(None, |acc: Option<f32>, y| {
+                Some(acc.map_or(y, |a| a.min(y)))
+            })
+    }
+
+    #[test]
+    fn take_viewport_fix_切段与动画期间校正_稳定后不再校正() {
+        // 起始状态：第 0 段正在展开动画中 → 必须校正。
+        let mut last = 0;
+        assert!(
+            take_viewport_fix(&mut last, 0, false),
+            "开合动画未结束时必须校正，否则视口会停在正文中段"
+        );
+        // 动画结束、段没变 → **不再校正**（否则用户手动滚下去会被每帧拽回顶部）。
+        // 这条断言正是"滚到下方后自动跳回第一行"那个缺陷的判决：状态一旦没被推进，
+        // 它就会一直是 true。
+        assert!(
+            !take_viewport_fix(&mut last, 0, true),
+            "稳定之后不应再校正视口"
+        );
+        assert_eq!(last, 0, "状态必须被推进到当前段");
+        // 切段那一帧必须校正（哪怕选中段已经是展开状态）。
+        assert!(take_viewport_fix(&mut last, 1, true));
+        assert_eq!(last, 1);
+        // 切段后动画期间继续校正，稳定后停止。
+        assert!(take_viewport_fix(&mut last, 1, false));
+        assert!(!take_viewport_fix(&mut last, 1, true));
+        // 来回切段每次都要校正（状态跟的是当前段，不是"曾经切过一次"）。
+        assert!(take_viewport_fix(&mut last, 0, true));
+        assert!(take_viewport_fix(&mut last, 1, true));
+    }
+
+    #[test]
+    fn 切段后选中段标题回到视口() {
+        // 审核人实测："技术方案和测试计划展开时，展示的内容不是从头开始，而是滚动到了中间"。
+        // 成因：切段使上一段正文收起（内容变矮），但 ScrollArea 的偏移被原样保留 ——
+        // 视口停在"新段正文中段"（实测偏移 1800 时第 2 段标题被推到屏幕 y=2144，
+        // 视口只有 600 高，段标题根本不在视口内）。
+        //
+        // ⚠ **这条用例不是"视口校正"的判决**：离屏 `run_ui` 里滚轮不生效，造不出"已滚下去"
+        // 的起点（详见 [`need_viewport_fix`] 的注释），所以撤掉校正它照样会过。
+        // 它的作用是守住切换路径本身能跑通、且切段后选中段标题**可见**（不是画到视口外）；
+        // 校正规则由 `need_viewport_fix_动画结束前持续校正` 单测守住，
+        // 校正后的实际滚动效果由人工在真实 GUI 里点一次确认。
+        let ctx = {
+            let c = egui::Context::default();
+            c.set_fonts(crate::fonts::definitions());
+            c
+        };
+        let root = temp_root("scroll-step");
+        long_doc(&root);
+        let mut app = App::new(&root);
+        assert_eq!(app.step, 0);
+
+        // 第 1 段正文很长 → 第 2 段标题本来就在视口外。
+        let texts = center_frame(&mut app, &ctx, 0.0);
+        assert!(
+            min_y_of(&texts, NEEDLE_HEADER).is_none(),
+            "前提不成立：第 1 段正文很长，第 2 段标题本应在视口外，却画在了 y={:?}",
+            min_y_of(&texts, NEEDLE_HEADER)
+        );
+
+        // 切段（= 点第 2 段标题的效果）。开合带动画，所以要跑到它收敛：视口校正只在
+        // "切段帧或动画未结束"时发起，动画一停就交还给用户。
+        app.step = 1;
+        let mut after = None;
+        for _ in 0..40 {
+            after = min_y_of(&center_frame(&mut app, &ctx, 0.0), NEEDLE_HEADER);
+            if after.is_some() {
+                break;
+            }
+        }
+        let after = after.expect("切段后第 2 段标题应被滚进视口：视口停在了正文中段");
+        assert!(after < 600.0, "切段后第 2 段标题应在视口内，实得 y={after}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
