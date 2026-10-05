@@ -4,7 +4,7 @@ tier: standard
 owner: -
 review_policy: codebound
 verified_at: 2026-10-05
-source_refs: []
+source_refs: [gui/src, docs/设计]
 ---
 
 # REQ-011 GUI 正文 Markdown 渲染：表格竖线与列宽缺陷修复
@@ -13,10 +13,10 @@ source_refs: []
 > 本文件是硬拦截依据——`.gates/hooks/req-guard-check.{sh,ps1}` 只解析下列 `GATE` 标记行；
 > 正文可自由编辑，但**请勿手工修改 GATE 行**（请用 `req-guard approve`）。
 
-<!-- GATE:HEAD id=REQ-011 status=draft created=2026-10-05_09:54:43 -->
-<!-- GATE:STEP name=decomposition label=需求分解 status=pending reviewer=- updated=- -->
-<!-- GATE:STEP name=solution label=技术方案 status=pending reviewer=- updated=- -->
-<!-- GATE:STEP name=testplan label=测试计划 status=pending reviewer=- updated=- -->
+<!-- GATE:HEAD id=REQ-011 status=approved created=2026-10-05_09:54:43 -->
+<!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_09:59:34 sum=5f470752beaced231462d90b9c04d448b96b35229704fc1b68082bdb0c43dafa -->
+<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_09:59:43 sum=ec136fb1528dff6f76e53e6da7074ce7b169f56dbe2436db646135ff7b172793 -->
+<!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_10:00:01 sum=c1d3e51031adece15606d84de93f705170dda58a321973a343af0ba596b3d45e -->
 
 ## 1. 需求分解
 
@@ -42,6 +42,10 @@ GUI 正文由 `gui/src/markdown.rs` 的**自研零依赖渲染器**画出（不�
    两列短表只有 200px 宽（贴左、右边缘悬在半空），三列长表顶到面板边缘还要出横向
    滚动条；单元格每行能显示的字数也跟着变（300px 处的折行与段落按版心折行不是一回事）。
    同一篇正文里段落一律按版心宽、表格却忽宽忽窄，观感就是"有的行字多、有的行字少"。
+
+   过程如实记录：两处修复**先落地后立项** —— pre-commit 的 `check --staged` 按
+   `Ambiguous` 拦下（没有任何已批清单声明 `gui/src/markdown.rs`，当初引入渲染器的
+   75bf7f9 也没留下 TOUCH 声明），本清单据此补开，把已实现的改动纳入声明与验收。
 
    顺带查明一处相邻隐患：列表项曾用 `ui.horizontal_wrapped` 排版，wrap 布局会把
    "这一行还剩多少宽度"掺进折行与对齐（egui 的 `Label` 在 wrap 布局里还会按首行缩进
@@ -265,4 +269,7 @@ docs/设计/UI架构细化方案.md
 ## 审核记录
 
 <!-- GATE:AUDIT -->
+- 2026-10-05_09:59:34 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | approved | -
+- 2026-10-05_09:59:43 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | -
+- 2026-10-05_10:00:01 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | approved | -
 <!-- /GATE:AUDIT -->
