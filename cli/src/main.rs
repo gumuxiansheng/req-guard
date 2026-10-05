@@ -13,6 +13,7 @@ use req_guard_core::error::{GateError, Result};
 use req_guard_core::gate;
 use req_guard_core::idcheck;
 use req_guard_core::requirement;
+use req_guard_core::resolve;
 use req_guard_core::status;
 use req_guard_core::touch;
 use std::path::{Path, PathBuf};
@@ -98,15 +99,24 @@ fn run(a: &cli::Args) -> Result<()> {
             let id = a.id.as_deref().unwrap_or("");
             let step = a.step.as_deref().unwrap_or("");
             let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
-            let r = requirement::apply(root, id, step, &reviewer, comment_of(a))?;
+            let out = requirement::apply(root, id, step, &reviewer, comment_of(a))?;
             // 明示"草稿已消费"：草稿文件已删除，重复 apply 会报未找到草稿。
             println!(
                 "✅ 已应用草稿并重新批准：{} / {}（{}，审核人 {}）\n   该段已绑定新摘要，草稿已消费。",
-                r.id,
+                out.req.id,
                 step,
                 requirement::step_label(step),
                 reviewer
             );
+            // 位置配对模型下多出的行落在**段尾**（不是段中间）—— 不说清楚，人会在
+            // 下一次修订时误以为那段文字在段中间（REQ-010 AC-006）。
+            if out.appended_lines > 0 {
+                println!(
+                    "   注意：草稿比原段散文多 {} 行，这些行已追加到该段**末尾**（草稿通道按行位置覆盖，\
+                     无法在段中间插入）。",
+                    out.appended_lines
+                );
+            }
         }
         Action::Amend => {
             let id = a.id.as_deref().unwrap_or("");
@@ -359,8 +369,27 @@ fn run(a: &cli::Args) -> Result<()> {
             }
         }
         Action::Check => {
-            // 裁决来自拦截脚本（唯一判定逻辑），这里只做渲染与退出码。
-            let verdict = gate::gate_check(root)?;
+            // 裁决来自 core 的 resolve（唯一判定逻辑），这里只做取参、渲染与退出码。
+            //
+            // 变更集来源三选一（互斥校验在 `cli::validate`）：不给即全局判定。
+            // `--stdin` 必须显式给出 —— CI 里 stdin 常被重定向，隐式读会挂死。
+            let source = if a.stdin {
+                resolve::PathSource::Stdin
+            } else if let Some(b) = a.base.as_deref() {
+                resolve::PathSource::Range(b.to_string())
+            } else if a.staged {
+                resolve::PathSource::Staged
+            } else {
+                resolve::PathSource::None
+            };
+            // hint 优先级：`--req` > `HOOK_REQ`（分支名消歧随 P3 的 multi.bind_branch 落地）
+            let hint = a
+                .req
+                .clone()
+                .or_else(|| std::env::var("HOOK_REQ").ok())
+                .filter(|v| !v.trim().is_empty());
+            let ctx = resolve::Ctx { source, hint };
+            let verdict = gate::gate_check_with(root, &ctx)?;
             render::print_verdict(&verdict);
             if !verdict.is_pass() {
                 std::process::exit(1);
@@ -840,22 +869,27 @@ fn run_touch(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
     let id = match a.id.as_deref() {
         Some(i) => i.to_string(),
         None => {
-            // 缺省取"最新活跃需求"（与 HOOK_SH 第 2 段同规则）
-            let reqs = requirement::list(root)?;
-            let mut live: Vec<requirement::Requirement> = Vec::new();
-            for r in reqs {
-                let c = std::fs::read_to_string(&r.path).unwrap_or_default();
-                if requirement::head_status(&c) != "done" {
-                    live.push(r);
-                }
-            }
-            live.sort_by(|x, y| y.path.file_name().cmp(&x.path.file_name()));
-            match live.first() {
-                Some(r) => r.id.clone(),
-                None => {
+            // 缺省取「唯一那份」未归档清单。**多份时拒绝**（REQ-006 G1）：
+            // 原实现取"文件名逆序第一份"，于是 AI 在 REQ-001 上的改动会被追加到
+            // REQ-002 的声明块里 —— 声明与改动分属两份清单，两边都失效：
+            // REQ-001 的改动等于没声明，REQ-002 的声明被撑大到不属于它的范围。
+            let live = resolve::live_snapshot(root)?;
+            match live.len() {
+                1 => live[0].id.clone(),
+                0 => {
                     return Err(GateError::Validation(
                         "没有未归档的需求清单可追加声明；请先 req-guard create".into(),
                     ))
+                }
+                _ => {
+                    let ids: Vec<&str> = live.iter().map(|r| r.id.as_str()).collect();
+                    return Err(GateError::Validation(format!(
+                        "仓库内有 {} 份未归档需求（{}），无法判断该往哪一份追加声明。\n\
+                         请显式指定：req-guard touch --declare <需求ID> --glob \"<路径>\"\n\
+                         （不指定就往错的那份写，等于把声明与改动分到两份清单上——两边都失效）",
+                        live.len(),
+                        ids.join(", ")
+                    )));
                 }
             }
         }

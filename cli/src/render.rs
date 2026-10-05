@@ -91,10 +91,12 @@ pub fn print_comment_summary(r: &ReqStatus) {
 
 /// 渲染门禁裁决（`check` 命令）。
 ///
-/// 拦截原因原样透传到 stderr，保证与脚本输出一致（AI 与人都要看得见）。
+/// **拦截原因与放行明细一律走 stderr**（AI 与人都要看得见）：
+/// 放行时也要打明细，因为里面可能有内容冻结告警 —— 告警是门禁唯一的静默降级口，
+/// 丢了就等于「看起来有冻结、实际没有」。
 ///
-/// 放行时**仅**在命中绕过窗口才打印脚本明细：正常放行保持既有输出不变，
-/// 而"靠绕过放行"必须让审核人与 CI 日志看见，不能只剩一句"三段已批准"。
+/// 绕过标记走 **stdout**：脚本改为委托 `check` 之后，脚本的 stdout 仍须带它 ——
+/// 外部工具靠读脚本 stdout 判断「本次放行是不是靠绕过」的那条契约不能破。
 pub fn print_verdict(v: &req_guard_core::gate::GateVerdict) {
     match v {
         req_guard_core::gate::GateVerdict::Pass {
@@ -104,12 +106,14 @@ pub fn print_verdict(v: &req_guard_core::gate::GateVerdict) {
         } => {
             println!("{}", summary);
             if *bypassed {
-                for line in detail {
-                    eprintln!("{}", line);
-                }
+                println!("{}", req_guard_core::gate::BYPASS_MARKER);
+            }
+            for line in detail {
+                eprintln!("{}", line);
             }
         }
-        req_guard_core::gate::GateVerdict::Block { detail, .. } => {
+        req_guard_core::gate::GateVerdict::Block { summary, detail } => {
+            eprintln!("{}", summary);
             for line in detail {
                 eprintln!("{}", line);
             }

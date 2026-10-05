@@ -35,28 +35,19 @@ pub const DENY_SH_REL: &str = ".gates/hooks/req-guard-deny.sh";
 /// deny 包装脚本（Windows）相对路径。
 pub const DENY_PS1_REL: &str = ".gates/hooks/req-guard-deny.ps1";
 
-/// 拦截脚本命中应急绕过窗口时输出的**机器可读标记**（sh / ps1 两端都必须输出）。
+/// 命中应急绕过窗口时输出的**机器可读标记**。
 ///
 /// 判定"本次放行是不是靠绕过"不能去匹配人类可读文案——文案一改判定就失效，
 /// 而失效方向恰好是最坏的：绕过被伪装成"三段已批准"的正常放行。
-/// 脚本额外输出本行，`gate_check` 据此置 [`GateVerdict::Pass::bypassed`]。
-///
-/// [`HOOK_SH`] / [`HOOK_PS1`] 内该字符串是**字面量**（脚本是 raw string，无法插值），
-/// 由单测 `hook_脚本输出绕过标记` 锁定两端与本常量一致。
+/// `gate_check_with` 走 [`crate::resolve::Verdict::Bypassed`]（判定在 core），
+/// 并把本行放进 `detail`；CLI 另把它打到 stdout，使**脚本委托 `check` 之后**
+/// 脚本的 stdout 仍带这个标记（外部工具读脚本 stdout 的那条契约不破）。
 pub const BYPASS_MARKER: &str = "REQ_GUARD_BYPASS=1";
-
-/// `req-guard check` 代为判定内容冻结后设此变量，脚本据此**跳过**自己的第 3.5 段。
-///
-/// 为什么需要：内容冻结的判定（SHA-256）只能在 core 做，脚本要做就得把二进制
-/// 放进 PATH —— 而 `req-guard check` 本身就是那个二进制。让它反过来依赖自己
-/// 在 PATH 上，既绕（自证）又不稳（PATH 最小化时 `check` 恒拦）。
-/// 分工：**Rust 入口自查 + 告诉脚本"已查过"；pre-commit 直跑脚本时由脚本兜**。
-pub const SUM_CHECKED_ENV: &str = "REQ_GUARD_SUM_CHECKED";
 
 /// 当前平台注入工具配置时引用的拦截脚本**相对路径**（Windows→`.ps1`，其余→`.sh`）。
 ///
-/// 与 [`run_hook`] 同规则：按**编译目标平台**选，不按"哪个文件存在"（install 在任意平台
-/// 都会同时落盘 .sh/.ps1 作为跨平台资产）。`hook_json` 与测试断言共用此函数，
+/// 按**编译目标平台**选，不按"哪个文件存在"（install 在任意平台都会同时落盘
+/// .sh/.ps1 作为跨平台资产）。`hook_json` 与测试断言共用此函数，
 /// 避免平台差异在两个地方各写一遍而漂移。
 fn hook_script_rel(use_deny: bool) -> &'static str {
     match (cfg!(windows), use_deny) {
@@ -443,9 +434,10 @@ pub fn install(root: &Path, tools: &[String], verbose: bool) -> Result<Vec<PathB
     created.push(write_decl(
         root,
         ".gates/README.md",
-        REQ_GUARD_README,
+        &req_guard_readme(),
         &mut notes,
     )?);
+    ensure_readme_section(root, &mut notes)?;
     created.push(write_file(root, HOOK_SH_REL, HOOK_SH)?);
     created.push(write_file(root, HOOK_TOUCH_SH_REL, HOOK_TOUCH_SH)?);
     created.push(write_file(root, HOOK_PS1_REL, &ps1_with_bom())?);
@@ -656,174 +648,107 @@ impl GateVerdict {
     }
 }
 
-/// 执行拦截脚本，返回 `(是否放行, stdout, stderr)`。
+/// 全局门禁判定（**无变更集**）—— TUI / GUI 的状态面板与「本次改动合规吗」之外的
+/// 存量用法走这里。语义与改造前逐字一致：只判「能不能开工」，不判「这次改动归谁」。
 ///
-/// 脚本是唯一判定逻辑（见《技术方案.md》§1.2），本函数只负责调用与收集输出。
-fn run_hook(root: &Path) -> Result<(bool, String, String)> {
-    let sh = root.join(HOOK_SH_REL);
-    let ps1 = root.join(HOOK_PS1_REL);
-
-    // 解释器按**编译目标平台**决定，而非按"哪个脚本文件存在"：`install` 在任意平台都会
-    // 同时落盘 .sh/.ps1（跨平台资产）。若按"ps1 存在即调 powershell"，Linux/macOS 上
-    // `req-guard check` 会误调不存在的 powershell 而恒败——这是"脚本崩了 / 真在拦"
-    // 之外的第三种危险失效（命令错配）。故本机一律只执行本平台解释器对应的脚本。
-    let is_windows = cfg!(windows);
-    let (prog, script): (&str, std::path::PathBuf) = if is_windows {
-        ("powershell", ps1.clone())
-    } else {
-        ("sh", sh.clone())
-    };
-
-    // 仅 Windows 关注 ps1 的 UTF-8 BOM（缺失会让 PowerShell 解析失败 → 恒拦截）；
-    // 类 Unix 平台上该文件仅为跨平台占位，不参与本机执行。
-    if is_windows && ps1.exists() && !has_utf8_bom(&ps1) {
-        eprintln!(
-            "⚠️ 拦截脚本 {} 缺少 UTF-8 BOM，Windows PowerShell 会解析失败（表现为恒拦截）。\
-             请重新执行 req-guard install 修复。",
-            ps1.display()
-        );
-    }
-
-    if !script.exists() {
-        return Err(GateError::Validation(format!(
-            "未安装 AI 需求门禁（缺少 {}），请先执行 req-guard install",
-            if is_windows {
-                HOOK_PS1_REL
-            } else {
-                HOOK_SH_REL
-            }
-        )));
-    }
-
-    let args: Vec<String> = if is_windows {
-        vec![
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-File".to_string(),
-            script.to_string_lossy().to_string(),
-        ]
-    } else {
-        vec![script.to_string_lossy().to_string()]
-    };
-
-    let out = Command::new(prog)
-        .args(&args)
-        .current_dir(root)
-        .output()
-        .map_err(|e| GateError::External {
-            command: format!("{} {}", prog, args.join(" ")),
-            status: None,
-            stderr: e.to_string(),
-        })?;
-
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    ))
-}
-
-/// 执行门禁检查，返回**结构化裁决**（CLI / TUI / GUI / CI 共用）。
-///
-/// 放行时同样保留脚本明细：绕过窗口内脚本会输出 [`BYPASS_MARKER`]，据此置
-/// [`GateVerdict::bypassed`] 并把 summary 改成显式警告——绝不能让"靠绕过放行"
-/// 显示成"三段已批准"。
-/// 内容冻结校验的明细行（每条清单一组）。
-fn sum_check_detail(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    for r in match crate::requirement::list(root) {
-        Ok(v) => v,
-        Err(_) => return out,
-    } {
-        let content = std::fs::read_to_string(&r.path).unwrap_or_default();
-        if crate::requirement::head_status(&content) == "done" {
-            continue; // 已归档是生命周期终点
-        }
-        for i in crate::requirement::verify_sums(&content) {
-            let mark = if i.severity.is_error() {
-                "[错误]"
-            } else {
-                "[警告]"
-            };
-            out.push(format!(
-                "{mark} [{}] {} {}",
-                i.kind.as_str(),
-                r.id,
-                i.message.lines().next().unwrap_or("")
-            ));
-        }
-    }
-    out
-}
-
+/// 多需求仓库下它会命中 [`crate::resolve::BlockKind::Ambiguous`]（无变更集就无从归因，
+/// 这是诚实答案而不是缺陷）。界面上要把「正在做的那份需求」纳入判定，应改用
+/// [`gate_check_with`] 并把该 id 作为 hint —— 属 P4 的 UI 接线。
 pub fn gate_check(root: &Path) -> Result<GateVerdict> {
-    // 内容冻结先自查（core 判定，不经脚本、不依赖 PATH），并把结论并入 detail。
-    // 放在脚本之前：这段判定与"三段是否批准"正交，脚本失败时它依然有效。
-    let sum_detail = sum_check_detail(root);
-    let (ok, stdout, stderr) = {
-        std::env::set_var(SUM_CHECKED_ENV, "1");
-        let r = run_hook(root);
-        std::env::remove_var(SUM_CHECKED_ENV);
-        r
-    }?;
-    if !ok && sum_detail.iter().any(|d| d.contains("[错误]")) {
-        // 脚本已拦；把内容冻结的结论也带出去，避免"两处问题只看到一处"
-        let raw = format!("{}\n{}", stdout, stderr);
-        return Ok(GateVerdict::Block {
-            summary: format!(
-                "⛔ 拦截：{}（共 {} 项）",
-                sum_detail[0].lines().next().unwrap_or("内容冻结校验未通过"),
-                sum_detail.iter().filter(|d| d.contains("[错误]")).count()
-            ),
-            detail: {
-                let mut v: Vec<String> = raw
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty() && !l.contains(BYPASS_MARKER))
-                    .collect();
-                v.extend(sum_detail);
-                v
-            },
-        });
-    }
-    let raw = format!("{}\n{}", stdout, stderr);
-    let bypassed = ok && raw.contains(BYPASS_MARKER);
-    let detail: Vec<String> = raw
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        // 标记行是给程序看的，混进界面明细只是噪音。
-        .filter(|l| !l.contains(BYPASS_MARKER))
-        .collect();
+    gate_check_with(
+        root,
+        &crate::resolve::Ctx {
+            source: crate::resolve::PathSource::None,
+            hint: None,
+        },
+    )
+}
 
-    if ok {
-        let mut detail = detail;
-        detail.extend(sum_detail);
-        if !bypassed && detail.iter().any(|d| d.contains("[错误]")) {
-            return Ok(GateVerdict::Block {
-                summary: "⛔ 拦截：已批准段的正文与批准时不一致".to_string(),
+/// 带变更集上下文的门禁判定，返回**结构化裁决**（CLI / TUI / GUI / CI 共用）。
+///
+/// 判定来自 [`crate::resolve`]（唯一真相在 core）：本函数**不再执行拦截脚本**
+/// —— 脚本已改为委托给 `req-guard check`，若这里再反过来执行脚本就是无限递归。
+/// 内容冻结（REQ-002）随之由 resolve 的 R15 独家承担，且覆盖面从「被选中的那一份」
+/// 扩大到全部非 `done` 清单（见 [`crate::resolve`] 的 G7）。
+pub fn gate_check_with(root: &Path, ctx: &crate::resolve::Ctx) -> Result<GateVerdict> {
+    Ok(verdict_to_gate(crate::resolve::resolve(root, ctx)?))
+}
+
+/// [`crate::resolve::Verdict`] → [`GateVerdict`]（形状不变，只换内容来源）。
+///
+/// 保留两个形状是刻意的：三个前端（cli / tui / gui）都只认 `Pass` / `Block` 与
+/// `bypassed`，换形状要动全部渲染层，而本次改动的实质只是「detail 从哪来」。
+fn verdict_to_gate(v: crate::resolve::Verdict) -> GateVerdict {
+    match v {
+        crate::resolve::Verdict::Pass { reqs, note } => {
+            let mut detail: Vec<String> = Vec::new();
+            if !reqs.is_empty() {
+                detail.push(format!("被裁决的需求：{}", reqs.join(" ")));
+            }
+            if let Some(n) = &note {
+                detail.extend(
+                    n.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty()),
+                );
+            }
+            let summary = if reqs.is_empty() {
+                "✅ 门禁放行：本次改动不涉及任何受管路径".to_string()
+            } else {
+                format!(
+                    "✅ 门禁放行：{} 三段已批准且无未解决的阻塞性评论",
+                    reqs.join(" / ")
+                )
+            };
+            GateVerdict::Pass {
+                summary,
                 detail,
-            });
+                bypassed: false,
+            }
         }
-        let summary = if bypassed {
-            "⚠️ 门禁放行：命中应急绕过窗口（三段并非全部批准，已记审计日志）".to_string()
-        } else {
-            "✅ 门禁放行：三段已批准且无未解决的阻塞性评论".to_string()
-        };
-        Ok(GateVerdict::Pass {
-            summary,
-            detail,
-            bypassed,
-        })
-    } else {
-        Ok(GateVerdict::Block {
-            summary: detail
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "⛔ 门禁拦截".to_string()),
-            detail,
-        })
+        crate::resolve::Verdict::Bypassed {
+            reqs,
+            expires_epoch,
+        } => GateVerdict::Pass {
+            // 绝不能让「靠绕过放行」显示成「三段已批准」—— 放行原因不同，
+            // 事后审计与责任归属完全不同。
+            summary: "⚠️ 门禁放行：命中应急绕过窗口（三段并非全部批准，已记审计日志）".to_string(),
+            detail: vec![
+                format!("涉及需求：{}", reqs.join(" ")),
+                format!("绕过窗口过期时刻：{expires_epoch}"),
+                "本次放行靠绕过，已记审计日志".to_string(),
+            ],
+            bypassed: true,
+        },
+        crate::resolve::Verdict::Block {
+            kind,
+            reqs,
+            message,
+        } => {
+            let summary = message
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("⛔ 门禁拦截")
+                .to_string();
+            let mut detail: Vec<String> = Vec::new();
+            if !reqs.is_empty() {
+                detail.push(format!("涉及需求：{}", reqs.join(" ")));
+            }
+            detail.extend(
+                message
+                    .lines()
+                    .map(|l| l.trim_end().to_string())
+                    .filter(|l| !l.is_empty()),
+            );
+            if detail.first().map(|s| s.as_str()) == Some(summary.as_str()) {
+                detail.remove(0);
+            }
+            GateVerdict::Block {
+                summary: format!("{} [{}]", summary, kind.as_str()),
+                detail,
+            }
+        }
     }
 }
 
@@ -1027,6 +952,49 @@ pub fn audit_tail(root: &Path, n: usize) -> Result<Vec<String>> {
     Ok(lines[start..].to_vec())
 }
 
+/// 审计日志一行的性质（**判定在 core，两个界面只负责上色**）。
+///
+/// 为什么需要分类而不是各界面自己 `starts_with`：REQ-006 起日志前缀多了
+/// `BLOCK-AMBIGUOUS` / `BLOCK-SUM` / `BLOCK-SELECTION` / `NOTE` 等若干种，
+/// 若两个界面各自猜前缀，改一种就得改两处，而漏改的那处会把拦截显示成放行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKind {
+    /// 放行（含多候选与「无受管路径」）。
+    Pass,
+    /// 拦截（任何 `BLOCK*`）。
+    Block,
+    /// 应急绕过放行 —— 必须与正常放行区分显示（责任归属不同）。
+    Bypass,
+    /// 放行附带的说明（内容冻结告警等）。
+    Note,
+    /// 其余（`APPROVE` / `AMEND` / `TOUCH.EXTEND` 等既有事件）。
+    Event,
+}
+
+/// 判定一行审计日志的性质。
+///
+/// 只看第一个空白后的**首 token**：`BLOCK-AMBIGUOUS` / `BLOCK-SUM` 都以
+/// `BLOCK` 开头，故按 `starts_with("BLOCK")` 判；`PASS` / `BYPASS-HIT` / `NOTE` 同理。
+pub fn audit_kind(line: &str) -> AuditKind {
+    // 行首是时间戳（`2026-10-04 20:22:18 PASS REQ-001`），事件 token 是**第一个以大写
+    // 字母开头**的空白分隔词 —— 日期与时间都不以字母开头，故这样取无需数位置。
+    let head = line
+        .split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_uppercase()))
+        .unwrap_or_default();
+    if head.starts_with("BLOCK") {
+        AuditKind::Block
+    } else if head.starts_with("PASS") {
+        AuditKind::Pass
+    } else if head.starts_with("BYPASS") {
+        AuditKind::Bypass
+    } else if head.starts_with("NOTE") {
+        AuditKind::Note
+    } else {
+        AuditKind::Event
+    }
+}
+
 /// 生成有时效的应急绕过令牌（写入 `.gates/.bypass`，并记审计）。
 pub fn bypass(root: &Path, reason: &str, actor: &str, ttl_minutes: u64) -> Result<PathBuf> {
     // 审批锁（§4.4）：绕过同样是审批类动作，AI 会话内禁止自助开启。
@@ -1175,6 +1143,7 @@ if [ ! -f .gates/hooks/req-guard-check.sh ]; then
   echo "  请先执行 req-guard install 初始化门禁；确需跳过本次：git commit --no-verify" >&2
   exit 1
 fi
+# 主门禁：判定在 core，脚本只取参（--staged 由脚本内部传入）
 sh .gates/hooks/req-guard-check.sh || exit 1
 # 变更范围契约：实际改动 ⊆ 技术方案段 GATE:TOUCH 声明的并集（判定在 core）
 if [ ! -f .gates/hooks/req-guard-touch-check.sh ]; then
@@ -1348,6 +1317,25 @@ pub fn touch_exempt_patterns(root: &Path) -> Vec<String> {
     out
 }
 
+/// 读取 `.gates/req-guard.yaml` 的 `multi.mode`（缺省 `resolve`）。
+///
+/// `all` 是**保守档**：候选恒为全部未归档清单。不会漏拦，但会把互锁制度化 ——
+/// 起草中的需求会阻断一切编码。仅在团队明确接受「都在开工前批完」时开启。
+pub fn multi_mode_all(root: &Path) -> bool {
+    match yaml_scalar(root, "multi", "mode") {
+        Some(v) => v.trim().eq_ignore_ascii_case("all"),
+        None => false,
+    }
+}
+
+/// 读取 `.gates/req-guard.yaml` 的 `multi.bind_branch`（缺省 false）。
+///
+/// 分支名消歧**默认关闭**：分支与需求并非恒等（一次改动常跨多份需求），
+/// 默认开会引入一类新的误判。开启后分支名也只作消歧用，**永不覆盖**反查结果。
+pub fn multi_bind_branch(root: &Path) -> bool {
+    yaml_bool(root, "multi", "bind_branch", false)
+}
+
 /// 范围扩张后是否自动打回技术方案要求重新过审（默认 true）。
 pub fn touch_reapprove(root: &Path) -> bool {
     yaml_bool(root, "touch", "reapprove", true)
@@ -1511,6 +1499,15 @@ fn verify_ci(root: &Path) -> Vec<String> {
 ///
 /// 未安装（配置不存在）的工具不要求——不制造噪音；未知新工具出现时，
 /// 由团队把它登记进 `TOOL_PROFILES` 后纳入校验白名单。
+/// 读已安装的主门禁脚本（不存在时返回 `None`，由调用方按"缺资产"报缺口）。
+fn read_hook(root: &Path, rel: &str) -> Option<String> {
+    let p = root.join(rel);
+    if !p.exists() {
+        return None;
+    }
+    fs::read_to_string(p).ok()
+}
+
 pub fn verify_install(root: &Path) -> Vec<String> {
     let mut problems = Vec::new();
 
@@ -1524,6 +1521,75 @@ pub fn verify_install(root: &Path) -> Vec<String> {
     ] {
         if !root.join(rel).exists() {
             problems.push(format!("缺少门禁资产 {}（执行 req-guard install）", rel));
+        }
+    }
+
+    // ── REQ-006 P2：委托接线缺口（"实现了但没接线"是门禁最坏的静默失效）──
+    // 主门禁脚本改为「只取参 + 委托 req-guard check」之后，下列任一不满足都意味着
+    // 裁决逻辑仍留在脚本里（= 判定有两处真相）或 CI 拿不到变更集（L3 静默失效）。
+    if let Some(sh) = read_hook(root, HOOK_SH_REL) {
+        for (needle, why) in [
+            (
+                "req-guard check --stdin",
+                "主门禁脚本未委托 core 判定（PreToolUse 侧）",
+            ),
+            (
+                "req-guard check --staged",
+                "主门禁脚本未委托 core 判定（pre-commit 侧）",
+            ),
+        ] {
+            if !sh.contains(needle) {
+                problems.push(format!("{HOOK_SH_REL} {why}（缺 `{needle}`）"));
+            }
+        }
+        for (needle, why) in [
+            (
+                "sort -r",
+                "脚本仍在用「文件名逆序第一个非 done」选活跃需求（REQ-006 缺陷本体）",
+            ),
+            (
+                "GATE:STEP",
+                "脚本仍在自己判三段审批状态（判定应只在 core 一处）",
+            ),
+            (
+                "verify-content",
+                "脚本仍在自查内容冻结（会与 core 重复校验）",
+            ),
+        ] {
+            if sh.contains(needle) {
+                problems.push(format!("{HOOK_SH_REL} {why}（仍含 `{needle}`）"));
+            }
+        }
+    }
+    // 注：`verify-content` 子命令本身必须保留（§3.5 删除后它是人自查冻结的唯一入口），
+    // 但 core 不认识 CLI 的命令表（core 不依赖 cli），故**不能**在 verify_install 里查 ——
+    // 写一个恒返回 true 的占位检查比不写更坏（看起来有这道墙，实际没有）。
+    // 它的真实守卫在两处：`scripts/verify_gate.py` 的场景 29/30（实跑子命令），
+    // 以及 CI 自举里对 `verify-content` 的断言。
+    if enforce_ci(root) {
+        if let Ok(ci) = fs::read_to_string(root.join(".gates/ci/req-guard-ci.yml")) {
+            if !ci.contains("check --base") {
+                problems.push(
+                    ".gates/ci/req-guard-ci.yml 的 check 步骤缺 `--base <ref>`：\
+                     多需求仓库下裸 check 无变更集可依，会恒拦（L3 静默失效）"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // ps1 缺 UTF-8 BOM → PowerShell 解析失败 → 表现为**恒拦截**，且报错极难定位。
+    // 这条告警原先挂在 `run_hook`（判定执行器）上，判定下沉 core 后随 `run_hook` 一并
+    // 退役，故搬到这里：`verify_install` 是「只读检出缺口」的唯一入口（CI 用 install --verify）。
+    if cfg!(windows) {
+        for rel in [HOOK_PS1_REL, DENY_PS1_REL] {
+            let p = root.join(rel);
+            if p.exists() && !has_utf8_bom(&p) {
+                problems.push(format!(
+                    "{rel} 缺少 UTF-8 BOM，Windows PowerShell 会解析失败（表现为恒拦截）；\
+                     请重新执行 req-guard install 修复"
+                ));
+            }
         }
     }
 
@@ -1853,7 +1919,9 @@ strict_order: true
 enforce:
   ai_tool_hook: true   # AI 工具 PreToolUse，拦截 Write/Edit —— 最硬的一层
   pre_commit: true     # git pre-commit 兜底
-  ci: true             # CI 侧拦截：流水线须调用 req-guard check，并设为必需（required）状态检查
+  ci: true             # CI 侧拦截：流水线须调用 `req-guard check --base <ref>` 并设为必需（required）
+                       # 状态检查。--base 不可省：裁决对象是「本次变更集」，多需求仓库下
+                       # 裸 check 无变更集可依会恒拦（见 docs/设计/多需求并行门禁裁决技术方案.md）
 
 # 被拦截的 AI 写操作（matcher 语法随工具而异）
 blocked_tools:
@@ -1880,6 +1948,18 @@ bypass:
   enabled: true
   default_ttl_minutes: 60
   require_reason: true
+
+# 多需求并行裁决（docs/设计/多需求并行门禁裁决技术方案.md §4.7 / REQ-006）
+multi:
+  # resolve（默认）= 裁决对象是**本次变更集**：按各清单技术方案段的 GATE:TOUCH 声明
+  #   反查归属，只判相关的那几份；反查不出且仓库有多份未归档清单时报错并给出路。
+  # all            = 保守档：候选恒为全部未归档清单。不会漏拦，但起草中的需求会
+  #   阻断一切编码（= 把互锁制度化），按团队节奏取舍。
+  mode: resolve
+  # 分支名消歧：分支名含 REQ-<id> 时作为 hint。**只消歧、永不覆盖**（与 --req 同规矩），
+  #   且仅在"没有任何已批清单声明本次改动"时才生效。
+  #   默认关闭 —— 一次改动常跨多份需求，分支与需求并非恒等，默认开会引入新的误判。
+  bind_branch: false
 
 # 变更范围契约（GATE:TOUCH）
 #   技术方案段的 GATE:TOUCH 块是**唯一**人工声明源；frontmatter 的 source_refs
@@ -1908,8 +1988,70 @@ archive:
   after_days: 30
 "#;
 
+/// `.gates/README.md` 里的「草稿叠加区与 apply」小节。
+///
+/// 单独立常量的理由：README 全文只对**新建**仓库生效（[`write_decl`] 存在即保留），
+/// 而草稿契约是 `apply` 的**行为契约**——存量仓库升级后也必须能查到。
+/// 常量化才能让「生成」与「补写」共用同一份文本，不至于各写一份然后漂移。
+pub const README_DRAFT_SECTION: &str = r#"## 草稿叠加区与 `apply`（修订已批准的段）
+
+改一段**已批准**的清单时，走草稿通道：`amend` 打回待审 → AI 把拟改正文写进
+`.gates/drafts/<需求ID>.draft.md` → 审核人用**一条命令**完成「应用 + 重新批准 + 绑定新摘要」。
+
+```bash
+req-guard token issue --req REQ-001 --step solution     # L3 票据，一次一动作
+req-guard amend  REQ-001 --step solution --token <票据> --comment "要改什么、为什么"
+# AI 写草稿：{step=solution}\n<该段拟替换的正文>
+req-guard apply  REQ-001 --step solution --token <票据> --comment "改完了"
+```
+
+草稿通道有三条硬约束（`apply` 会逐条校验，违反即拒且**不落盘**）：
+
+1. **草稿只写散文** —— `GATE:TOUCH` / `GATE:AC` / `GATE:AUDIT` 等块由 `req-guard` 维护，
+   草稿里的块标记不生效、还会把位置错位。块内条目（如验收标准）请**直接编辑清单**。
+2. **一次只应用一段** —— 草稿含多段会被 `apply` 拒绝；此前会被"应用一段后删掉整份草稿"
+   静默吃掉其余段。请把草稿裁剪成只留目标段，逐段应用。
+3. **草稿必须整段重写** —— 通道按行位置覆盖：草稿短于原段时原段尾部散文会被丢弃
+   （`apply` 已改为直接拒绝）；草稿长出的行落在该段**末尾**，无法在段中间插入。
+   `apply` 成功时会报出多出几行。
+
+> 校验期间草稿若被改动（编辑器保存、另一个进程），`apply` 会在写盘前发现并拒绝 ——
+> 落盘的一定是**你看到的那份**草稿。
+
+"#;
+
+/// 补写 README 里缺失的小节（返回是否改动了文件）。
+///
+/// 追加而非覆盖：`write_decl` 保留用户的调整，所以升级只能**加**不能**改**。
+/// 已有该小节则原样返回（幂等）。
+fn ensure_readme_section(root: &Path, notes: &mut Vec<String>) -> Result<bool> {
+    let full = root.join(".gates/README.md");
+    if !full.exists() {
+        return Ok(false); // 全新仓库：随生成写入全文即可
+    }
+    let cur = fs::read_to_string(&full).map_err(|e| GateError::Io {
+        path: Some(full.clone()),
+        source: e,
+    })?;
+    if cur.contains(README_DRAFT_SECTION) {
+        return Ok(false);
+    }
+    let mut out = cur.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(README_DRAFT_SECTION);
+    fs::write(&full, out).map_err(|e| GateError::Io {
+        path: Some(full.clone()),
+        source: e,
+    })?;
+    notes.push(
+        ".gates/README.md：已补写「草稿叠加区与 apply」小节（apply 行为契约，升级必查）"
+            .to_string(),
+    );
+    Ok(true)
+}
+
 /// `.gates/README.md`：门禁使用说明（随项目生成，便于新成员自助）。
-pub const REQ_GUARD_README: &str = r#"# AI 需求门禁（req-guard）
+pub const REQ_GUARD_README_BODY: &str = r#"# AI 需求门禁（req-guard）
 
 > **规则**：AI 在本项目实现新需求前，必须先按步骤完成
 > **需求分解 → 技术方案 → 测试计划** 三段清单，且每段由审核人显式批准，
@@ -2026,6 +2168,16 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 - 两者互补；req-guard 生成时把 AI 门禁**追加**在 gates-toolkit 的 pre-commit 之后，不覆盖。
 "#;
 
+/// 生成的 README 全文 = 主体 + 草稿契约小节。
+///
+/// 为什么是函数而不是 `const`：`concat!` 只接受字面量，喂不进
+/// [`README_DRAFT_SECTION`]；而若把契约小节抄进正文第二遍，就等于亲手造出两份
+/// 会漂移的契约（README 里那份永远不会被存量仓库看到——见 [`write_decl`]）。
+/// 一次性拼接换来"契约只有一份"这条不变量，值这个 `String`。
+pub fn req_guard_readme() -> String {
+    format!("{}\n{}", REQ_GUARD_README_BODY, README_DRAFT_SECTION)
+}
+
 /// POSIX 拦截脚本（AI 工具 hook 与 pre-commit 共用，唯一判定逻辑）。
 pub const HOOK_SH: &str = r#"#!/usr/bin/env sh
 # req-guard — AI 需求门禁硬拦截脚本（POSIX）
@@ -2038,7 +2190,6 @@ set -u
 
 REQ_DIR=".gates/requirements"
 AUDIT_LOG=".gates/audit/gate-audit.log"
-BYPASS_FILE=".gates/.bypass"
 
 log() {
   mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
@@ -2075,104 +2226,30 @@ if [ ! -t 0 ]; then
   fi
 fi
 
-# ---------- 1) 应急绕过窗口（有痕、有时效） ----------
-if [ -f "$BYPASS_FILE" ]; then
-  EXP=$(sed -n 's/.*expires_epoch=\([0-9]*\).*/\1/p' "$BYPASS_FILE" 2>/dev/null | head -1)
-  case "$EXP" in ''|*[!0-9]*) EXP="";; esac
-  NOW=$(date '+%s' 2>/dev/null || echo 0)
-  case "$NOW" in ''|*[!0-9]*) NOW=0;; esac
-  if [ -n "$EXP" ] && [ "$NOW" -lt "$EXP" ]; then
-    log "BYPASS-HIT expires_epoch=$EXP"
-    echo "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）" >&2
-    # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
-    echo "REQ_GUARD_BYPASS=1"
-    exit 0
-  fi
-fi
-
-# ---------- 2) 定位当前活跃需求（跳过已归档 done 的） ----------
-ACTIVE=""
-if [ -d "$REQ_DIR" ]; then
-  for F in $(ls "$REQ_DIR" 2>/dev/null | grep '\.md$' | grep -v '\.comments\.md$' | sort -r); do
-    ST=$(sed -n 's/.*GATE:HEAD .*status=\([a-z_]*\).*/\1/p' "$REQ_DIR/$F" 2>/dev/null | head -1)
-    if [ "$ST" != "done" ]; then
-      ACTIVE="$F"
-      break
-    fi
-  done
-fi
-
-if [ -z "$ACTIVE" ]; then
-  log "BLOCK no-requirement"
-  echo "[req-guard] ⛔ 拦截：未找到待开发的需求清单。" >&2
-  echo "          AI 在编写代码前，必须先创建并走完三段清单审核：" >&2
-  echo "            req-guard create -t \"<需求标题>\"" >&2
+# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+#
+# 为什么第 1 段之后的一切都被删掉了：三段检查、阻塞评论、评论摘要、内容冻结，
+# 现在全部由 `req-guard check` 判定（core/src/resolve.rs）。本脚本**不含任何裁决分支** ——
+# ① 判定散落到第二处的那一刻起，它就与 core 版本漂移，而门禁最坏的失效不是"报错"
+# 而是"看着在拦、其实没拦"；② 任何加进本脚本的判定都必须在 HOOK_PS1 里逐行镜像一遍，
+# 那是纯负债（本次改造就是为了消掉这份镜像）。
+#
+# 三个上下文各取一种变更集，**不得混用**（两个变更集混判必然产生无法解释的裁决）：
+#   有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON，不在 sh 里 sed 抠
+#   无 payload（pre-commit / 人工）→ --staged：已暂存文件集
+if ! command -v req-guard >/dev/null 2>&1; then
+  log "BLOCK no-binary"
+  echo "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。" >&2
+  echo "          判定在 core，缺二进制即无从判定 —— fail-closed，不猜。" >&2
+  echo "          请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。" >&2
+  echo "          确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。" >&2
   exit 1
 fi
-
-# ---------- 3) 三段步骤必须全部 approved ----------
-FAILED=""
-for STEP in decomposition solution testplan; do
-  LINE=$(grep 'GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null | grep "name=$STEP " | head -1)
-  ST=$(printf '%s' "$LINE" | sed -n 's/.*status=\([a-z_]*\).*/\1/p')
-  if [ "$ST" != "approved" ]; then
-    FAILED="$FAILED\n    - $STEP 未通过审核（当前: ${ST:-pending}）"
-  fi
-done
-
-if [ -n "$FAILED" ]; then
-  log "BLOCK $ACTIVE"
-  printf "[req-guard] ⛔ 拦截：需求 %s 尚未通过审核，AI 不得编写/修改源码。\n" "$ACTIVE" >&2
-  printf "          未完成步骤：%b\n" "$FAILED" >&2
-  echo "          请补齐清单后由审核人执行：" >&2
-  echo "            req-guard approve <需求ID> --step <步骤> --reviewer <姓名>" >&2
-  echo "          步骤顺序：decomposition(需求分解) → solution(技术方案) → testplan(测试计划)" >&2
-  exit 1
+if [ -n "${STDIN_DATA:-}" ]; then
+  printf '%s' "$STDIN_DATA" | req-guard check --stdin || exit 1
+else
+  req-guard check --staged || exit 1
 fi
-
-# ---------- 3.5) 已批准段的内容冻结（有 sum= 才需要；缺二进制即 fail-closed） ----------
-# 只在**确实存在绑定摘要**时才调用二进制：存量清单没有 sum=，若无条件调用，
-# 未装二进制的仓库会从"能提交"变成"不能提交"——那是新功能制造的 outage。
-# 一旦有 sum= 却没有 req-guard，就无从校验"批准后正文是否被改"，必须拦。
-if [ -z "${REQ_GUARD_SUM_CHECKED:-}" ] \
-   && grep -q '^<!-- GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null \
-   && grep -q 'sum=[0-9a-f]' "$REQ_DIR/$ACTIVE" 2>/dev/null; then
-  if ! command -v req-guard >/dev/null 2>&1; then
-    log "BLOCK-SUM no-binary"
-    echo "[req-guard] ⛔ 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。" >&2
-    echo "          把 req-guard 加入 PATH 后重试；确需跳过本次：git commit --no-verify" >&2
-    exit 1
-  fi
-  SUM_OUT=$(req-guard verify-content "$ACTIVE" 2>&1) || {
-    log "BLOCK-SUM $ACTIVE"
-    printf '%s\n' "$SUM_OUT" >&2
-    exit 1
-  }
-  printf '%s\n' "$SUM_OUT" >&2
-fi
-
-# ---------- 4) 阻塞性评论必须全部 resolved ----------
-COMMENTS="$REQ_DIR/${ACTIVE%.md}.comments.md"
-if [ -f "$COMMENTS" ] && grep -q 'blocking=true' "$COMMENTS" 2>/dev/null; then
-  OPEN=$(grep 'GATE:COMMENT' "$COMMENTS" 2>/dev/null | grep 'blocking=true' | grep 'state=open')
-  if [ -n "$OPEN" ]; then
-    log "BLOCK-COMMENT $ACTIVE"
-    echo "[req-guard] ⛔ 拦截：存在未解决的阻塞性评论，需审核人 resolve 后才可编码" >&2
-    exit 1
-  fi
-fi
-
-# ---------- 5) 评论摘要（每次都提示，保证 AI 必然看到） ----------
-if [ -f "$COMMENTS" ]; then
-  N=$(grep 'GATE:COMMENT' "$COMMENTS" 2>/dev/null | grep -c 'state=open')
-  case "$N" in ''|*[!0-9]*) N=0;; esac
-  if [ "$N" -gt 0 ]; then
-    echo "[req-guard] 提示：有 ${N} 条 open 评论，执行 req-guard comments ${ACTIVE} 查看" >&2
-  fi
-fi
-
-log "PASS $ACTIVE"
-exit 0
 "#;
 
 /// Windows 拦截脚本（PowerShell，逻辑与 [`HOOK_SH`] 等价）。
@@ -2182,7 +2259,6 @@ $ErrorActionPreference = 'Continue'
 
 $REQ_DIR = ".gates/requirements"
 $AUDIT_LOG = ".gates/audit/gate-audit.log"
-$BYPASS_FILE = ".gates/.bypass"
 
 function Write-GateAudit([string]$msg) {
   $dir = Split-Path -Parent $AUDIT_LOG
@@ -2215,99 +2291,23 @@ if ($stdinData.Trim()) {
   }
 }
 
-# ---------- 1) 应急绕过窗口 ----------
-if (Test-Path $BYPASS_FILE) {
-  $txt = [string](Get-Content $BYPASS_FILE -Raw -ErrorAction SilentlyContinue)
-  $m = [regex]::Match($txt, 'expires_epoch=(\d+)')
-  if ($m.Success) {
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($now -lt [int64]$m.Groups[1].Value) {
-      Write-GateAudit "BYPASS-HIT expires_epoch=$($m.Groups[1].Value)"
-      Write-Output "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）"
-      # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
-      Write-Output "REQ_GUARD_BYPASS=1"
-      exit 0
-    }
-  }
-}
-
-# ---------- 2) 定位当前活跃需求 ----------
-$active = $null
-if (Test-Path $REQ_DIR) {
-  $files = Get-ChildItem -Path $REQ_DIR -Filter *.md -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notlike '*.comments.md' } |
-    Sort-Object Name -Descending
-  foreach ($f in $files) {
-    $head = Get-Content $f.FullName -TotalCount 20 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'GATE:HEAD' } | Select-Object -First 1
-    $st = ''
-    if ($head -match 'status=([a-z_]+)') { $st = $Matches[1] }
-    if ($st -ne 'done') { $active = $f; break }
-  }
-}
-
-if ($null -eq $active) {
-  Write-GateAudit "BLOCK no-requirement"
-  Write-Error "[req-guard] 拦截：未找到待开发的需求清单。请先执行 req-guard create -t ""<需求标题>"""
-  exit 1
-}
-
-# ---------- 3) 三段步骤必须全部 approved ----------
-$failed = @()
-foreach ($step in @('decomposition', 'solution', 'testplan')) {
-  $l = Get-Content $active.FullName -ErrorAction SilentlyContinue | Where-Object { $_ -match 'GATE:STEP' -and $_ -match "name=$step " } | Select-Object -First 1
-  $st = ''
-  if ($l -match 'status=([a-z_]+)') { $st = $Matches[1] }
-  if ($st -ne 'approved') {
-    if (-not $st) { $st = 'pending' }
-    $failed += "$step 未通过审核（当前: $st）"
-  }
-}
-
-if ($failed.Count -gt 0) {
-  Write-GateAudit "BLOCK $($active.Name)"
-  Write-Error "[req-guard] 拦截：需求 $($active.Name) 尚未通过审核，AI 不得编写/修改源码。未完成步骤： $($failed -join '; ')"
-  exit 1
-}
-
-# ---------- 3.5) 已批准段的内容冻结（与 HOOK_SH 同一判定、同一 fail-closed 取向） ----------
-# 只在确实存在绑定摘要时才调二进制：存量清单没有 sum=，无条件调用会让
-# 未装二进制的仓库从"能提交"变成"不能提交"——那是新功能制造的 outage。
-if (-not $env:REQ_GUARD_SUM_CHECKED) {
-  $hasSum = Select-String -Path $active.FullName -Pattern 'sum=[0-9a-f]' -Quiet
-} else { $hasSum = $false }
-if ($hasSum) {
-  if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
-    Write-GateAudit "BLOCK-SUM no-binary"
-    Write-Error "[req-guard] 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。确需跳过本次：git commit --no-verify"
+# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+# 与 HOOK_SH 同构：本地 sh 是唯一真实部署面，本文件是它的逐行镜像（Windows 资产）。
+# 镜像负债之所以只剩这一处，正是因为第 1 段之后的一切裁决都已下沉到 core。
+if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
+    Write-GateAudit "BLOCK no-binary"
+    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。"
     exit 1
-  }
-  $sumOut = & req-guard verify-content $active.Name 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    Write-GateAudit "BLOCK-SUM $($active.Name)"
-    $sumOut | ForEach-Object { Write-Error $_ }
-    exit 1
-  }
-  $sumOut | ForEach-Object { Write-Error $_ }
 }
-
-# ---------- 4) 阻塞性评论必须全部 resolved ----------
-$commentsFile = Join-Path $REQ_DIR ($active.BaseName + ".comments.md")
-if (Test-Path $commentsFile) {
-  $blockingOpen = Get-Content $commentsFile -ErrorAction SilentlyContinue |
-    Where-Object { $_ -match 'GATE:COMMENT' -and $_ -match 'blocking=true' -and $_ -match 'state=open' }
-  if ($blockingOpen) {
-    Write-GateAudit "BLOCK-COMMENT $($active.Name)"
-    Write-Error "[req-guard] 拦截：存在未解决的阻塞性评论，需审核人 resolve 后才可编码"
-    exit 1
-  }
-  $openN = @(Get-Content $commentsFile -ErrorAction SilentlyContinue |
-    Where-Object { $_ -match 'GATE:COMMENT' -and $_ -match 'state=open' }).Count
-  if ($openN -gt 0) {
-    Write-Output "[req-guard] 提示：有 ${openN} 条 open 评论，执行 req-guard comments $($active.Name) 查看"
-  }
+if ($stdinData.Trim()) {
+    # 有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON
+    $stdinData | req-guard check --stdin | Out-Host
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+} else {
+    # 无 payload（pre-commit / 人工）→ --staged
+    req-guard check --staged | Out-Host
+    if ($LASTEXITCODE -ne 0) { exit 1 }
 }
-
-Write-GateAudit "PASS $($active.Name)"
 exit 0
 "#;
 
@@ -2345,6 +2345,54 @@ exit 0
 #[cfg(test)]
 mod tests {
     use crate::testutil::fill_sections;
+
+    /// 存量仓库升级：`write_decl` 保留用户改过的 README，所以草稿契约小节
+    /// 只能**补写**。不测这条，就会出现"新装仓库看得到契约、老仓库看不到"的分裂 ——
+    /// 而这正是 REQ-010 P1 要消除的那类静默缺口。
+    #[test]
+    fn 存量仓库install会补写草稿契约小节且保留用户前言() {
+        let root = temp_dir("readme-backfill");
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        let readme = root.join(".gates/README.md");
+        fs::write(&readme, "# 门禁\n\n我自己改过的前言。\n").unwrap();
+
+        let mut notes = Vec::new();
+        assert!(ensure_readme_section(&root, &mut notes).unwrap());
+        let after = fs::read_to_string(&readme).unwrap();
+        assert!(after.contains("我自己改过的前言。"), "补写不得覆盖用户内容");
+        assert!(after.contains(README_DRAFT_SECTION), "必须补上草稿契约小节");
+        assert!(
+            notes.iter().any(|n| n.contains("补写")),
+            "须提示用户 README 被改动：{notes:?}"
+        );
+
+        // 幂等：再装一次不得重复追加
+        let mut notes2 = Vec::new();
+        assert!(!ensure_readme_section(&root, &mut notes2).unwrap());
+        assert_eq!(
+            after,
+            fs::read_to_string(&readme).unwrap(),
+            "重复 install 不得叠加"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 新装仓库_readme一次到位且不需补写() {
+        let root = temp_dir("readme-fresh");
+        install(&root, &["none".to_string()], false).unwrap();
+        let readme = fs::read_to_string(root.join(".gates/README.md")).unwrap();
+        assert!(readme.contains(README_DRAFT_SECTION));
+        // 全文只出现一次（正文里不该再抄一份）
+        assert_eq!(
+            readme.matches(README_DRAFT_SECTION).count(),
+            1,
+            "契约小节在 README 里重复了"
+        );
+        let mut notes = Vec::new();
+        assert!(!ensure_readme_section(&root, &mut notes).unwrap());
+        cleanup(&root);
+    }
 
     /// `PRE_COMMIT_BLOCK`（新装时整块追加）与 `PRE_COMMIT_TOUCH_BLOCK`
     /// （给「已装旧版主门禁」的老仓库单独补的那段）**必须逐字一致**。
@@ -2576,15 +2624,25 @@ mod tests {
     }
 
     #[test]
-    fn 拦截脚本排除评论文件() {
+    fn 拦截脚本不再遍历需求目录_排除评论文件由core负责() {
+        // 改造前 sh/ps1 各自 `ls` 一遍需求目录并排除 `*.comments.md`；排除逻辑因此
+        // 在**三处**重复（sh / ps1 / `requirement::list`），任一处漂移就会把
+        // `REQ-999.comments.md` 当成一条 id 为空的幽灵需求（改造前的场景 9 锁的就是它）。
+        // 现在目录遍历只剩 core 一处，故断言方向反转：脚本**不得**再遍历。
         assert!(
-            HOOK_SH.contains(r"grep -v '\.comments\.md$'"),
-            "sh 脚本遍历需求目录时必须排除评论文件"
+            !HOOK_SH.contains("ls \"$REQ_DIR\"") && !HOOK_SH.contains(r"grep -v '\.comments\.md$'"),
+            "sh 脚本不得再遍历需求目录（排除评论文件的职责已归 core）"
         );
         assert!(
-            HOOK_PS1.contains("*.comments.md"),
-            "ps1 脚本遍历需求目录时必须排除评论文件"
+            !HOOK_PS1.contains("Get-ChildItem -Path $REQ_DIR"),
+            "ps1 脚本不得再遍历需求目录"
         );
+        assert!(
+            !HOOK_SH.contains("sort -r") && !HOOK_PS1.contains("Sort-Object Name -Descending"),
+            "「文件名逆序第一个即活跃需求」的选法必须已从两端消失（REQ-006 缺陷本体）"
+        );
+        // 排除规则本身仍在 core（`requirement::list` 过滤 COMMENTS_SUFFIX），
+        // 由 `requirement` 模块自带的用例覆盖；此处只锁"脚本不再自己遍历"。
     }
 
     #[test]
@@ -3054,28 +3112,81 @@ mod tests {
     }
 
     #[test]
-    fn gate_check_未安装脚本时报错() {
+    fn gate_check_未安装脚本也能判定() {
+        // 改造前 `check` 经 sh 执行，故缺脚本即 `Err("未安装")`；判定下沉 core 后
+        // **不再依赖脚本是否落盘** —— 这是「服务端墙不该依赖某台机器装没装 hook」。
+        // 本用例锁语义而非实现：缺脚本时仍须给出裁决（此夹具无需求 → 拦截）。
         let root = temp_dir("gate-uninstalled");
-        let e = gate_check(&root).unwrap_err();
-        assert!(e.to_string().contains("未安装"), "应提示先 install：{}", e);
+        assert!(!root.join(HOOK_SH_REL).exists(), "前置条件：未安装");
+        let v = gate_check(&root).unwrap();
+        assert!(!v.is_pass(), "无需求应拦截：{}", v.summary());
+        assert!(
+            v.summary().contains("未找到待开发的需求清单"),
+            "{}",
+            v.summary()
+        );
         cleanup(&root);
     }
 
     #[test]
-    fn gate_check_ps1占位存在时unix仍走sh() {
-        // 回归（run_hook 史缺陷）：曾按"ps1 文件存在即调 powershell"，而 install 在任意
-        // 平台都会同时落盘 .sh/.ps1（跨平台资产），导致 Linux/macOS 上 `req-guard check`
-        // 误调不存在的 powershell 而恒败。类 Unix 平台必须始终走 sh、忽略 ps1 占位。
+    fn gate_check_ps1占位存在时不改变裁决() {
+        // 回归（`run_hook` 史缺陷）：曾按"ps1 文件存在即调 powershell"，而 install 在
+        // 任意平台都会同时落盘 .sh/.ps1（跨平台资产），导致类 Unix 平台上裁决恒败。
+        // 判定下沉 core 后该失效形态不复存在，但**跨平台资产不得影响裁决**这条
+        // 不变式仍要锁住 —— ps1 占位的存在必须对 `check` 完全无感。
         let root = temp_dir("runhook-plat");
         install(&root, &["none".to_string()], false).unwrap();
         assert!(
             root.join(HOOK_PS1_REL).exists(),
             "install 总会生成 ps1 占位（跨平台资产）"
         );
-        // 无需求 → 经 run_hook 用 sh 正常执行并返回 Block（而非 powershell 报错）
         let v = gate_check(&root).unwrap();
-        assert!(!v.is_pass(), "缺需求应走 sh 拦截：{}", v.summary());
+        assert!(!v.is_pass(), "缺需求应拦截：{}", v.summary());
+        let bare = temp_dir("runhook-plat-bare");
+        assert_eq!(
+            v.summary(),
+            gate_check(&bare).unwrap().summary(),
+            "有无 ps1 占位不得改变裁决"
+        );
         cleanup(&root);
+        cleanup(&bare);
+    }
+
+    #[test]
+    fn audit_kind_按前缀分类() {
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 PASS REQ-001 REQ-003"),
+            AuditKind::Pass
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 PASS no-managed-path"),
+            AuditKind::Pass
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 BYPASS-HIT expires_epoch=1 REQ-001"),
+            AuditKind::Bypass
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 BLOCK-SUM REQ-006"),
+            AuditKind::Block
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 BLOCK-AMBIGUOUS candidates=REQ-001(approved)"),
+            AuditKind::Block
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 BLOCK REQ-002 steps=solution"),
+            AuditKind::Block
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 20:22:18 NOTE REQ-001 「需求分解」未启用内容冻结"),
+            AuditKind::Note
+        );
+        assert_eq!(
+            audit_kind("2026-10-04 21:18:31 APPROVE REQ-006 step=solution reviewer=x"),
+            AuditKind::Event
+        );
+        assert_eq!(audit_kind(""), AuditKind::Event);
     }
 
     #[test]
@@ -3108,19 +3219,48 @@ mod tests {
     }
 
     #[test]
-    fn hook_脚本输出绕过标记() {
-        // 脚本是 raw string，无法插值 BYPASS_MARKER，只能靠本用例锁定两端一致：
-        // 一旦有人改了文案却忘了脚本，绕过放行就会被谎报成"三段已批准"。
+    fn hook_绕过标记已下沉core_两端不再自带字面量() {
+        // 改造前：脚本第 1 段自带"读 .gates/.bypass + 比时间 + 打印标记"，故它是 raw
+        // string 无法插值 BYPASS_MARKER，只能靠本用例锁两端一致。改造后绕过判定下沉到
+        // `resolve`（R2），脚本不再读 .bates —— **两端都不该再有这个字面量**。
+        //
+        // 反向断言同样重要：若有人把绕过判定抄回脚本，就会出现"两处判定"，
+        // 而它们对"过期时刻差一秒"这类边界的处理必然漂移。
         assert!(
-            HOOK_SH.contains(BYPASS_MARKER),
-            "sh 脚本必须输出绕过标记 {}",
-            BYPASS_MARKER
+            !HOOK_SH.contains(BYPASS_MARKER),
+            "sh 脚本不得再自带绕过判定（它只取参与渲染）"
         );
         assert!(
-            HOOK_PS1.contains(BYPASS_MARKER),
-            "ps1 脚本必须输出绕过标记 {}",
-            BYPASS_MARKER
+            !HOOK_PS1.contains(BYPASS_MARKER),
+            "ps1 脚本不得再自带绕过判定"
         );
+        // 判据用 `expires_epoch=`（解析令牌的关键字段）而不是 `.gates/.bypass`：
+        // 后者仍会作为**给人看的出路文案**出现在拦截提示里，那是应该保留的。
+        assert!(
+            !HOOK_SH.contains("expires_epoch=") && !HOOK_PS1.contains("expires_epoch="),
+            "绕过令牌的解析必须只在 core 一处（脚本不得再读 expires_epoch）"
+        );
+    }
+
+    #[test]
+    fn hook_绕过经gate_check后仍标记bypassed() {
+        // 契约改由「core 判定 → GateVerdict → CLI 打 stdout」承担：
+        // 外部工具读脚本 stdout 判断"本次放行是不是靠绕过"那条线不能破。
+        let root = temp_dir("bypass-wire");
+        install(&root, &["none".to_string()], false).unwrap();
+        crate::testutil::disable_auth(&root);
+        let r = crate::requirement::create(&root, None, "绕过接线夹具").unwrap();
+        crate::testutil::fill_sections(&root, &r.id);
+        bypass(&root, "接线用例", "tester", 60).unwrap();
+        let v = gate_check(&root).unwrap();
+        assert!(v.is_pass() && v.bypassed(), "{}", v.summary());
+        assert!(v.summary().contains("绕过"), "{}", v.summary());
+        assert!(
+            !v.detail().iter().any(|l| l.contains(BYPASS_MARKER)),
+            "机器标记不进界面明细（CLI 单独打 stdout）：{:?}",
+            v.detail()
+        );
+        cleanup(&root);
     }
 
     #[test]
@@ -3280,9 +3420,13 @@ mod tests {
         install(&root, &["none".to_string()], false).unwrap();
         // 本用例验的是"绕过窗口放行并标记"，与鉴权无关：降为 L0 以免依赖人类凭据。
         crate::testutil::disable_auth(&root);
+        // 夹具要有一份**待审**清单：R1（无需求）先于绕过判定，
+        // 空仓库开绕过仍是拦截 —— 那正是「绕过不该凭空造出一个通过」。
+        let r = crate::requirement::create(&root, None, "绕过用例夹具").unwrap();
+        crate::testutil::fill_sections(&root, &r.id);
         assert!(
             !gate_check(&root).unwrap().is_pass(),
-            "前置条件：无需求时本应拦截，以确保放行确实由绕过窗口导致"
+            "前置条件：待审清单本应拦截，以确保放行确实由绕过窗口导致"
         );
 
         bypass(&root, "联调临时放行", "tester", 60).unwrap();

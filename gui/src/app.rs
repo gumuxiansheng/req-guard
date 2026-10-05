@@ -1255,8 +1255,25 @@ fn render_dialogs(ctx: &egui::Context, app: &mut App) {
                         if app.audit.is_empty() {
                             ui.label("（暂无审计记录）");
                         } else {
+                            // 按 core 判定的性质上色（分类只有一份，见 gate::audit_kind）。
+                            // 拦截与绕过必须一眼可辨：把 BLOCK 显示成 PASS 就是"看着在放行"。
                             for line in app.audit.iter().rev() {
-                                ui.monospace(line);
+                                let color = match req_guard_core::gate::audit_kind(line) {
+                                    req_guard_core::gate::AuditKind::Block => {
+                                        egui::Color32::from_rgb(200, 80, 80)
+                                    }
+                                    req_guard_core::gate::AuditKind::Bypass => {
+                                        egui::Color32::from_rgb(210, 170, 60)
+                                    }
+                                    req_guard_core::gate::AuditKind::Note => {
+                                        egui::Color32::from_rgb(130, 130, 130)
+                                    }
+                                    req_guard_core::gate::AuditKind::Pass => {
+                                        egui::Color32::from_rgb(90, 180, 110)
+                                    }
+                                    req_guard_core::gate::AuditKind::Event => egui::Color32::GRAY,
+                                };
+                                ui.monospace(egui::RichText::new(line).color(color));
                             }
                         }
                     });

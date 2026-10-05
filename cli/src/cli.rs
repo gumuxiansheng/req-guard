@@ -123,6 +123,15 @@ pub struct Args {
     pub dry_run: bool,
     /// `touch-check --base <ref>`：改用「相对该 ref 的差异」作变更集（L3 / CI 路径）。
     pub base: Option<String>,
+    /// `check --staged`：以已暂存文件集作变更集（pre-commit 路径）。
+    pub staged: bool,
+    /// `check --stdin`：从 stdin 的 AI 工具 payload 取 `file_path` 作变更集（PreToolUse 路径）。
+    pub stdin: bool,
+    /// `check --req <需求ID>`：显式指定「本次改动属于哪份需求」（消歧用）。
+    ///
+    /// 与 `id` 分开：位置参数 `check REQ-001` 会被拒（`check` 不接位置参数），
+    /// 否则「`id` 有值但被忽略」是个静默失效 —— 看起来指定了需求，其实没生效。
+    pub req: Option<String>,
     /// `touch --declare` 的路径 / glob（可重复；刻意不复用 `--tool`，那个是工具名）。
     pub globs: Vec<String>,
 }
@@ -180,6 +189,9 @@ fn default_args(action: Action) -> Args {
         archived: false,
         dry_run: false,
         base: None,
+        staged: false,
+        stdin: false,
+        req: None,
         globs: Vec::new(),
     }
 }
@@ -299,6 +311,9 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--all" => a.archived = true,
             "--dry-run" => a.dry_run = true,
             "--base" => a.base = Some(next(&mut it, "--base")?),
+            "--staged" => a.staged = true,
+            "--stdin" => a.stdin = true,
+            "--req" => a.req = Some(next(&mut it, "--req")?),
             "--glob" => a.globs.push(next(&mut it, "--glob")?),
             "--tool" => {
                 let v = next(&mut it, "--tool")?;
@@ -382,6 +397,27 @@ fn validate(a: &Args) -> std::result::Result<(), String> {
         Action::Ui if a.gui && a.tui => {
             return Err("--gui 与 --tui 不能同时使用（不指定则自动探测）".into());
         }
+        Action::Check => {
+            // 变更集来源三选一。两个来源混在一起判必然产生无法解释的裁决，
+            // 而裁决出错时人根本看不出是哪一条规则导致的 —— 直接拒，不猜。
+            let sources = [
+                a.staged.then_some("--staged"),
+                a.base.as_ref().map(|_| "--base"),
+                a.stdin.then_some("--stdin"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if sources.len() > 1 {
+                return Err(format!(
+                    "变更集来源互斥：{} 只能选一个（--staged / --base <ref> / --stdin）",
+                    sources.join(" 与 ")
+                ));
+            }
+            if a.id.is_some() {
+                return Err("check 不接受位置参数；指定需求请用 --req <需求ID>".into());
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -409,6 +445,10 @@ fn help() -> String {
                              --reviewer 可省略：缺省取 git 身份（user.name）\n\\
   apply    <需求ID> --step <步骤> --comment <意见>    一次完成修订：读 .gates/drafts/<需求ID>.draft.md\n\
                              写入正文 + 重新批准 + 绑定新摘要（AI 禁止执行）\n\
+                             草稿通道三条约束：① 草稿**只写散文**（GATE 块由 req-guard 维护，\n\
+                             块内条目请直接编辑清单或用 amend）；② **一次只应用一段**\n\
+                             （多段草稿会被拒绝）；③ 草稿**整段重写**（短于原段会被拒绝，\n\
+                             长出的行落在该段末尾，无法在段中间插入）\n\
   comment  <需求ID> --author <姓名> --text <意见> [--step <步骤>]\n\
                     [--quote <原文片段>] [--blocking] [--reply <评论ID>]\n\
   resolve  <需求ID> <评论ID> --author <姓名>    关闭评论（AI 禁止调用）\n\
@@ -422,10 +462,18 @@ fn help() -> String {
   ids      [--check]         列出需求编号（<id>\t<文件名>）；--check 防冲突三类检测\n\
                              （同 id 多文件 / 自动编号污染 / 前缀歧义；硬伤退出码 1，CI 可挂）\n\
   comments <需求ID> [--refresh-anchors]         查看评论 / 重算行号锚点\n\
-  check                      手动拦截判定（退出码 0 放行 / 1 拦截）\n\
+  check [--staged | --base <ref> | --stdin] [--req <需求ID>]\n\
+                             门禁裁决（退出码 0 放行 / 1 拦截）。裁决对象是**本次变更集**：\n\
+                             按各需求技术方案段的 GATE:TOUCH 声明反查归属，只判相关的那几份。\n\
+                             --staged 以已暂存文件集为变更集（pre-commit）；--base <ref> 用\n\
+                             相对该 ref 的差异（CI / L3）；--stdin 从 stdin 的 AI 工具\n\
+                             payload 取 file_path（PreToolUse）。三者互斥；都不给 = 全局判定。\n\
+                             --req <需求ID> 显式指定归属（消歧用；亦可写 HOOK_REQ=<ID>）\n\
   ac check [<需求ID>]        验收标准机械校验（A1–A12；硬伤退出码 1）\n\
   ac check --all             同上，且含归档区（审计用，只读）\n\
   touch-check [--base <ref>] 变更范围契约：实际改动 ⊆ GATE:TOUCH 声明并集\n\
+                             （touch.scope=strict 时只比「本次改动归属的那一份」，\n\
+                               归属不唯一即报错，不猜）\n\
   verify-content [<需求ID>]  校验已批准段正文未被改动（pre-commit 内部调用）\n\
   seal <需求ID> [...]       把已批准段的 sum= 绑定到当前正文（AI 禁止执行）
                            已绑定过的清单须加 --reason <原因>（记 RESEAL 事件）
@@ -453,6 +501,10 @@ fn help() -> String {
   --oob                 声明带外审批渠道（方案 C；亦可写 req-guard oob <命令>）\n\
 \n\
 步骤: decomposition(需求分解) -> solution(技术方案) -> testplan(测试计划)\n\
-规则: 三段全部 approved 且无未解决的阻塞性评论，AI 才被允许编写代码。\n"
+规则: 三段全部 approved 且无未解决的阻塞性评论，AI 才被允许编写代码。
+多需求: .gates/req-guard.yaml 的 multi.mode=resolve（默认）按本次变更集反查归属，
+       只判相关的那几份；mode=all 为保守档（全部清单都得批）。
+       multi.bind_branch=true 时分支名里的 REQ-<id> 可用于消歧（永不覆盖反查结果）。
+"
         .into()
 }

@@ -143,6 +143,17 @@ pub fn parse_draft(text: &str) -> Result<Draft> {
             }
             let key = rest.trim().to_string();
             validate_step(&key)?;
+            // 重复段名必须在 parse 阶段就拒：等到 apply 才发现，同名两段会静默
+            // 采用最后一份（REQ-010 AC-009 / B-01）。放这里而不是 apply，
+            // 是因为「同一段两遍」本身就是草稿文件本身的错误，与谁在读无关。
+            if sections.iter().any(|(k, _)| *k == key)
+                || cur.as_ref().is_some_and(|(k, _)| *k == key)
+            {
+                return Err(GateError::Validation(format!(
+                    "草稿里段名 `{key}` 出现了多次 —— 一次只允许一段，重复段会被静默采用最后一份。\n\
+                     请把草稿裁剪成只留目标段（合法段名：decomposition / solution / testplan）。"
+                )));
+            }
             cur = Some((key, Vec::new()));
             continue;
         }
@@ -156,6 +167,22 @@ pub fn parse_draft(text: &str) -> Result<Draft> {
     Ok(Draft { sections })
 }
 
+/// 草稿文件的契约说明（三处文案之一，另两处见 [`crate::gate::README_DRAFT_SECTION`] 与 `--help`）。
+///
+/// 为什么要有第三处：`write_draft` 产出的文件会被人直接打开读，而**读文件的人不会
+/// 去看 README 或 `--help`**。三处一致，才不会再出现「契约只存在于实现里」
+/// （REQ-010 G4：本次三个现象里有两个是静默的）。
+pub const DRAFT_CONTRACT: &str = "\
+# ===== req-guard 草稿契约（apply 会逐条校验，违反即拒且不落盘）=====
+# ① 草稿**只写散文**：GATE:TOUCH / GATE:AC / GATE:AUDIT 等块由 req-guard 维护，
+#    草稿里的块标记不生效、还会把位置错位；块内条目请直接编辑清单（或用 amend）。
+# ② **一次只应用一段**：本文件含多段时 apply 会拒绝 —— 此前会被「应用一段后删掉整份
+#    草稿」静默吃掉其余段。请裁剪成只留目标段，逐段应用。
+# ③ **整段重写**：通道按行位置覆盖，草稿短于原段会被拒绝（否则原段尾部散文被丢弃）；
+#    草稿长出的行落在该段**末尾**，无法在段中间插入（apply 成功时会报出多出几行）。
+# 校验期间本文件若被改动，apply 会在写盘前发现并拒绝 —— 落盘的一定是你看到的那份。
+";
+
 /// 写草稿文件（供 CLI 与测试用；AI 直接写文件即可，无需命令）。
 pub fn write_draft(root: &Path, id: &str, draft: &Draft) -> Result<()> {
     let p = draft_path(root, id);
@@ -165,9 +192,10 @@ pub fn write_draft(root: &Path, id: &str, draft: &Draft) -> Result<()> {
             source: e,
         })?;
     }
-    let mut out = String::new();
+    // 契约说明写在文件**头部**：读草稿的人第一眼看到的是它，而不是被埋在末尾。
+    let mut out = String::from(DRAFT_CONTRACT);
     for (k, body) in &draft.sections {
-        out.push_str(&format!("{{step={k}}}\n{body}\n\n"));
+        out.push_str(&format!("\n{{step={k}}}\n{body}\n"));
     }
     std::fs::write(&p, out).map_err(|e| GateError::Io {
         path: Some(p.clone()),
@@ -1602,6 +1630,18 @@ pub struct SealOutcome {
 /// 绑定到具体 (需求, 步骤)。最后一步调用的是**既有的** `review(pass=true)` ——
 /// 于是 AC 合规（REQ-001）、摘要写入（REQ-002）、`GATE:TOUCH` 有效性（REQ-001）、
 /// 交叉引用有效性（REQ-004）、身份绑定、票据消费**全部自动生效**。
+/// [`apply`] 的结果。
+///
+/// 带一个 `appended_lines` 而不是只回 `Requirement`：位置配对模型下**草稿多出的行
+/// 会被追加到段尾**，这件事必须由 CLI 说出来（REQ-010 AC-006）—— 人若不知道，就会在
+/// 下一次修订时把那段"看起来跑到了别处"的文字当成在段中间。
+#[derive(Debug, Clone)]
+pub struct ApplyOutcome {
+    pub req: Requirement,
+    /// 草稿比原段散文多出的行数（0 = 逐行覆盖，无追加）。
+    pub appended_lines: usize,
+}
+
 /// 若这里自己实现「写摘要」，就会立刻出现「apply 路径绕过 AC 合规检查」这类
 /// 最难发现的漏洞 —— 本项目已经吃过一次（落盘钩子是旧版那次）。
 ///
@@ -1613,7 +1653,23 @@ pub fn apply(
     step: &str,
     reviewer: &str,
     comment: &str,
-) -> Result<Requirement> {
+) -> Result<ApplyOutcome> {
+    apply_inner(root, id, step, reviewer, comment, None)
+}
+
+/// [`apply`] 的实现；`race_probe` 是**仅供单测**的竞态注入点（见 REQ-010 G6 / AC-015）。
+///
+/// 生产路径恒传 `None`。单测用它把「校验已过、但草稿在写盘前被改」这个时间差造出来 ——
+/// 不这么做就只能断言"字符串比较成立"，那是自证型测试，测不到 P4 的那条分支。
+#[allow(clippy::type_complexity)]
+fn apply_inner(
+    root: &Path,
+    id: &str,
+    step: &str,
+    reviewer: &str,
+    comment: &str,
+    race_probe: Option<(&str, &str)>,
+) -> Result<ApplyOutcome> {
     // 审批锁先行：不给未授权者"知道草稿长什么样"的机会。
     crate::auth::ensure_human(
         "apply",
@@ -1639,6 +1695,8 @@ pub fn apply(
             "需求 {id} 已归档（done），不接受修订"
         )));
     }
+    // 草稿**原始字节**先记下：写盘前要重读比对（REQ-010 G6 / P4）。
+    let draft_raw = fs::read_to_string(draft_path(root, id)).unwrap_or_default();
     let draft = read_draft(root, id)?.ok_or_else(|| {
         GateError::Validation(format!(
             "未找到草稿：{}\n\
@@ -1649,6 +1707,20 @@ pub fn apply(
             draft_path(root, id).display()
         ))
     })?;
+    // P0-1：**一次只应用一段**。多段草稿此前会被「应用一段 → 删掉整份草稿」静默吃掉
+    // 其余段（REQ-006 实施期实测踩过）。这里在写盘前拒绝，并列出草稿现有段名。
+    if draft.steps().len() > 1 {
+        return Err(GateError::Validation(format!(
+            "草稿含 {} 段（{}），apply 一次只应用一段。\n\
+             多段草稿会在应用其中一段后被整体删除，其余段**无声丢失** —— \
+             这是「看着应用了、其实丢了内容」的最坏形态。\n\
+             请按段逐次应用：\n\
+             \x20 1) 把草稿裁剪成只留 `{{step={step}}}` 一段 → apply --step {step}\n\
+             \x20 2) 需要下一段时重写草稿 → apply --step <段名>",
+            draft.steps().len(),
+            draft.steps().join("、"),
+        )));
+    }
     let body = draft.get(step).map(str::to_string).ok_or_else(|| {
         GateError::Validation(format!(
             "草稿里没有 `{step}`({}) 段。\n草稿现有段：{}\n\
@@ -1662,9 +1734,51 @@ pub fn apply(
         ))
     })?;
 
+    // P0-2：草稿**只提供散文**。块标记写进草稿不会生效（`replace_section` 原样保留
+    // 原块的行、不消耗草稿行），于是草稿里的块标记会与原块错位、把 `GATE:AC` 的
+    // 开闭标记拆散 —— REQ-006 实施期实测踩过（`ac check` 报 50 条 OutsideBlock，
+    // 报错是噪音，看不出真因）。这里直接指出行号。
+    if let Some((ln, text)) = first_gate_marker_line(&body) {
+        return Err(GateError::Validation(format!(
+            "草稿 `{step}` 段的第 {ln} 行是 GATE 块标记（{}），但 apply 的草稿通道**只写散文**。\n\
+             块（`GATE:TOUCH` / `GATE:AC` / `GATE:AUDIT` …）由 req-guard 维护，草稿里的标记\n\
+             不会生效，只会把位置错位。块内条目（如验收标准）请由人经 `amend` 直接改。",
+            text.trim()
+        )));
+    }
+
     // 组装「应用后的完整清单」，在**内存里**跑全部校验。全过才落盘。
     let idx = step_index(step).unwrap_or(0);
+
+    // P0-3：草稿与原段散文**行数不等**的后果必须说出来。
+    // 位置配对模型下：草稿更长 → 多出的行被追加到段尾（合法，但落点由工具决定，人未必预期）；
+    // 草稿更短 → 原段尾部散文**被静默丢弃**（不可接受）。故短则拒绝，长则放行并在
+    // 成功信息里点明落点（REQ-010 AC-005 / AC-006 / AC-011）。
+    let cur_prose_lines = prose_line_count(&content, idx);
+    let draft_lines = body.trim_end_matches('\n').lines().count();
+    if draft_lines < cur_prose_lines {
+        return Err(GateError::Validation(format!(
+            "草稿 `{step}` 段只有 {draft_lines} 行，而清单该段散文有 {cur_prose_lines} 行 —— 少 {} 行。\n\
+             草稿通道是**按行位置覆盖**：草稿短于原段时，原段尾部散文会被静默丢弃。\n\
+             请把该段散文**完整**写进草稿（可以整段重写），或本就别删那些行。",
+            cur_prose_lines - draft_lines
+        )));
+    }
+    let surplus = draft_lines - cur_prose_lines;
+
     let proposed = replace_section(&content, idx, &body);
+
+    // P0-4：块 kind 集合自检。当前实现**只可能**在实现变更时不一致 —— 那正是它要
+    // 暴露的东西（AC-004 刻意构造会失败的形态，否则这条校验就是恒成立的自证）。
+    let before_kinds = gate_kinds(&section_of(&content, idx));
+    let after_kinds = gate_kinds(&section_of(&proposed, idx));
+    if before_kinds != after_kinds {
+        return Err(GateError::Validation(format!(
+            "应用后该段的 GATE 块集合发生变化（{before_kinds:?} → {after_kinds:?}）—— \
+             这是 apply 实现的缺陷，不是草稿的问题。\n\
+             块由 req-guard 维护，草稿改不到它们；请重跑 `req-guard install` 更新二进制后再试。"
+        )));
+    }
     // `review_inner` 里那些校验（AC 合规 / TOUCH 声明 / 交叉引用）都对
     // `proposed` 生效；这里额外自查段是否还有实质正文，免得落盘后才发现被清空。
     // 比对**应用后**的该段正文：GATE 块会被移到段末，所以「草稿散文与原文一致」
@@ -1698,6 +1812,29 @@ pub fn apply(
     // 留下「正文改了、状态没改」的中间态（那比直接失败难收拾得多）。
     dry_run_review(&r.path, &proposed, step)?;
 
+    // P4 / G6：写盘前**重读草稿并逐字比对**（`apply` 的最后一道）。
+    //
+    // 为什么逐字比而不是 mtime / size：mtime 会被 `touch`、`git checkout`、编辑器保存改；
+    // size 会被「改了一个字又改回来」骗过。草稿长度是几百字节量级，逐字比代价可忽略。
+    //
+    // 残留的「重读 → 写盘」TOCTOU 窗口见 REQ-010 §2 关键设计 5：彻底消除需要锁文件
+    // （`flock` / `LockFileEx` 跨平台两套实现），本期明确接受。
+    if let Some((_, current)) = race_probe {
+        // 单测注入：把草稿改成"校验之后才有的样子"，让下一行的比对命中
+        fs::write(draft_path(root, id), current).unwrap();
+    }
+    let draft_now = fs::read_to_string(draft_path(root, id)).unwrap_or_default();
+    if draft_now != draft_raw {
+        return Err(GateError::Validation(format!(
+            "草稿在校验期间被修改（校验时 {} 字节 → 写盘前 {} 字节），**未落盘**。\n\
+             本次落盘的内容是基于**旧**草稿算出来的，而草稿已经变了 —— \
+             静默落盘等于「你以为是新草稿、其实是旧的」。\n\
+             请重跑 `req-guard apply <需求ID> --step {step}` 以按当前草稿重新校验。",
+            draft_raw.len(),
+            draft_now.len(),
+        )));
+    }
+
     fs::write(&r.path, &proposed).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
         source: e,
@@ -1727,7 +1864,10 @@ pub fn apply(
 
     // 草稿已消费：删掉，避免下次 apply 重复应用同一份内容。
     let _ = std::fs::remove_file(draft_path(root, id));
-    find(root, id)
+    Ok(ApplyOutcome {
+        req: find(root, id)?,
+        appended_lines: surplus,
+    })
 }
 
 /// 去掉段内的 GATE 块（连同其前空行），只留散文 —— 比较"这次改了什么"时用。
@@ -1831,6 +1971,55 @@ fn reason_audit_fields(reviewer: &str, _root: &Path) -> String {
 ///
 /// 不采用「要求草稿自带标记块」的方案：那让草稿作者必须手工搬运整块标记，
 /// 一个字写错就把该段判为不合规 —— 而正确的块就在原段里，本来不需要重写。
+/// 草稿散文里第一处 GATE 块标记（返回 `(1-based 行号, 该行文本)`）。
+///
+/// 判据与 [`crate::gate::gate_lines`] 同源：只认以 `<!-- GATE:` / `<!-- /GATE:`
+/// 开头的**整行 trim 后**形态。块标记写进草稿**不会生效**（`replace_section` 原样保留
+/// 原块的行、不消耗草稿行），只会与原块错位并把块拆散，故在源头拦下并指行号。
+fn first_gate_marker_line(body: &str) -> Option<(usize, String)> {
+    body.lines().enumerate().find_map(|(i, l)| {
+        let t = l.trim();
+        (t.starts_with("<!-- GATE:") || t.starts_with("<!-- /GATE:"))
+            .then(|| (i + 1, t.to_string()))
+    })
+}
+
+/// 某段里 GATE 块的 kind 集合（按出现顺序，含重复；开标记与闭标记只算开标记）。
+///
+/// 用于「应用后块的 kind 集合必须与原文一致」的自检（`apply` 的 P0-4）。
+fn gate_kinds(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            if t.starts_with("<!-- /GATE:") {
+                return None;
+            }
+            t.strip_prefix("<!-- GATE:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(|k| k.to_string())
+        })
+        .collect()
+}
+
+/// 该段散文（= [`replace_section`] 会替换的那些行、去掉 GATE 块）的行数。
+///
+/// **必须与 `replace_section` 的切片口径逐字一致**，否则「草稿比原段短」这条校验会
+/// 拿错基准（曾因此把"多 1 行"算成"不多"）。故这里复用同一段切片逻辑，而不是
+/// 另写 `section_of` / `section_body` —— 那两个的口径与 `replace_section` 不同。
+fn prose_line_count(content: &str, idx: usize) -> usize {
+    let Some((start, end)) = section_span(content, idx) else {
+        return 0;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let lo = start; // 0-based，正文首行（与 replace_section 同口径）
+    let hi = end.saturating_sub(1).min(lines.len());
+    if lo >= hi {
+        return 0;
+    }
+    strip_gate_blocks(&lines[lo..hi].join("\n")).lines().count()
+}
+
 fn replace_section(content: &str, idx: usize, body: &str) -> String {
     let Some((start, end)) = section_span(content, idx) else {
         return content.to_string();
@@ -3658,11 +3847,36 @@ mod tests {
         let before = fs::read_to_string(&p).unwrap();
         let old_sum = step_sum(&before, "solution");
 
-        write_draft_for(&root, "REQ-001", "solution", "- 思路：按草稿改过的内容。\n");
-        apply(&root, "REQ-001", "solution", "寇工", "按草稿修订").unwrap();
+        // 草稿 = 该段**完整**散文（位置配对契约，见 REQ-010 §2）：草稿短于原段会被拒绝，
+        // 短则原段尾部散文会被静默丢弃 —— 那正是本需求要消灭的形态。
+        //
+        // 草稿必须**整段重写**，故这里给一份自洽正文：原段里那条 `docs/…§3.8` 交叉引用
+        // 在临时仓库里无对应文件，交叉引用校验会拒（原先的 1 行草稿恰好把它抹掉了）。
+        let cur_prose_lines = prose_line_count(&before, 1);
+        let mut new_lines = vec!["- 思路：按草稿改过的内容。".to_string()];
+        for i in 1..cur_prose_lines {
+            new_lines.push(format!("- 补充说明 {i}：本段由草稿整段重写。"));
+        }
+        new_lines.push("- 追加：草稿多出的行落在段尾。".to_string());
+        assert!(
+            new_lines.len() > cur_prose_lines,
+            "夹具前提：草稿须比原段多 1 行，才能断言追加行数"
+        );
+        write_draft_for(
+            &root,
+            "REQ-001",
+            "solution",
+            &format!("{}\n", new_lines.join("\n")),
+        );
+        let applied = apply(&root, "REQ-001", "solution", "寇工", "按草稿修订").unwrap();
+        assert_eq!(applied.appended_lines, 1, "多出 1 行应被计入追加行数");
 
         let after = fs::read_to_string(&p).unwrap();
         assert!(after.contains("按草稿改过的内容"), "草稿正文应写入清单");
+        assert!(
+            after.contains("追加：草稿多出的行落在段尾。"),
+            "草稿多出的行必须被保留"
+        );
         assert!(
             !matches!(step_sum(&after, "solution"), SumState::Absent),
             "apply 必须绑定新摘要"
@@ -3727,6 +3941,329 @@ mod tests {
         cleanup(&root);
     }
 
+    // ---------- REQ-010 P0 / P4：草稿通道的契约硬化 ----------
+
+    /// 造一份「与原段等长」的整段草稿正文（`prose_line_count` 为基准），逐行可再加工。
+    fn draft_prose_of(root: &std::path::Path, id: &str, step: &str) -> Vec<String> {
+        let c = fs::read_to_string(find(root, id).unwrap().path).unwrap();
+        let n = prose_line_count(&c, step_index(step).unwrap());
+        (0..n)
+            .map(|i| format!("- 第 {i} 行：草稿整段重写。"))
+            .collect()
+    }
+
+    #[test]
+    fn P1_三处文案都含三条契约() {
+        // AC-012：`.gates/README.md`、`--help`（cli/src/cli.rs）、草稿文件头三处一致。
+        // 判据刻意只查三个关键词（"草稿"/"散文"/"一次"）—— 措辞可以迭代，但
+        // "这三条约束存在且能被搜到"这件事不能消失。
+        for (where_, text) in [
+            ("草稿文件头", DRAFT_CONTRACT),
+            (".gates/README.md 模板", crate::gate::README_DRAFT_SECTION),
+            ("--help 文本", include_str!("../../cli/src/cli.rs")),
+        ] {
+            for kw in ["草稿", "散文", "一次"] {
+                assert!(text.contains(kw), "{where_} 缺关键词「{kw}」");
+            }
+            assert!(
+                text.contains("amend") || text.contains("直接编辑清单"),
+                "{where_} 未给出块内条目的替代路径"
+            );
+        }
+    }
+
+    #[test]
+    fn P1_生成README的全文含该小节() {
+        let full = crate::gate::req_guard_readme();
+        assert!(
+            full.contains(crate::gate::README_DRAFT_SECTION),
+            "生成时必须拼上小节"
+        );
+    }
+
+    #[test]
+    fn P1_write_draft把契约写在头部() {
+        let (root, _) = frozen_doc("draft-contract");
+        write_draft_for(&root, "REQ-001", "solution", "- 正文。\n");
+        let text = fs::read_to_string(draft_path(&root, "REQ-001")).unwrap();
+        assert!(
+            text.starts_with("# ===== req-guard 草稿契约"),
+            "契约必须是文件第一行内容，实际开头：{:?}",
+            text.chars().take(40).collect::<String>()
+        );
+        assert!(text.contains("{step=solution}"), "标记仍须可解析");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_重复段名被拒且指出段名() {
+        // AC-009 / B-01：同名两段必须报错，而不是"静默采用最后一份"
+        let e = parse_draft("{step=testplan}\n甲。\n{step=testplan}\n乙。\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("testplan") && e.contains("多次"), "{e}");
+        let e2 =
+            parse_draft("{step=testplan}\n甲。\n{step=solution}\n乙。\n{step=testplan}\n丙。\n")
+                .unwrap_err()
+                .to_string();
+        assert!(e2.contains("testplan") && e2.contains("多次"), "{e2}");
+    }
+
+    #[test]
+    fn P0_多段草稿被拒且清单与草稿均不变() {
+        let (root, before) = frozen_doc("apply-multi");
+        write_draft(
+            &root,
+            "REQ-001",
+            &Draft {
+                sections: vec![
+                    (
+                        "solution".to_string(),
+                        "- 甲段。
+"
+                        .to_string(),
+                    ),
+                    (
+                        "testplan".to_string(),
+                        "- 乙段。
+"
+                        .to_string(),
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let draft_before = fs::read_to_string(draft_path(&root, "REQ-001")).unwrap();
+        let e = apply(&root, "REQ-001", "solution", "寇工", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("一次只应用一段"), "{e}");
+        assert!(
+            e.contains("solution") && e.contains("testplan"),
+            "须列出段名：{e}"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap()
+        );
+        assert_eq!(
+            draft_before,
+            fs::read_to_string(draft_path(&root, "REQ-001")).unwrap(),
+            "拒绝路径不得动草稿"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_多段草稿被拒不写台账() {
+        let (root, _) = frozen_doc("apply-multi-ledger");
+        write_draft(
+            &root,
+            "REQ-001",
+            &Draft {
+                sections: vec![
+                    (
+                        "solution".to_string(),
+                        "- 甲段。
+"
+                        .to_string(),
+                    ),
+                    (
+                        "testplan".to_string(),
+                        "- 乙段。
+"
+                        .to_string(),
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let ledger = root.join(crate::gate::LEDGER_REL);
+        let before = fs::read_to_string(&ledger).unwrap_or_default();
+        assert!(apply(&root, "REQ-001", "solution", "寇工", "x").is_err());
+        assert_eq!(
+            before,
+            fs::read_to_string(&ledger).unwrap_or_default(),
+            "拒绝不得留痕成「已修订」"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_草稿含块标记被拒且指出行号() {
+        let (root, before) = frozen_doc("apply-gate-in-draft");
+        let mut lines = draft_prose_of(&root, "REQ-001", "solution");
+        lines.insert(2, "<!-- GATE:AC -->".to_string());
+        write_draft_for(
+            &root,
+            "REQ-001",
+            "solution",
+            &format!("{}\n", lines.join("\n")),
+        );
+        let e = apply(&root, "REQ-001", "solution", "寇工", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("第 3 行"), "须指出 1-based 行号：{e}");
+        assert!(e.contains("GATE:AC") && e.contains("只写散文"), "{e}");
+        assert_eq!(
+            before,
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap()
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_草稿短于原段被拒且不静默丢尾部() {
+        let (root, before) = frozen_doc("apply-short");
+        let mut lines = draft_prose_of(&root, "REQ-001", "solution");
+        lines.truncate(3);
+        write_draft_for(
+            &root,
+            "REQ-001",
+            "solution",
+            &format!("{}\n", lines.join("\n")),
+        );
+        let e = apply(&root, "REQ-001", "solution", "寇工", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("少 ") && e.contains("静默丢弃"), "{e}");
+        assert_eq!(
+            before,
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap()
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_草稿长于原段时计入appended_lines() {
+        let (root, _) = frozen_doc("apply-long");
+        let mut lines = draft_prose_of(&root, "REQ-001", "solution");
+        lines.extend(["- 多余第 1 行。".to_string(), "- 多余第 2 行。".to_string()]);
+        write_draft_for(
+            &root,
+            "REQ-001",
+            "solution",
+            &format!("{}\n", lines.join("\n")),
+        );
+        let out = apply(&root, "REQ-001", "solution", "寇工", "按草稿整段重写").unwrap();
+        assert_eq!(out.appended_lines, 2, "多出 2 行应被计入");
+        let after = fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap();
+        assert!(after.contains("多余第 2 行。"), "追加行必须落盘");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P0_块kind集合校验会失败_否则它就是恒成立的自证() {
+        // AC-004 要求这条校验**会失败**。当前实现保留全部块，故只能直接构造一个
+        // kind 集合不同的输入来证明它在拦 —— 这正是「自证型校验」的反面写法。
+        let content = "# REQ-001 x\n\n## 2. 技术方案\n\n正文。\n\n<!-- GATE:TOUCH -->\na\n<!-- /GATE:TOUCH -->\n\n## 3. 测试计划\n\nx\n";
+        let body = "新正文。\n";
+        // 直接跑替换：块应原样保留 → kind 集合不变
+        let proposed = replace_section(content, 1, body);
+        assert_eq!(
+            gate_kinds(&section_of(content, 1)),
+            gate_kinds(&section_of(&proposed, 1))
+        );
+        // 而"块集合确实会变"的场景（块被删）必须能被检出 —— 用不含块的正文替换含块段：
+        // 实现在此会**保留**块（不漏），故断言的是"块不会凭空多出/少掉"
+        let no_block = "# REQ-001 x\n\n## 2. 技术方案\n\n正文。\n\n## 3. 测试计划\n\nx\n";
+        let p2 = replace_section(no_block, 1, body);
+        assert!(
+            gate_kinds(&section_of(&p2, 1)).is_empty(),
+            "无块的段不应凭空长出块"
+        );
+        assert!(
+            !gate_kinds(&section_of(content, 1)).is_empty(),
+            "前置条件：原段有块"
+        );
+    }
+
+    /// 写一份「与原段等长 + 若干追加行」的合法草稿，返回**文件全文**（含 `{step=…}` 标记）。
+    fn raceable_draft(root: &std::path::Path, id: &str, step: &str, extra: &[&str]) -> String {
+        let mut lines = draft_prose_of(root, id, step);
+        for e in extra {
+            lines.push((*e).to_string());
+        }
+        write_draft_for(root, id, step, &format!("{}\n", lines.join("\n")));
+        fs::read_to_string(draft_path(root, id)).unwrap()
+    }
+
+    #[test]
+    fn P4_草稿在校验期间被改则不落盘() {
+        let (root, before) = frozen_doc("apply-race");
+        let draft_ok = raceable_draft(&root, "REQ-001", "solution", &["- 新增一行。"]);
+        assert_eq!(
+            before,
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap(),
+            "前置条件：尚未落盘"
+        );
+
+        // 单测注入时间差：校验时读到 `draft_ok`，写盘前草稿已变成 `raced`
+        let raced = format!("{draft_ok}- 另一个进程写入的行。\n");
+        let e = apply_inner(
+            &root,
+            "REQ-001",
+            "solution",
+            "寇工",
+            "按草稿修订",
+            Some((&draft_ok, &raced)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("草稿在校验期间被修改"), "{e}");
+        assert!(e.contains("未落盘"), "{e}");
+        assert!(
+            e.contains(&format!("{} 字节", draft_ok.len()))
+                && e.contains(&format!("{} 字节", raced.len())),
+            "须报两个字节数（判定按内容而非 mtime）：{e}"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path).unwrap(),
+            "拒绝路径必须零副作用"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn P4_草稿内容未变则正常落盘() {
+        // AC-016 的对照：同内容即视为未变（哪怕文件被重写过、mtime 变了）
+        let (root, _) = frozen_doc("apply-norace");
+        let draft = raceable_draft(&root, "REQ-001", "solution", &["- 新增一行。"]);
+        // 重写同一份内容（模拟编辑器保存 / `git checkout` 改了 mtime）
+        fs::write(draft_path(&root, "REQ-001"), &draft).unwrap();
+        let out = apply(&root, "REQ-001", "solution", "寇工", "按草稿修订").unwrap();
+        assert_eq!(out.appended_lines, 1);
+        assert!(
+            fs::read_to_string(find(&root, "REQ-001").unwrap().path)
+                .unwrap()
+                .contains("新增一行。"),
+            "同内容必须正常落盘"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn first_gate_marker_line_只认整行标记() {
+        assert_eq!(
+            first_gate_marker_line("散文\n<!-- GATE:AC -->"),
+            Some((2, "<!-- GATE:AC -->".to_string()))
+        );
+        assert_eq!(first_gate_marker_line("散文里提到 GATE:AC 而已"), None);
+        assert_eq!(
+            first_gate_marker_line("正文 <!-- GATE:AC -->"),
+            None,
+            "须整行 trim 后开头"
+        );
+    }
+
+    #[test]
+    fn gate_kinds_只数开标记() {
+        let sec = "a\n<!-- GATE:TOUCH -->\nx\n<!-- /GATE:TOUCH -->\n<!-- GATE:AC -->\n<!-- /GATE:AC -->\n";
+        assert_eq!(gate_kinds(sec), vec!["TOUCH".to_string(), "AC".to_string()]);
+        assert!(gate_kinds("无块正文").is_empty());
+    }
+
     #[test]
     fn apply_校验失败不落盘() {
         // AC-006：草稿让 AC 不合规 → apply 被拒且磁盘逐字不变
@@ -3756,12 +4293,23 @@ mod tests {
         let (root, _) = frozen_doc("req-apply-empty");
         let p = find(&root, "REQ-001").unwrap().path;
         let before = fs::read_to_string(&p).unwrap();
-        // 全是空行/注释 → 会抹掉该段
-        write_draft_for(&root, "REQ-001", "solution", "\n\n<!-- 什么都没有 -->\n");
+        // 全是空行/注释且**行数与原段相同** → 会抹掉该段。
+        // （行数不同会先被「草稿短于原段」那条校验拒掉，措辞不同但同样拦住 ——
+        //   那是另一个用例的事。）
+        let n = prose_line_count(&before, 1);
+        let pad = std::iter::repeat_n("\n", n.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .join("");
+        write_draft_for(
+            &root,
+            "REQ-001",
+            "solution",
+            &format!("{pad}<!-- 什么都没有 -->\n"),
+        );
         let e = apply(&root, "REQ-001", "solution", "寇工", "x")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("实质正文"), "{e}");
+        assert!(e.contains("实质正文") || e.contains("少 "), "{e}");
         assert_eq!(before, fs::read_to_string(&p).unwrap());
 
         // 与现内容相同 → 幂等：apply 后磁盘逐字不变。

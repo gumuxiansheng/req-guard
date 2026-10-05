@@ -4,7 +4,6 @@ $ErrorActionPreference = 'Continue'
 
 $REQ_DIR = ".gates/requirements"
 $AUDIT_LOG = ".gates/audit/gate-audit.log"
-$BYPASS_FILE = ".gates/.bypass"
 
 function Write-GateAudit([string]$msg) {
   $dir = Split-Path -Parent $AUDIT_LOG
@@ -37,97 +36,21 @@ if ($stdinData.Trim()) {
   }
 }
 
-# ---------- 1) 应急绕过窗口 ----------
-if (Test-Path $BYPASS_FILE) {
-  $txt = [string](Get-Content $BYPASS_FILE -Raw -ErrorAction SilentlyContinue)
-  $m = [regex]::Match($txt, 'expires_epoch=(\d+)')
-  if ($m.Success) {
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($now -lt [int64]$m.Groups[1].Value) {
-      Write-GateAudit "BYPASS-HIT expires_epoch=$($m.Groups[1].Value)"
-      Write-Output "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）"
-      # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
-      Write-Output "REQ_GUARD_BYPASS=1"
-      exit 0
-    }
-  }
-}
-
-# ---------- 2) 定位当前活跃需求 ----------
-$active = $null
-if (Test-Path $REQ_DIR) {
-  $files = Get-ChildItem -Path $REQ_DIR -Filter *.md -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notlike '*.comments.md' } |
-    Sort-Object Name -Descending
-  foreach ($f in $files) {
-    $head = Get-Content $f.FullName -TotalCount 20 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'GATE:HEAD' } | Select-Object -First 1
-    $st = ''
-    if ($head -match 'status=([a-z_]+)') { $st = $Matches[1] }
-    if ($st -ne 'done') { $active = $f; break }
-  }
-}
-
-if ($null -eq $active) {
-  Write-GateAudit "BLOCK no-requirement"
-  Write-Error "[req-guard] 拦截：未找到待开发的需求清单。请先执行 req-guard create -t ""<需求标题>"""
-  exit 1
-}
-
-# ---------- 3) 三段步骤必须全部 approved ----------
-$failed = @()
-foreach ($step in @('decomposition', 'solution', 'testplan')) {
-  $l = Get-Content $active.FullName -ErrorAction SilentlyContinue | Where-Object { $_ -match 'GATE:STEP' -and $_ -match "name=$step " } | Select-Object -First 1
-  $st = ''
-  if ($l -match 'status=([a-z_]+)') { $st = $Matches[1] }
-  if ($st -ne 'approved') {
-    if (-not $st) { $st = 'pending' }
-    $failed += "$step 未通过审核（当前: $st）"
-  }
-}
-
-if ($failed.Count -gt 0) {
-  Write-GateAudit "BLOCK $($active.Name)"
-  Write-Error "[req-guard] 拦截：需求 $($active.Name) 尚未通过审核，AI 不得编写/修改源码。未完成步骤： $($failed -join '; ')"
-  exit 1
-}
-
-# ---------- 3.5) 已批准段的内容冻结（与 HOOK_SH 同一判定、同一 fail-closed 取向） ----------
-# 只在确实存在绑定摘要时才调二进制：存量清单没有 sum=，无条件调用会让
-# 未装二进制的仓库从"能提交"变成"不能提交"——那是新功能制造的 outage。
-if (-not $env:REQ_GUARD_SUM_CHECKED) {
-  $hasSum = Select-String -Path $active.FullName -Pattern 'sum=[0-9a-f]' -Quiet
-} else { $hasSum = $false }
-if ($hasSum) {
-  if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
-    Write-GateAudit "BLOCK-SUM no-binary"
-    Write-Error "[req-guard] 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。确需跳过本次：git commit --no-verify"
+# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+# 与 HOOK_SH 同构：本地 sh 是唯一真实部署面，本文件是它的逐行镜像（Windows 资产）。
+# 镜像负债之所以只剩这一处，正是因为第 1 段之后的一切裁决都已下沉到 core。
+if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
+    Write-GateAudit "BLOCK no-binary"
+    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。"
     exit 1
-  }
-  $sumOut = & req-guard verify-content $active.Name 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    Write-GateAudit "BLOCK-SUM $($active.Name)"
-    $sumOut | ForEach-Object { Write-Error $_ }
-    exit 1
-  }
-  $sumOut | ForEach-Object { Write-Error $_ }
 }
-
-# ---------- 4) 阻塞性评论必须全部 resolved ----------
-$commentsFile = Join-Path $REQ_DIR ($active.BaseName + ".comments.md")
-if (Test-Path $commentsFile) {
-  $blockingOpen = Get-Content $commentsFile -ErrorAction SilentlyContinue |
-    Where-Object { $_ -match 'GATE:COMMENT' -and $_ -match 'blocking=true' -and $_ -match 'state=open' }
-  if ($blockingOpen) {
-    Write-GateAudit "BLOCK-COMMENT $($active.Name)"
-    Write-Error "[req-guard] 拦截：存在未解决的阻塞性评论，需审核人 resolve 后才可编码"
-    exit 1
-  }
-  $openN = @(Get-Content $commentsFile -ErrorAction SilentlyContinue |
-    Where-Object { $_ -match 'GATE:COMMENT' -and $_ -match 'state=open' }).Count
-  if ($openN -gt 0) {
-    Write-Output "[req-guard] 提示：有 ${openN} 条 open 评论，执行 req-guard comments $($active.Name) 查看"
-  }
+if ($stdinData.Trim()) {
+    # 有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON
+    $stdinData | req-guard check --stdin | Out-Host
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+} else {
+    # 无 payload（pre-commit / 人工）→ --staged
+    req-guard check --staged | Out-Host
+    if ($LASTEXITCODE -ne 0) { exit 1 }
 }
-
-Write-GateAudit "PASS $($active.Name)"
 exit 0

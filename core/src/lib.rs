@@ -19,6 +19,8 @@ pub mod issue;
 /// AI 工具 hook payload 解析（PreToolUse 的 stdin JSON）。
 pub mod json;
 pub mod requirement;
+/// 多需求并行的门禁裁决：裁决对象是「本次变更集」而非「某一份清单」（REQ-006）。
+pub mod resolve;
 pub mod section;
 pub mod specmeta;
 pub mod status;

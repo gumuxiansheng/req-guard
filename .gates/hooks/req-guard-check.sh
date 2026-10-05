@@ -9,7 +9,6 @@ set -u
 
 REQ_DIR=".gates/requirements"
 AUDIT_LOG=".gates/audit/gate-audit.log"
-BYPASS_FILE=".gates/.bypass"
 
 log() {
   mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
@@ -46,101 +45,27 @@ if [ ! -t 0 ]; then
   fi
 fi
 
-# ---------- 1) 应急绕过窗口（有痕、有时效） ----------
-if [ -f "$BYPASS_FILE" ]; then
-  EXP=$(sed -n 's/.*expires_epoch=\([0-9]*\).*/\1/p' "$BYPASS_FILE" 2>/dev/null | head -1)
-  case "$EXP" in ''|*[!0-9]*) EXP="";; esac
-  NOW=$(date '+%s' 2>/dev/null || echo 0)
-  case "$NOW" in ''|*[!0-9]*) NOW=0;; esac
-  if [ -n "$EXP" ] && [ "$NOW" -lt "$EXP" ]; then
-    log "BYPASS-HIT expires_epoch=$EXP"
-    echo "[req-guard] 警告：命中应急绕过窗口，本次放行（已记审计日志）" >&2
-    # 机器可读标记：供 req-guard check 判定"本次放行靠绕过"（勿改，与 BYPASS_MARKER 对应）
-    echo "REQ_GUARD_BYPASS=1"
-    exit 0
-  fi
-fi
-
-# ---------- 2) 定位当前活跃需求（跳过已归档 done 的） ----------
-ACTIVE=""
-if [ -d "$REQ_DIR" ]; then
-  for F in $(ls "$REQ_DIR" 2>/dev/null | grep '\.md$' | grep -v '\.comments\.md$' | sort -r); do
-    ST=$(sed -n 's/.*GATE:HEAD .*status=\([a-z_]*\).*/\1/p' "$REQ_DIR/$F" 2>/dev/null | head -1)
-    if [ "$ST" != "done" ]; then
-      ACTIVE="$F"
-      break
-    fi
-  done
-fi
-
-if [ -z "$ACTIVE" ]; then
-  log "BLOCK no-requirement"
-  echo "[req-guard] ⛔ 拦截：未找到待开发的需求清单。" >&2
-  echo "          AI 在编写代码前，必须先创建并走完三段清单审核：" >&2
-  echo "            req-guard create -t \"<需求标题>\"" >&2
+# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+#
+# 为什么第 1 段之后的一切都被删掉了：三段检查、阻塞评论、评论摘要、内容冻结，
+# 现在全部由 `req-guard check` 判定（core/src/resolve.rs）。本脚本**不含任何裁决分支** ——
+# ① 判定散落到第二处的那一刻起，它就与 core 版本漂移，而门禁最坏的失效不是"报错"
+# 而是"看着在拦、其实没拦"；② 任何加进本脚本的判定都必须在 HOOK_PS1 里逐行镜像一遍，
+# 那是纯负债（本次改造就是为了消掉这份镜像）。
+#
+# 三个上下文各取一种变更集，**不得混用**（两个变更集混判必然产生无法解释的裁决）：
+#   有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON，不在 sh 里 sed 抠
+#   无 payload（pre-commit / 人工）→ --staged：已暂存文件集
+if ! command -v req-guard >/dev/null 2>&1; then
+  log "BLOCK no-binary"
+  echo "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。" >&2
+  echo "          判定在 core，缺二进制即无从判定 —— fail-closed，不猜。" >&2
+  echo "          请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。" >&2
+  echo "          确需本次放行：git commit --no-verify / .gates/.bypass 应急窗口。" >&2
   exit 1
 fi
-
-# ---------- 3) 三段步骤必须全部 approved ----------
-FAILED=""
-for STEP in decomposition solution testplan; do
-  LINE=$(grep 'GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null | grep "name=$STEP " | head -1)
-  ST=$(printf '%s' "$LINE" | sed -n 's/.*status=\([a-z_]*\).*/\1/p')
-  if [ "$ST" != "approved" ]; then
-    FAILED="$FAILED\n    - $STEP 未通过审核（当前: ${ST:-pending}）"
-  fi
-done
-
-if [ -n "$FAILED" ]; then
-  log "BLOCK $ACTIVE"
-  printf "[req-guard] ⛔ 拦截：需求 %s 尚未通过审核，AI 不得编写/修改源码。\n" "$ACTIVE" >&2
-  printf "          未完成步骤：%b\n" "$FAILED" >&2
-  echo "          请补齐清单后由审核人执行：" >&2
-  echo "            req-guard approve <需求ID> --step <步骤> --reviewer <姓名>" >&2
-  echo "          步骤顺序：decomposition(需求分解) → solution(技术方案) → testplan(测试计划)" >&2
-  exit 1
+if [ -n "${STDIN_DATA:-}" ]; then
+  printf '%s' "$STDIN_DATA" | req-guard check --stdin || exit 1
+else
+  req-guard check --staged || exit 1
 fi
-
-# ---------- 3.5) 已批准段的内容冻结（有 sum= 才需要；缺二进制即 fail-closed） ----------
-# 只在**确实存在绑定摘要**时才调用二进制：存量清单没有 sum=，若无条件调用，
-# 未装二进制的仓库会从"能提交"变成"不能提交"——那是新功能制造的 outage。
-# 一旦有 sum= 却没有 req-guard，就无从校验"批准后正文是否被改"，必须拦。
-if [ -z "${REQ_GUARD_SUM_CHECKED:-}" ] \
-   && grep -q '^<!-- GATE:STEP' "$REQ_DIR/$ACTIVE" 2>/dev/null \
-   && grep -q 'sum=[0-9a-f]' "$REQ_DIR/$ACTIVE" 2>/dev/null; then
-  if ! command -v req-guard >/dev/null 2>&1; then
-    log "BLOCK-SUM no-binary"
-    echo "[req-guard] ⛔ 拦截：已批准段绑定了内容摘要，但 req-guard 不在 PATH，无法校验。" >&2
-    echo "          把 req-guard 加入 PATH 后重试；确需跳过本次：git commit --no-verify" >&2
-    exit 1
-  fi
-  SUM_OUT=$(req-guard verify-content "$ACTIVE" 2>&1) || {
-    log "BLOCK-SUM $ACTIVE"
-    printf '%s\n' "$SUM_OUT" >&2
-    exit 1
-  }
-  printf '%s\n' "$SUM_OUT" >&2
-fi
-
-# ---------- 4) 阻塞性评论必须全部 resolved ----------
-COMMENTS="$REQ_DIR/${ACTIVE%.md}.comments.md"
-if [ -f "$COMMENTS" ] && grep -q 'blocking=true' "$COMMENTS" 2>/dev/null; then
-  OPEN=$(grep 'GATE:COMMENT' "$COMMENTS" 2>/dev/null | grep 'blocking=true' | grep 'state=open')
-  if [ -n "$OPEN" ]; then
-    log "BLOCK-COMMENT $ACTIVE"
-    echo "[req-guard] ⛔ 拦截：存在未解决的阻塞性评论，需审核人 resolve 后才可编码" >&2
-    exit 1
-  fi
-fi
-
-# ---------- 5) 评论摘要（每次都提示，保证 AI 必然看到） ----------
-if [ -f "$COMMENTS" ]; then
-  N=$(grep 'GATE:COMMENT' "$COMMENTS" 2>/dev/null | grep -c 'state=open')
-  case "$N" in ''|*[!0-9]*) N=0;; esac
-  if [ "$N" -gt 0 ]; then
-    echo "[req-guard] 提示：有 ${N} 条 open 评论，执行 req-guard comments ${ACTIVE} 查看" >&2
-  fi
-fi
-
-log "PASS $ACTIVE"
-exit 0

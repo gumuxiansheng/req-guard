@@ -50,3 +50,27 @@
 | 2026-10-04 19:43:27 | DERIVE_SOURCE_REFS REQ-008 - -> core/src,scripts,docs/规范 |
 | 2026-10-04 19:43:27 | APPROVE REQ-008 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-04 19:43:44 | APPROVE REQ-008 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-04 21:18:31 | APPROVE REQ-006 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-04 21:18:42 | DERIVE_SOURCE_REFS REQ-006 - -> core/src,cli/src,templates/hooks/fragments,templates/ci,scripts,.cnb.yml,.github/workflows,docs/设计,docs,docs/规范,packaging/docs,packaging |
+| 2026-10-04 21:18:43 | APPROVE REQ-006 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-04 21:18:51 | APPROVE REQ-006 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-04 22:19:32 | RESEAL REQ-006 sums=需求分解:ec0e42e9,技术方案:eef905a6,测试计划:76f28a62 reason=修复假机器标记 |
+| 2026-10-05 00:27:43 | AMEND REQ-006 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=- sig=- actor=Mike_Zhu |
+| 2026-10-05 00:27:43 | DERIVE_SOURCE_REFS REQ-006 core/src,cli/src,templates/hooks/fragments,templates/ci,scripts,.cnb.yml,.github/workflows,docs/设计,docs,docs/规范,packaging/docs,packaging -> core/src,cli/src,templates/hooks/fragments,templates/ci,scripts,.cnb.yml,.github/workflows,docs/设计,docs,docs/规范,packaging/docs,packaging,gui/src,tui/src |
+| 2026-10-05 00:27:43 | APPROVE REQ-006 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 00:56:54 | AMEND REQ-006 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=- sig=- actor=Mike_Zhu |
+| 2026-10-05 00:56:54 | APPROVE REQ-006 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 00:59:15 | APPROVE REQ-010 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 00:59:55 | DERIVE_SOURCE_REFS REQ-010 - -> core/src,cli/src,docs,.gates,packaging/docs,packaging |
+| 2026-10-05 00:59:55 | APPROVE REQ-010 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 01:00:04 | APPROVE REQ-010 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 01:19:31 | AMEND REQ-006 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 01:22:43 | APPROVE REQ-006 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 01:23:24 | RESEAL REQ-006 sums=需求分解:ec0e42e9,技术方案:898d8610,测试计划:b7adf3bf reason=补_AC-040..AC-050 |
+| 2026-10-05 01:25:44 | RESEAL REQ-010 sums=需求分解:e9de85d0,技术方案:7497baee,测试计划:7144fcfa reason=新增AC点 |
+| 2026-10-05 01:30:58 | AMEND REQ-010 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=- sig=- actor=Mike_Zhu |
+| 2026-10-05 01:30:59 | APPROVE REQ-010 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 01:32:48 | AMEND REQ-010 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=- sig=- actor=Mike_Zhu |
+| 2026-10-05 01:32:49 | APPROVE REQ-010 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 09:32:51 | AMEND REQ-010 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 09:37:48 | APPROVE REQ-010 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |

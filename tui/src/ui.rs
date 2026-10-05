@@ -304,7 +304,18 @@ fn render_audit(f: &mut Frame, app: &App, area: Rect) {
         app.audit
             .iter()
             .rev()
-            .map(|l| Line::from(l.clone()))
+            // 按 core 判定的性质上色（分类只有一份，见 gate::audit_kind）。
+            // 拦截与绕过必须一眼可辨：把 BLOCK 显示成 PASS 就是"看着在放行"。
+            .map(|l| {
+                let color = match req_guard_core::gate::audit_kind(l) {
+                    req_guard_core::gate::AuditKind::Block => Color::Red,
+                    req_guard_core::gate::AuditKind::Bypass => Color::Yellow,
+                    req_guard_core::gate::AuditKind::Note => Color::DarkGray,
+                    req_guard_core::gate::AuditKind::Pass => Color::Green,
+                    req_guard_core::gate::AuditKind::Event => Color::Gray,
+                };
+                Line::from(Span::styled(l.clone(), Style::default().fg(color)))
+            })
             .collect()
     };
     let block = Block::default()

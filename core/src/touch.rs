@@ -59,6 +59,11 @@ pub enum TouchIssueKind {
     SectionNotFound,
     /// 没有任何未 done 的清单 —— 无从比对（fail-closed，如实报而非静默放行）。
     NoRequirement,
+    /// `strict` 口径下本次变更集归属到多份（或零份）清单 —— 无从"只比一份"。
+    ///
+    /// 旧实现在这里**静默截断到逆序第一份 live 清单**：REQ-001 的实际改动在
+    /// strict 下没人比，而人以为"strict 更严"。误判方向是漏拦，故必须报错。
+    AmbiguousScope,
 }
 
 impl TouchIssueKind {
@@ -71,6 +76,7 @@ impl TouchIssueKind {
             TouchIssueKind::NotDeclared => "NotDeclared",
             TouchIssueKind::SectionNotFound => "SectionNotFound",
             TouchIssueKind::NoRequirement => "NoRequirement",
+            TouchIssueKind::AmbiguousScope => "AmbiguousScope",
         }
     }
 }
@@ -103,7 +109,13 @@ pub fn has_errors(issues: &[TouchIssue]) -> bool {
 pub enum TouchScope {
     /// 全部未 done 清单的声明并集（默认）。
     Union,
-    /// 只比最新活跃清单（与 `HOOK_SH` 第 2 段同规则），范围更紧、误报更多。
+    /// 只比**本次变更集归属的那一份**清单，范围更紧、误报更多。
+    ///
+    /// 归属由 [`crate::resolve::judge`] 给出（与门禁裁决同一份解析）。候选 ≠1 时
+    /// 报 [`TouchIssueKind::AmbiguousScope`]。
+    ///
+    /// ⚠️ 旧语义是「只比文件名逆序第一份未归档清单」，**已废除**：那个选法与
+    /// 「本次改动属于谁」无关，会让别的清单的改动在 strict 下无人比对（漏拦）。
     Strict,
 }
 
@@ -522,11 +534,10 @@ fn collect_declarations(
             )));
         }
     }
-    if scope == TouchScope::Strict && only.is_none() && !live.is_empty() {
-        // 与 HOOK_SH 第 2 段同规则：文件名倒序第一个非 done
-        live.sort_by(|a, b| b.path.file_name().cmp(&a.path.file_name()));
-        live.truncate(1);
-    }
+    // `strict` 的收窄**不在这里做**：归属要由 resolve 判定（见 `check_strict`），
+    // 在此处按文件名截断就是那个已废除的旧语义。此处只保留"只比一份"的形状 ——
+    // 具体那一份由调用方经 `only` 传进来。
+    let _ = scope;
     let mut out = Vec::new();
     for r in &live {
         let content = std::fs::read_to_string(&r.path).unwrap_or_default();
@@ -696,8 +707,62 @@ pub fn check(
         Changed::Staged(list) => list.clone(),
         Changed::Range(base) => diff_files(root, base)?,
     };
+    if scope == TouchScope::Strict {
+        return check_strict(root, &changed, only);
+    }
     let decls = collect_declarations(root, scope, only)?;
     Ok(check_changes(root, &decls, &changed))
+}
+
+/// `strict` 口径：只比**本次变更集归属的那一份**清单。
+///
+/// 归属复用 [`crate::resolve::judge`]（与门禁裁决同一份解析）—— 两处各写一套归属
+/// 逻辑，就等于制造第二个真相，而它们对"多份清单都声明了该文件"的取舍必然漂移。
+///
+/// 候选 ≠1 时报 [`TouchIssueKind::AmbiguousScope`] 并列出候选：**不猜**。旧实现在
+/// 此处静默取"文件名逆序第一份"，那个选法与本次改动无关 —— 别的清单的改动在
+/// strict 下就无人比对了（漏拦，且人以为 strict 更严）。
+fn check_strict(root: &Path, changed: &[String], only: Option<&str>) -> Result<Vec<TouchIssue>> {
+    let live = crate::resolve::live_snapshot(root)?;
+    let exempt = crate::gate::touch_exempt_patterns(root);
+    let hint = only.map(|s| s.to_string());
+    // 只取候选集：这里要的是"归属是谁"，不是"能不能写"（三段/评论/内容冻结一概不问）。
+    let owned = crate::resolve::owned_by(&live, changed, hint.as_deref(), &exempt);
+    let ids: Vec<String> = owned.iter().map(|r| r.id.clone()).collect();
+    if ids.len() != 1 {
+        let mut msg =
+            String::from("[req-guard] ⛔ 变更范围校验（strict 口径）无法确定该比哪一份清单。\n");
+        msg.push_str(&format!("  本次改动：{}\n", joined_paths(changed)));
+        msg.push_str(&format!(
+            "  归属候选：{}（共 {} 份）\n",
+            if ids.is_empty() {
+                "（无 —— 没有任何已批清单声明这些路径）".to_string()
+            } else {
+                ids.join(", ")
+            },
+            ids.len()
+        ));
+        msg.push_str("  strict 口径要求「恰好一份」，处置三选一：\n");
+        msg.push_str("    1) 用 --req <需求ID> / HOOK_REQ=<ID> 显式指定本次改动所属的需求\n");
+        msg.push_str("    2) 补声明：本次改动属于某份清单 → req-guard touch --declare <ID> --glob \"<路径>\"\n");
+        msg.push_str("    3) 回到并集口径（默认）：把 touch.scope 设为 union\n");
+        return Ok(vec![TouchIssue::err(TouchIssueKind::AmbiguousScope, msg)]);
+    }
+    let decls = collect_declarations(root, TouchScope::Union, Some(&ids[0]))?;
+    Ok(check_changes(root, &decls, changed))
+}
+
+fn joined_paths(changed: &[String]) -> String {
+    let v: Vec<&str> = changed
+        .iter()
+        .map(|p| p.as_str())
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    if v.is_empty() {
+        "（空变更集）".to_string()
+    } else {
+        v.join(", ")
+    }
 }
 
 /// `touch --declare`：向清单的声明块**追加** glob（去重保序），并按配置打回技术方案。
@@ -924,6 +989,164 @@ mod tests {
     }
 
     // ---------- declared ----------
+
+    // ---------- strict 口径（REQ-006 P3）----------
+
+    /// 造一份带 TOUCH 声明的清单，供 strict 口径用例复用。
+    fn req_with_touch(dir: &std::path::Path, id: &str, status: &str, declares: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut s = format!(
+            "# {id} 测试\n\n<!-- GATE:HEAD id={id} status=approved created=2026-10-04 -->\n"
+        );
+        for (k, l) in crate::requirement::STEPS.iter() {
+            s.push_str(&format!(
+                "<!-- GATE:STEP name={k} label={l} status={status} reviewer=- updated=- -->\n"
+            ));
+        }
+        s.push_str("\n## 1. 需求分解\n\n- 背景：夹具。\n\n## 2. 技术方案\n\n- 思路：夹具。\n\n");
+        s.push_str("<!-- GATE:TOUCH -->\n");
+        for d in declares {
+            s.push_str(&format!("{d}\n"));
+        }
+        s.push_str("<!-- /GATE:TOUCH -->\n\n## 3. 测试计划\n\n- 计划：夹具。\n");
+        std::fs::write(dir.join(format!("{id}.md")), s).unwrap();
+    }
+
+    #[test]
+    fn strict_归属恰好一份时只比那一份() {
+        let root = crate::testutil::temp_dir("touch-strict-one");
+        let dir = root.join(crate::requirement::REQ_DIR);
+        req_with_touch(&dir, "REQ-001", "approved", &["src/**"]);
+        req_with_touch(&dir, "REQ-002", "approved", &["docs/**"]);
+        crate::testutil::disable_auth(&root);
+        let issues = check(
+            &root,
+            TouchScope::Strict,
+            None,
+            &Changed::Staged(vec!["src/a.rs".to_string()]),
+        )
+        .unwrap();
+        assert!(
+            !has_errors(&issues),
+            "恰好一份归属且该份声明覆盖 → 应放行：{issues:?}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    #[test]
+    fn strict_归属多份时报AmbiguousScope而非静默截断() {
+        // 旧实现在此静默取「文件名逆序第一份」：REQ-001 的实际改动在 strict 下
+        // 无人比对，而人以为 strict 更严 —— 失效方向是漏拦。
+        let root = crate::testutil::temp_dir("touch-strict-many");
+        let dir = root.join(crate::requirement::REQ_DIR);
+        req_with_touch(&dir, "REQ-001", "approved", &["src/**"]);
+        req_with_touch(&dir, "REQ-002", "approved", &["src/**"]);
+        crate::testutil::disable_auth(&root);
+        let issues = check(
+            &root,
+            TouchScope::Strict,
+            None,
+            &Changed::Staged(vec!["src/a.rs".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.kind == TouchIssueKind::AmbiguousScope)
+                .count(),
+            1,
+            "两份已批清单都声明了该路径 → 必须报归属不唯一：{issues:?}"
+        );
+        let msg = &issues[0].message;
+        for kw in ["REQ-001", "REQ-002", "--req", "union"] {
+            assert!(msg.contains(kw), "须含「{kw}」：\n{msg}");
+        }
+        crate::testutil::cleanup(&root);
+    }
+
+    #[test]
+    fn strict_无从归因时报AmbiguousScope() {
+        let root = crate::testutil::temp_dir("touch-strict-none");
+        let dir = root.join(crate::requirement::REQ_DIR);
+        req_with_touch(&dir, "REQ-001", "approved", &["src/**"]);
+        req_with_touch(&dir, "REQ-002", "approved", &["docs/**"]);
+        crate::testutil::disable_auth(&root);
+        let issues = check(
+            &root,
+            TouchScope::Strict,
+            None,
+            &Changed::Staged(vec!["zzz/a.rs".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(issues[0].kind, TouchIssueKind::AmbiguousScope, "{issues:?}");
+        assert!(
+            issues[0].message.contains("没有任何已批清单声明"),
+            "{}",
+            issues[0].message
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    #[test]
+    fn strict_显式指定收窄到那一份() {
+        let root = crate::testutil::temp_dir("touch-strict-req");
+        let dir = root.join(crate::requirement::REQ_DIR);
+        req_with_touch(&dir, "REQ-001", "approved", &["src/**"]);
+        req_with_touch(&dir, "REQ-002", "approved", &["docs/**"]);
+        crate::testutil::disable_auth(&root);
+        // 指定 REQ-001 后，docs/** 下未声明的文件就该按 REQ-001 的声明判 → 未声明 → 拦
+        let issues = check(
+            &root,
+            TouchScope::Strict,
+            Some("REQ-002"),
+            &Changed::Staged(vec!["docs/x.md".to_string()]),
+        )
+        .unwrap();
+        assert!(
+            !has_errors(&issues),
+            "指定对的那份且已声明 → 放行：{issues:?}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    #[test]
+    fn strict_单需求仓库退化为并集语义() {
+        // G4：单需求仓库里 strict 不该比 union 更严（改造前 strict 会截断到唯一那份，
+        // 等价；这里锁住"不因为换了实现就变了语义"）。
+        let root = crate::testutil::temp_dir("touch-strict-single");
+        let dir = root.join(crate::requirement::REQ_DIR);
+        req_with_touch(&dir, "REQ-001", "approved", &["src/**"]);
+        crate::testutil::disable_auth(&root);
+        let changed = vec!["docs/x.md".to_string()];
+        let strict = check(
+            &root,
+            TouchScope::Strict,
+            None,
+            &Changed::Staged(changed.clone()),
+        )
+        .unwrap();
+        let union = check(&root, TouchScope::Union, None, &Changed::Staged(changed)).unwrap();
+        assert_eq!(
+            strict
+                .iter()
+                .filter(|i| i.kind == TouchIssueKind::AmbiguousScope)
+                .count(),
+            0,
+            "唯一 live 时不得报归属不唯一：{strict:?}"
+        );
+        assert_eq!(
+            strict
+                .iter()
+                .filter(|i| i.kind == TouchIssueKind::NotDeclared)
+                .count(),
+            union
+                .iter()
+                .filter(|i| i.kind == TouchIssueKind::NotDeclared)
+                .count(),
+            "单需求下 strict 与 union 判定一致"
+        );
+        crate::testutil::cleanup(&root);
+    }
 
     #[test]
     fn declared_解析去注释去重保序() {

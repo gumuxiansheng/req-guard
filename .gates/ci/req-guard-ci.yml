@@ -41,9 +41,11 @@ jobs:
       #
       #   C. 或缓存二进制：git clone 后 cargo build --release
 
-      # L3：硬拦截判定（§4.3）。三段未全批 / 有未解决阻塞评论 / 无清单 → 退出码 1，CI 红。
+      # L3：硬拦截判定（§4.3）。裁决对象是**本次变更集**（--base），故对多需求仓库
+      # 也能按需求归因：无变更集就无从归因，会恒拦（裸 `check` 在多份未归档清单下即如此）。
+      # 未过审 / 有未解决阻塞评论 / 内容冻结被破坏 / 无法归因 → 退出码 1，CI 红。
       - name: req-guard check（未过审即失败）
-        run: ./req-guard check
+        run: ./req-guard check --base "origin/${{ github.base_ref || 'main' }}"
 
       # 验收标准机械校验（core/src/ac.rs 的 A1–A12）：第 3 段的 AC 必须编号连续、
       # Given/When/Then 齐备且可度量。有硬伤退出码 1，CI 红。

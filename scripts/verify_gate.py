@@ -107,12 +107,27 @@ if not SH:
     )
 
 
-def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=None, env=None):
-    """在独立临时目录里跑一次拦截脚本，返回退出码。"""
+def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=None, env=None,
+        git=True):
+    """在独立临时目录里跑一次拦截脚本，返回退出码。
+
+    REQ-006 P2 起脚本**只取参与渲染**，判定在 `req-guard check`（core），
+    故本函数必须做两件事，否则每个场景都会 exit 1（假通过）：
+
+    1. `git init`：无变更集上下文时脚本走 `check --staged`，它回落
+       `git diff --cached` —— 非 git 目录会报错并被当成拦截。空索引的
+       `git diff --cached` 退出码为 0 且输出为空，于是单需求仓库的语义
+       与改造前逐字一致（这正是 G4 兼容性门槛要的）。
+    2. 把 `BIN_DIR` 塞进 PATH：判定在 core，缺二进制即 fail-closed。
+    """
     work = Path(tempfile.mkdtemp(prefix="reqguard-")) / name
     (work / Path(HOOK_REL).parent).mkdir(parents=True)
     (work / REQ_DIR).mkdir(parents=True)
     (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+    if git:
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+    env = dict(env or os.environ)
+    env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
 
     if req_content:
         (work / REQ_DIR / "REQ-001.md").write_text(req_content, encoding="utf-8")
@@ -824,6 +839,128 @@ for name, req, cmts, bp, stdin_data, expect, extra in CASES:
     print(f"{'PASS' if good else 'FAIL'}  {name}: exit={rc} (期望 {expect})")
 
 
+def verify_draft_contract() -> bool:
+    """REQ-010 P0/P1：草稿通道三条约束 + 三处文案（AC-012 / AC-013）。
+
+    为什么这些必须进本脚本（而不是只靠 Rust 单测）：单测里注释掉校验，
+    `cargo test` 当然会红 —— 但那是**编译不过**，不是门禁漂移。
+    AC-013 要的是"校验被注掉后本脚本退出码非 0"：即文案与校验的对应关系
+    要能被机械检出，否则 `--help`/README 里写着三条约束、实际只拦两条，
+    用户没有任何途径察觉。
+    """
+    ok = True
+    prose = "第一行。\n第二行。\n第三行。\n"
+    draft_dir = ".gates/drafts"
+
+    def make_frozen_req() -> str:
+        """造一份「三段已批 + 有 TOUCH 声明 + 各段有散文」的清单。
+
+        这里**不能**用 `make_req`：那份三段全空、且无 `GATE:TOUCH`。后果有二 ——
+        apply 会先被"没有有效变更范围声明"拦下，于是 D1 的 exit=1 来自**另一条**校验，
+        断言就成了自证（把多段校验注掉，D1 照样 PASS）。有散文才能让"草稿比原段短"
+        这条真正成为唯一拦下它的原因。
+        """
+        lines = [
+            "# REQ-001 用户登录改造",
+            "",
+            "<!-- GATE:HEAD id=REQ-001 status=draft created=2026-09-09 -->",
+        ]
+        for name, label in (
+            ("decomposition", "需求分解"),
+            ("solution", "技术方案"),
+            ("testplan", "测试计划"),
+        ):
+            lines.append(
+                f"<!-- GATE:STEP name={name} label={label} status=approved "
+                "reviewer=t updated=- -->"
+            )
+            lines.append("")
+        lines.append("## 1. 需求分解")
+        lines += ["", "- 背景：原始内容。", ""]
+        lines.append("## 2. 技术方案")
+        lines += ["", "<!-- GATE:TOUCH -->", "src/**", "<!-- /GATE:TOUCH -->", ""]
+        lines += [prose, ""]
+        lines.append("## 3. 测试计划")
+        lines += ["", prose, ""]
+        return "\n".join(lines) + "\n"
+
+    req = make_frozen_req()
+    # 草稿散文**刻意与清单当前散文不同**但行数相同：
+    # 若内容相同，apply 会先被"内容完全相同，不做任何事"拦下 —— 那 D1 的
+    # exit=1 又变成自证（换任何校验都会红）。断言要能唯一归因，
+    # 前提是除被测校验外**其它校验都应当通过**。
+    new_prose = "改后的第一行。\n改后的第二行。\n改后的第三行。\n"
+
+    def apply_with(draft_text: str, step: str = "solution", sid: str = "draft"):
+        work = Path(tempfile.mkdtemp(prefix="reqguard-")) / sid
+        (work / Path(HOOK_REL).parent).mkdir(parents=True)
+        (work / REQ_DIR).mkdir(parents=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        (work / REQ_DIR / "REQ-001.md").write_text(req, encoding="utf-8")
+        (work / draft_dir).mkdir(parents=True)
+        (work / draft_dir / "REQ-001.draft.md").write_text(draft_text, encoding="utf-8")
+        # 沙箱 L0：审批锁在 L3 下会拒绝 AI 自批（那是设计意图，不能在验证里绕开语义）
+        (work / ".gates" / "req-guard.yaml").write_text("level: 0\n", encoding="utf-8")
+        env = dict(os.environ)
+        env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
+        rc = subprocess.run(
+            [str(BIN), "apply", "REQ-001", "--step", step,
+             "--reviewer", "寇工", "--comment", "改完了"],
+            cwd=work, capture_output=True, text=True, env=env, **RUN_KW,
+        ).returncode
+        shutil.rmtree(work.parent, ignore_errors=True)
+        return rc
+
+    # ① 多段草稿 -> 拒（退出码非 0）
+    # 关键：两段各自都写满与原段等长的散文。写成 "甲。" 会让 exit=1 来自
+    # "草稿比原段短"那条校验 —— 那 D1 就是自证：把多段校验注掉，它照样 PASS。
+    # 断言要能唯一归因，多段草稿本身就得是**合法**的（只是段数超一条）。
+    multi = "{step=solution}\n" + new_prose + "\n{step=testplan}\n" + new_prose
+    rc = apply_with(multi, sid="multi")
+    good = rc != 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  D1_apply拒多段草稿: exit={rc} (期望非0)")
+
+    # ② 重复段名 -> 拒（AC-009）
+    rc = apply_with("{step=solution}\n" + new_prose + "{step=solution}\n" + new_prose, sid="dup")
+    good = rc != 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  D2_apply拒重复段名: exit={rc} (期望非0)")
+
+    # ③ 草稿含 GATE 块标记 -> 拒（AC-003）
+    rc = apply_with("{step=solution}\n" + new_prose + "<!-- GATE:AC -->\n", sid="gatein")
+    good = rc != 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  D3_apply拒草稿内GATE块: exit={rc} (期望非0)")
+
+    # ④ 草稿短于原段 -> 拒（AC-005 / AC-011）
+    rc = apply_with("{step=solution}\n只有一行。\n", sid="short")
+    good = rc != 0
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  D4_apply拒短草稿: exit={rc} (期望非0)")
+
+    # ⑤ 三处文案同时含关键句（AC-012 / U-07）
+    # `--help` 走 stderr 且退出码为 2（clap 惯例），故 stdout+stderr 都要看 ——
+    # 只读 stdout 会把"文案其实存在"误判成缺失。
+    h = subprocess.run([str(BIN), "--help"], capture_output=True, text=True, **RUN_KW)
+    help_txt = h.stdout + h.stderr
+    readme = (ROOT / ".gates" / "README.md").read_text(encoding="utf-8")
+    # 草稿文件头 = `DRAFT_CONTRACT`，由 write_draft 写在**第一行**。
+    # 这里从源码里读常量本身，而不是再抄一份 —— 抄的那份必然漂移，
+    # 而漂移正是 AC-013 要机械检出的东西。
+    req_src = (ROOT / "core" / "src" / "requirement.rs").read_text(encoding="utf-8")
+    m = re.search(r'pub const DRAFT_CONTRACT: &str = "\\\n(.*?)";', req_src, re.S)
+    draft_head = m.group(1) if m else ""
+    missing = [f"{where_}:{kw}" for where_, text in
+               (("--help", help_txt), (".gates/README.md", readme), ("草稿文件头", draft_head))
+               for kw in ("草稿", "散文", "一次") if kw not in text]
+    good = not missing
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  D5_三处文案含草稿契约: "
+          + ("齐全" if good else f"缺 {missing}"))
+    return ok
+
+
 def verify_pre_commit_fail_closed() -> bool:
     """11_pre_commit缺失脚本即拦截（fail-closed，§4.2）。
 
@@ -859,6 +996,7 @@ ok = ok and verify_content_freeze()
 ok = ok and verify_amend_gate()
 ok = ok and verify_install_exempt()
 ok = ok and verify_fenced_boundary()
+ok = ok and verify_draft_contract()
 ok = ok and verify_section_gate()
 
 
@@ -881,9 +1019,14 @@ def verify_deny_wrapper() -> bool:
         (work / deny_rel).parent.mkdir(parents=True, exist_ok=True)
         (work / deny_rel).write_text(DENY_HOOK, encoding="utf-8")
         (work / REQ_DIR / "REQ-001.md").write_text(make_req(status), encoding="utf-8")
+        # 与 `run()` 同款两件套：git init（`check --staged` 要 git diff --cached）
+        # + PATH 里有 req-guard（判定在 core，缺二进制即 fail-closed）。
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        denv = dict(os.environ)
+        denv["PATH"] = str(BIN_DIR) + os.pathsep + denv.get("PATH", "")
         r = subprocess.run(
             [SH, str(work / deny_rel)], cwd=work, capture_output=True, text=True,
-            stdin=subprocess.DEVNULL, **RUN_KW,
+            stdin=subprocess.DEVNULL, env=denv, **RUN_KW,
         )
         shutil.rmtree(work, ignore_errors=True)
         good = r.returncode == expect
@@ -939,6 +1082,167 @@ if BIN.exists():
     print(f"{'PASS' if good else 'FAIL'}  {name16}: exit={code16} (期望 1)")
 else:
     print(f"SKIP  {name14}: 未构建 {BIN}（先执行 cargo build）")
+
+# ============================================================================
+# REQ-006 P2 场景组：多需求并行的门禁裁决（编号实施时取verify_gate.py 最大号 +1）
+# ----------------------------------------------------------------------------
+# 既有 1–18 与 19–40 号场景**一个都没改期望值**，它们现在跑的是「脚本 → check --staged
+# → core」这条真实链路（`run()` 里的 git init + PATH 两件套就是为此）。
+# 下面这组只测**新增**行为：多需求裁决、hint 消歧、委托接线、fail-closed。
+# ============================================================================
+
+
+def make_req_with_touch(req_id: str, status: str, declares) -> str:
+    """造一份带 `GATE:TOUCH` 声明的清单（反查索引的数据源）。"""
+    block = (
+        "<!-- GATE:TOUCH -->\n" + "".join(f"{d}\n" for d in declares) + "<!-- /GATE:TOUCH -->\n"
+        if declares
+        else ""
+    )
+    return make_req(status).replace("REQ-001", req_id) + (
+        f"\n## 1. 需求分解\n\n- 背景：本场景夹具。\n\n## 2. 技术方案\n\n- 思路：夹具。\n\n"
+        + block
+        + "\n## 3. 测试计划\n\n- 计划：夹具。\n"
+    )
+
+
+def verify_multi_gate() -> bool:
+    """REQ-006 新增场景组。判定全在 core，本组测的是「脚本接线 + 多需求语义」。"""
+    if not BIN.exists():
+        print(f"SKIP  REQ-006_多需求裁决: 未构建 {BIN}")
+        return True
+
+    ok = True
+    doc = ".gates/requirements/REQ-001.md"
+
+    def one(name, files, payload_path=None, expect=1, hint=None):
+        """files: {相对路径: 内容}；payload_path: 用 payload 形态喂给脚本。"""
+        nonlocal ok
+        work = Path(tempfile.mkdtemp(prefix=f"reqguard-{name}-")) / name
+        (work / Path(HOOK_REL).parent).mkdir(parents=True, exist_ok=True)
+        (work / REQ_DIR).mkdir(parents=True)
+        (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+        for rel, content in files.items():
+            dst = work / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+        env = dict(os.environ)
+        env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
+        if hint:
+            env["HOOK_REQ"] = hint
+        if payload_path:
+            stdin_data = json.dumps(
+                {"tool_input": {"file_path": payload_path}}, ensure_ascii=False
+            )
+            r = subprocess.run(
+                [SH, str(work / HOOK_REL)], cwd=work, capture_output=True, text=True,
+                input=stdin_data, env=env, **RUN_KW,
+            )
+        else:
+            r = subprocess.run(
+                [str(BIN), "check"], cwd=work, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, env=env, **RUN_KW,
+            )
+        shutil.rmtree(work.parent, ignore_errors=True)
+        good = r.returncode == expect
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {name}: exit={r.returncode} (期望 {expect})")
+        return r
+
+    a_ok = make_req_with_touch("REQ-001", "approved", ["core/src/**"])
+    a_pending = make_req_with_touch("REQ-001", "pending", ["core/src/**"])
+    b_ok = make_req_with_touch("REQ-002", "approved", ["cli/src/**"])
+
+    # ① 互锁回归（G2）：已批 A + 未批 B，写 A 范围内 → 放行。
+    #    改造前会被逆序第一个（B 或 A）误锁，与"正在做哪份"无关。
+    one("R6_g2_已批范围内不因无关未批清单被拦",
+        {doc: a_ok, ".gates/requirements/REQ-002.md": a_pending.replace("REQ-001", "REQ-002")},
+        payload_path="core/src/a.rs", expect=0)
+
+    # ② 漏拦回归（G1）：未批 A + 已批 B，写 A 声明范围内 → 拦。
+    #    改造前抽中已批的 B 就放行，AI 在零审批清单上写代码而门禁显示绿灯。
+    one("R6_g1_未批清单范围内必须拦",
+        {doc: a_pending, ".gates/requirements/REQ-002.md": b_ok},
+        payload_path="core/src/a.rs", expect=1)
+
+    # ③ 歧义分支：多份 live 且无任何已批清单声明该路径 → 拦，且文案含三张牌。
+    r = one("R6_g3_无从归因报歧义并给出路",
+            {doc: a_ok, ".gates/requirements/REQ-002.md": b_ok},
+            payload_path="docs/x.md", expect=1)
+    for kw in ("touch --declare", "--req", "req-guard done"):
+        if kw not in (r.stderr + r.stdout):
+            print(f"      ↳ 歧义文案缺出路「{kw}」")
+            ok = False
+
+    # ④ hint 消歧：同一歧义场景，HOOK_REQ 指定那份 → 放行。
+    one("R6_g4_HOOK_REQ消歧放行",
+        {doc: a_ok, ".gates/requirements/REQ-002.md": b_ok},
+        payload_path="docs/x.md", expect=0, hint="REQ-001")
+
+    # ⑤ hint 不相交：指定的清单与本次改动无关 → 拦（hint 不是绕过口）。
+    one("R6_g5_HOOK_REQ不相交则拦",
+        {doc: a_ok, ".gates/requirements/REQ-002.md": b_ok},
+        payload_path="core/src/a.rs", expect=1, hint="REQ-002")
+
+    # ⑥ 委托接线（反回归）：脚本必须委��� core，且不再自带任何裁决。
+    for needle, should in (("req-guard check --stdin", True),
+                           ("req-guard check --staged", True),
+                           ("sort -r", False), ("GATE:STEP", False),
+                           ("verify-content", False), ("expires_epoch=", False)):
+        present = needle in HOOK
+        good = present == should
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  R6_g6_委托接线[{needle}]: "
+              f"{'存在' if present else '不存在'} (期望{'存在' if should else '不存在'})")
+
+    # ⑦ fail-closed：PATH 里没有 req-guard → 拦，且给出可操作指引。
+    work = Path(tempfile.mkdtemp(prefix="reqguard-R6_g7-")) / "g7"
+    (work / Path(HOOK_REL).parent).mkdir(parents=True)
+    (work / REQ_DIR).mkdir(parents=True)
+    (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+    (work / REQ_DIR / "REQ-001.md").write_text(a_ok, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+    bare = {"PATH": "/nonexistent-for-req-guard"}
+    r = subprocess.run([SH, str(work / HOOK_REL)], cwd=work, capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, env=bare, **RUN_KW)
+    shutil.rmtree(work.parent, ignore_errors=True)
+    good = r.returncode == 1 and "PATH" in (r.stdout + r.stderr)
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  R6_g7_缺二进制fail_closed: exit={r.returncode} (期望 1 且提示 PATH)")
+
+    # ⑧ pre-commit 链路：脚本走 --staged，验证"取到的路径集正确"而不只是"core 判得对"。
+    #    必须放**两份** live：单需求仓库里未声明的路径按 R7 放行（G4 兼容性 ——
+    #    改造前门禁也从不看路径），那样这条场景就测不出取参是否正确了。
+    work = Path(tempfile.mkdtemp(prefix="reqguard-R6_g8-")) / "g8"
+    (work / Path(HOOK_REL).parent).mkdir(parents=True)
+    (work / REQ_DIR).mkdir(parents=True)
+    (work / HOOK_REL).write_text(HOOK, encoding="utf-8")
+    (work / REQ_DIR / "REQ-001.md").write_text(a_ok, encoding="utf-8")
+    (work / REQ_DIR / "REQ-002.md").write_text(b_ok, encoding="utf-8")
+    (work / "core" / "src").mkdir(parents=True)
+    (work / "core" / "src" / "a.rs").write_text("x\n")
+    (work / "docs").mkdir()
+    (work / "docs" / "x.md").write_text("x\n")
+    subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+    env = dict(os.environ)
+    env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+    rc_all = subprocess.run([SH, str(work / HOOK_REL)], cwd=work, capture_output=True,
+                            text=True, stdin=subprocess.DEVNULL, env=env, **RUN_KW).returncode
+    subprocess.run(["git", "rm", "-q", "--cached", "-r", "core"], cwd=work, check=True)
+    rc_undeclared = subprocess.run([SH, str(work / HOOK_REL)], cwd=work, capture_output=True,
+                                   text=True, stdin=subprocess.DEVNULL, env=env, **RUN_KW).returncode
+    shutil.rmtree(work.parent, ignore_errors=True)
+    good = rc_undeclared == 1
+    ok = ok and good
+    print(f"{'PASS' if good else 'FAIL'}  R6_g8_pre-commit取参: "
+          f"仅暂存已批声明内={rc_all}(期望0) 仅暂存未声明={rc_undeclared}(期望1)")
+
+    return ok
+
+
+ok = ok and verify_multi_gate()
 
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)

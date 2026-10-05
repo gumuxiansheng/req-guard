@@ -113,3 +113,29 @@ req-guard bypass --reason "线上故障热修，事后补审" --ttl 60
 - **gates-toolkit**：代码质量门禁（提交时查 SQL/Java 规范）——管"写得对不对"。
 - **AI 需求门禁**：流程门禁（写代码前查审核）——管"该不该写"。
 - 两者互补；req-guard 生成时把 AI 门禁**追加**在 gates-toolkit 的 pre-commit 之后，不覆盖。
+
+## 草稿叠加区与 `apply`（修订已批准的段）
+
+改一段**已批准**的清单时，走草稿通道：`amend` 打回待审 → AI 把拟改正文写进
+`.gates/drafts/<需求ID>.draft.md` → 审核人用**一条命令**完成「应用 + 重新批准 + 绑定新摘要」。
+
+```bash
+req-guard token issue --req REQ-001 --step solution     # L3 票据，一次一动作
+req-guard amend  REQ-001 --step solution --token <票据> --comment "要改什么、为什么"
+# AI 写草稿：{step=solution}\n<该段拟替换的正文>
+req-guard apply  REQ-001 --step solution --token <票据> --comment "改完了"
+```
+
+草稿通道有三条硬约束（`apply` 会逐条校验，违反即拒且**不落盘**）：
+
+1. **草稿只写散文** —— `GATE:TOUCH` / `GATE:AC` / `GATE:AUDIT` 等块由 `req-guard` 维护，
+   草稿里的块标记不生效、还会把位置错位。块内条目（如验收标准）请**直接编辑清单**。
+2. **一次只应用一段** —— 草稿含多段会被 `apply` 拒绝；此前会被"应用一段后删掉整份草稿"
+   静默吃掉其余段。请把草稿裁剪成只留目标段，逐段应用。
+3. **草稿必须整段重写** —— 通道按行位置覆盖：草稿短于原段时原段尾部散文会被丢弃
+   （`apply` 已改为直接拒绝）；草稿长出的行落在该段**末尾**，无法在段中间插入。
+   `apply` 成功时会报出多出几行。
+
+> 校验期间草稿若被改动（编辑器保存、另一个进程），`apply` 会在写盘前发现并拒绝 ——
+> 落盘的一定是**你看到的那份**草稿。
+
