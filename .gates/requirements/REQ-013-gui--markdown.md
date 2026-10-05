@@ -14,38 +14,36 @@ source_refs: [gui/src, gui, Cargo.lock, docs/设计]
 > 正文可自由编辑，但**请勿手工修改 GATE 行**（请用 `req-guard approve`）。
 
 <!-- GATE:HEAD id=REQ-013 status=approved created=2026-10-05_12:24:29 -->
-<!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_12:34:25 sum=31ece5474a313bd73994400aa4015d4eca5a5a0385b1e83cf4b78470bb0d6cef -->
-<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_12:34:34 sum=3a8e1e94c75cf8b5661597bef934c00374ad9b81ac9ad49645b5c643874dff11 -->
-<!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_12:34:50 sum=9c21c72a8900134f5a96be4d24b9fa40b0df28b2c5192625ca011fe0eb9e8687 -->
+<!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:41:58 sum=222a737de6077b8a48eef7bb39ff7c0b66cec9a7b415b0020f8e1be8cccf6d42 -->
+<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:47:24 sum=9f6c482c27c958a91cbfbf38b270536f9c140b8d13a7d273526a32a6e8269bdf -->
+<!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:45:40 sum=a5f178e0280d3d40bbf59cc0682b3a9e441bf25ef94f25ad6c7a9e17a85dadda -->
 
 ## 1. 需求分解
 
 ### 背景与问题
 
-GUI 正文由 `gui/src/markdown.rs` 的**自研零依赖渲染器**画出（不引整包渲染器的理由与
-取舍见 `docs/设计/UI架构细化方案.md` §4.4）。审核人反馈两条：**排版观感简陋**、**解析在边界写法上不稳**。
-逐条查证如下（均为本地实测，不是推测）：
+GUI 正文由 `gui/src/markdown.rs` 渲染（解析用 `pulldown-cmark`，渲染与安全纪律自研）。
+本清单起因于审核人的两条反馈：**排版观感简陋**、**解析在边界写法上不稳**。
+第一至五条已在本轮修完，第六、七条是**实现过程中被自身测试与审核人实测暴露出来的相邻缺陷**，
+一并纳入本次范围（两者的修复都已落地并各有判决性用例）。
 
-1. **行宽没有上限，正文被拉到整屏宽**。`render_center`（`gui/src/app.rs:800`）把整个中央栏交给
-   `markdown::show`（`gui/src/app.rs:873`），`show` 直接用 `ui.available_width()` 当版心
-   （`gui/src/markdown.rs:1113`）。窗口默认 1000×680、拉宽到 1400 后中央栏就有 1200+px，
-   一行能塞 50 多个汉字——中文正文舒适区是 30–40 字/行，超过就"扫行时找不到下一行开头"。
-   表格、段落、列表因此全都按同一个过宽的版心折行。
+1. **行宽没有上限，正文被拉到整屏宽**。`render_center`（`gui/src/app.rs`）把整个中央栏交给
+   `markdown::show`，而 `show` 直接用 `ui.available_width()` 当版心。窗口默认 1000×680、
+   拉宽到 1400 后中央栏就有 1200+px，一行能塞 50 多个汉字——中文正文舒适区是 30–40 字/行，
+   超过就"扫行时找不到下一行开头"。表格、段落、列表因此全都按同一个过宽的版心折行。
 
-2. **列表缩进不随层级变化**。`LIST_INDENT_W` 是一个**常量 16px**
-   （`gui/src/markdown.rs:1073`），`list_block` 每层都只加这一个常量，于是"外层项"与"内层项"
-   的符号左边缘差 16px、但正文起点也只差 16px，两层挤在一起看不出层级；有序列表编号
-   `format!("{}.", …)`（`gui/src/markdown.rs:800`）宽度随位数变化，"9." 与 "10." 的正文起点不同。
+2. **列表缩进不随层级变化**。`LIST_INDENT_W` 是一个常量 16px，`list_block` 每层都只加这一个
+   常量，于是外层项与内层项的正文起点只差 16px，两层挤在一起看不出层级；有序列表编号
+   `format!("{}.", …)` 宽度随位数变化，"9." 与 "10." 的正文起点不同。
 
-3. **块间距与标题层级都是单一常量**。块间距一律 `add_space(6.0)`
-   （`gui/src/markdown.rs:731`），标题 1–4 级只改字号（`gui/src/markdown.rs:741`）、不区分色阶，
+3. **块间距与标题层级都是单一常量**。块间距一律 6px；标题 1–4 级只改字号、不区分色阶，
    于是一屏里"标题 / 段落 / 列表 / 表格"的呼吸感完全一样；标题里的 `**粗**` 与 `` `码` ``
-   还被 `inline_text` 拍平成纯文本（`gui/src/markdown.rs:748`），行内样式在标题里直接丢失。
+   还被 `inline_text` 拍平成纯文本，行内样式在标题里直接丢失。
 
 4. **解析层是手写状态机，只覆盖"够用"子集**。REQ-011 已修掉表格竖线与列宽两个缺陷，
-   但解析器本身仍不实现 GFM：setext 标题（`===` / `---` 底划）、autolink（裸 URL）、
-   HTML 实体（`&lt;`）、列表项懒续行、表格缺格补齐等都没有；`<!-- GATE:… -->` 的隐藏、
-   `cells_of` 的反引号等长闭合、任务列表勾选态，全靠这 500 余行自研代码维持。
+   但解析器本身仍不实现 GFM：setext 标题、autolink、HTML 实体、列表项懒续行、表格缺格补齐
+   等都没有；`<!-- GATE:… -->` 的隐藏、单元格内代码段的等长反引号闭合、任务列表勾选态，
+   全靠 500 余行自研代码维持。
 
 5. **换库这件事本身有实测坑，不能一把梭**。实测 `pulldown-cmark 0.13.4`
    （`Options` 开 `ENABLE_TABLES | ENABLE_TASKLISTS | ENABLE_STRIKETHROUGH`）直接解析
@@ -63,11 +61,26 @@ GUI 正文由 `gui/src/markdown.rs` 的**自研零依赖渲染器**画出（不�
    即：**换库必须带一层预归一化**，否则会用"更规范的解析器"换来"内容丢失"——
    对门禁工具来说，"看不见"比"难看"严重得多。
 
+6. **短表格下方会出现一整屏空白**（审核人实测截图）。成因：`table()` 给横向 `ScrollArea`
+   写了 `.auto_shrink([true, false])`。该 ScrollArea 没开纵向滚动，而 egui 里
+   "方向未开 + `auto_shrink=false`"对应 `inner_size.y = max(可用高, 内容高)` ——
+   **两行的短表格也占满整屏高度**，其后的段落被顶到视口外（离屏实测：那段文字**根本没被画出来**，
+   滚下去才看见）。这条缺陷 REQ-011 就带着，只是此前正文窄、表格常在折叠段里，没被看到；
+   版心收口后表格与后续段落挨得更近，问题被顶到眼前。
+
+7. **切换审核段时视口停在"新段的中段"**（审核人实测："展示的内容不是从头开始"）。
+   两帧离屏模拟量到的数字：第 1 段展开且滚动偏移 1800 时内容高 5159；点第 2 段标题后
+   第 1 段收起，内容高降到 3993，而 **ScrollArea 的偏移被原样保留在 1800** ——
+   第 2 段的标题被推到屏幕 y=2144（视口仅 600 高），视口正好停在第 2 段正文的中段。
+   成因在 `render_center`：`app.step` 一变，上一段正文收起（内容变矮），但滚动位置没人管。
+   这不是本轮改动引入的（是"点哪一段就看哪一段"的老问题），但本轮把正文排版修好之后，
+   它成了审核人 daily 流程里最硌手的一处，一并修。
+
 ### 目标
 
 - **G1 版心宽度有上限**：正文折行宽度 = `min(ui.available_width(), MEASURE_W)`，
   `MEASURE_W = 680px`（≈ 34 个汉字，符合中文舒适区）；窄面板时仍取可用宽，不出现横向滚动。
-- **G2 版心水平居中**：正文块左右留白差 < 1px（宽屏下不再"贴左 + 右侧一大片空白"）。
+- **G2 版心水平居中**：版心左右留白差 < 1px（宽屏下不再"贴左 + 右侧一大片空白"）。
 - **G3 列表层级可读**：每深入一层缩进 +16px；有序编号按本列表最大位数右对齐，
   同一列表内各项正文起点一致；块间距按块类型分级（不再一律 6px）。
 - **G4 标题层级可辨**：1–2 级用正文色 + 粗体，3–4 级用 `Tone::Muted.color(ui)` + 粗体
@@ -77,61 +90,69 @@ GUI 正文由 `gui/src/markdown.rs` 的**自研零依赖渲染器**画出（不�
   **保留 `Block` / `Inline` AST 与四条安全纪律**（链接不激活、图片不加载、HTML 注释隐藏、
   不丢内容）；REQ-011 的表格竖线三条验收必须**继续成立**（由预归一化保证）。
 - **G6 依赖增量可度量**：`pulldown-cmark` 以 `default-features = false` 引入，
-  新增传递依赖恰为 3 个（`bitflags` / `memchr` / `unicase`），release 二进制增量 ≤ 400KB。
+  新增传递依赖恰为 3 个（`bitflags` / `memchr` / `unicase`），release 二进制增量 ≤ 400KB
+  （实测 12,367,716 → 12,647,116 = +279,400 字节）。
+- **G7 表格不留大片空白**：短表格的高度等于其行高之和，其后的段落必须落在同一屏内可见
+  （离屏断言：表格底与下一段顶的间距 < 30px，且下一段必须被画出）。
+- **G8 切段后视口落在该段开头**：点击某段标题后，该段标题与其正文开头必须落在视口内；
+  外层 ScrollArea 补 `id_salt`，使滚动偏移的记忆不依赖"前面创建了几个控件"。
 
 ### 非目标
 
-- **N1** 不引语法高亮：`syntect`（实测其 `default` feature 走 **onig**（C 库），要用须
-  `default-features = false + default-fancy`，依赖面再扩一圈），代码块维持纯色文本。
-- **N2** 不引整包渲染器：`egui_extras 0.36.2` **已无 markdown 模块**（实测其模块表里只有
+- **N1** 不引语法高亮：`syntect`（实测其 `default` feature 走 onig（C 库），要用须
+  `default-features = false + default-fancy`），代码块维持纯色文本。
+- **N2** 不引整包渲染器：`egui_extras 0.36.2` 已无 markdown 模块（实测其模块表里只有
   `datepicker / syntax_highlighting / image / layout / loaders / sizing / strip / table`，
   依赖表里也没有 `pulldown-cmark`）——`docs/设计/UI架构细化方案.md` §4.4 那句"可引
   `egui_extras` / `egui_markdown`"已过时，本次一并更正；`egui_markdown` 在 crates.io 上
   只剩 0.1.0 / 175 下载的同名新包（非 emilk 的 0.7.x），不引；`egui_commonmark 0.25.0`
-  （1.96M 下载、活跃、`egui ^0.36`、表格/任务列表/删除线都支持）因**链接走
-  `ui.hyperlink_to`（backend `src/misc.rs:239`）且无开关**、默认 feature 含
-  `load-images`（`image` crate + file/http loader）、表格走 `egui::Grid`（会回归 REQ-011
-  记录的"最后一列吃剩余宽度"坑）而不引。
+  因链接走 `ui.hyperlink_to`（backend `src/misc.rs:239`）且无开关而不引。
 - **N3** 不改清单格式，不要求存量清单迁移，不改模板。
-- **N4** 不做"可点链接 / 图片加载 / 复制原文里的外链"——安全取舍（模块注释里的四条纪律）不动。
-- **N5** 不动 `core` / `cli` / `tui`；`cargo build`（default features）仍零 UI 依赖，
-  `pulldown-cmark` 只在 `--features gui` / `--features full` 下进入依赖图。
+- **N4** 不做"可点链接 / 图片加载"——安全取舍（模块注释里的四条纪律）不动。
+- **N5** 不动 `core` / `cli` / `tui`；`cargo build`（default features）仍零 UI 依赖。
 - **N6** 不追 GFM 全量：脚注、定义列表、front-matter 块不解析成正文（按原文/跳过处理）。
+- **N7** 不改 TUI 与左栏需求列表的滚动行为；G8 只管中央面板"点段标题 → 视口到该段开头"。
 
 ### 子任务拆解
 
 | 编号 | 子任务 | 预估工时 |
 | --- | --- | --- |
-| T1 | `show()` 入口收版心：`MEASURE_W` 常量 + `vertical_centered` + `set_max_width` | 0.5h |
-| T2 | 块间距分级：抽出间距常量表，标题前后 / 块间 / 列表项间分别取值 | 0.5h |
-| T3 | 列表层级缩进：`show` 内部引入 depth，有序编号按最大位数右对齐 | 1.5h |
+| T1 | `show()` 入口收版心：`MEASURE_W` 常量 + 限宽居中的子 ui（`scope_builder`，**不是** `new_child`） | 0.5h |
+| T2 | 块间距分级：抽出间距常量表，标题前后 / 块间分别取值 | 0.5h |
+| T3 | 列表层级缩进：符号列定宽 + 嵌套项从行左边缘算缩进 + 有序编号右对齐 | 1.5h |
 | T4 | 标题色阶（复用 `palette::Tone`）+ 标题内保留行内样式 | 1h |
 | T5 | `gui/Cargo.toml` 引入 `pulldown-cmark 0.13.4`（`default-features = false`） | 0.5h |
 | T6 | 预归一化器：表格行内代码段的**未转义**裸竖线加反斜杠（复用 `tick_run`/`tick_close`） | 1h |
 | T7 | 事件 → AST 映射替换 `parse()` 旧实现，删旧解析器（约 500 行 → 约 200 行） | 2h |
 | T8 | 单测：几何断言改基准 + 竖线三条走公开入口 + 归一化边界 4 例 + GATE 注释 / 链接降级 | 2h |
-| T9 | `docs/设计/UI架构细化方案.md` §4.4 更正（`egui_extras` 已无 markdown）+ 排版纪律表补 3 条 | 1h |
+| T9 | `docs/设计/UI架构细化方案.md` §4.4 更正 + 排版纪律表补 3 条 | 1h |
 | T10 | 判决性实验：关掉预归一化 / 把版心改回 `available_width()`，对应单测必须 FAIL | 0.5h |
+| T11 | `table()` 的横向 ScrollArea 改 `auto_shrink([true, true])`（高度跟内容走） | 0.5h |
+| T12 | `render_center`：切段时 `scroll_to_me` 到该段标题 + ScrollArea 补 `id_salt` | 0.5h |
+| T13 | 两条新缺陷的判决性用例：短表格间距离屏断言 + 两帧滚动模拟（偏移保留的形态） | 1.5h |
 
-合计 10.5h。T1–T4（排版，零新增依赖）可独立交付、独立回滚；T5–T7（解析层）是第二步，
-依赖 T6 先于 T7 落地。**顺序固定**：先排版后解析，这样第二步万一要回滚，不影响第一步的观感收益。
+合计 13.5h。T1–T4（排版，零新增依赖）可独立交付、独立回滚；T5–T7（解析层）是第二步；
+T11–T13 是实现期暴露的相邻缺陷，与 T1–T4 同批交付（T11 在渲染器内，T12 在 `app.rs`）。
 
 ### 影响范围
 
-- **模块**：`gui/src/markdown.rs`（渲染器主体）、`gui/Cargo.toml` + `Cargo.lock`（新增 1 条依赖）、
+- **模块**：`gui/src/markdown.rs`（渲染器主体）、`gui/src/app.rs`（**新增**：中央面板的
+  滚动位置与 ScrollArea id）、`gui/Cargo.toml` + `Cargo.lock`（新增 1 条依赖）、
   `docs/设计/UI架构细化方案.md`（§4.4 更正 + 排版纪律表）。
 - **接口**：`parse(src) -> Vec<Block>`、`show(ui, &[Block])`、`Cache::get/clear`、`inline_text`
-  签名与语义**全部不变**；`Block` / `Inline` 类型不变（渲染层与调用方 `gui/src/app.rs:873` 零改动）。
-  层级缩进靠内部新增 `show_at(ui, blocks, depth)` 私有函数实现，不外泄。
+  签名与语义**全部不变**；`Block` / `Inline` 类型不变（渲染层与调用方 `app.rs` 的正文入口
+  零改动）。层级缩进靠内部新增 `show_at(ui, blocks, depth)` 私有函数实现，不外泄。
+  `render_center` 只在"点击段标题"分支多调一次 `Response::scroll_to_me`，不改任何状态语义。
 - **配置 / 清单格式 / 数据表 / 外部 API**：无。
 - **向后兼容**：解析出的 AST **语义等价**（竖线三条、任务勾选态、有序起始编号、引用内嵌套、
   链接/图片降级、`<!-- GATE:… -->` 隐藏），并新增 GFM 覆盖；唯一**有意的断言变更**是
   REQ-011 的两条离屏几何断言改用新基准 `min(可用宽, MEASURE_W)`（断言意图不变：表与正文同宽、
-  文字不越出版心）。
+  文字不越出版心）。G7 / G8 只改排布与视口，不改任何内容。
 
 ### 验收标准
 
-见第 3 段 `GATE:AC` 块（编号连续、Given/When/Then 齐全且可度量）。
+见第 3 段 `GATE:AC` 块（编号连续、Given/When/Then 齐全且可度量；其中两条为本次新增的
+短表格空白与切段视口验收，由审核人经 `amend` 补入）。
 
 ## 2. 技术方案
 
@@ -206,6 +227,7 @@ gui/src/markdown.rs
 gui/Cargo.toml
 Cargo.lock
 docs/设计/UI架构细化方案.md
+gui/src/app.rs
 <!-- /GATE:TOUCH -->
 
 ### 兼容性、性能与安全影响
@@ -392,6 +414,16 @@ docs/设计/UI架构细化方案.md
 - Given: 一份把版心直接取为可用宽而不设 680 上限的实现，与本清单新增的版心用例
 - When: 运行该版心用例
 - Then: 该用例失败，且读到的折行宽度大于 680
+
+### AC-019
+- Given: 一个装载了内嵌字体的离屏 egui 上下文，屏幕 800×600，正文块是一张两行的短表格紧接一段文字
+- When: 离屏渲染该正文，并读取表格末行文字的矩形底端与该段文字的矩形顶端
+- Then: 两者之差小于 30，且该段文字出现在绘制输出里，即短表格下方不留一整屏空白
+
+### AC-020
+- Given: 离屏 egui 上下文里有一个纵向滚动区与三段折叠头，第一段展开且滚动偏移为 1800
+- When: 下一帧切到第二段展开、对该段标题调用一次 Response 的 scroll_to_me，再渲染一帧
+- Then: 第二段标题的矩形顶端小于视口高度 600，即切段后视口落在该段开头而不是其中段
 <!-- /GATE:AC -->
 
 ## 审核记录
@@ -400,4 +432,9 @@ docs/设计/UI架构细化方案.md
 - 2026-10-05_12:34:25 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | approved | -
 - 2026-10-05_12:34:34 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | -
 - 2026-10-05_12:34:50 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | approved | -
+- 2026-10-05_14:27:41 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | amended | 新增两处Bugfix
+- 2026-10-05_14:41:58 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | approved | -
+- 2026-10-05_14:45:16 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | amended | 补两条验收
+- 2026-10-05_14:45:40 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | approved | -
+- 2026-10-05_14:47:24 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | -
 <!-- /GATE:AUDIT -->

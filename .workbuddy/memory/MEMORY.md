@@ -14,6 +14,14 @@
   另加 `Cargo.lock`、`templates/ci/*.yml` 的 `VER`、`packaging/templates/ci/*.gitlab` 的 `REQ_GUARD_VERSION`、
   `packaging/CHANGELOG.md`。发布包文档一律 `{{VERSION}}` 占位符由脚本注入，勿手改。
 - CLI 通用选项**必须写在子命令之后**（`status -p <dir>` ✅ / `-p <dir> status` ❌ 退出码 2）。
+- **SDD（spec-kit 类）接入**：唯一真相仍是 `.gates/requirements/REQ-*.md`；规则见
+  `docs/规范/SDD产物接入规范.md`（R1 一份需求一份清单 / R2 零复制只引用 / R3 `specs/` 只当草稿源，
+  apply 后删除或 gitignore）。**门禁对 `specs/**` 是"看不见"的**：`gate::pretool` 只对
+  `.gates/requirements/*.md` 判 AllowDoc、对 `*.comments.md` 硬拦，其余路径 `Continue`，而 `resolve`
+  G4 约定「未声明路径不额外拦」→ 让 SDD 产物进视野的唯一办法 = 第二段 `GATE:TOUCH` 声明 `specs/**`；
+  细粒度规格（design/research/data-model/contracts）**必须落 `docs/设计/`**，否则方案段的
+  `touch::cross_refs` 判 `target_missing` 直接拒批；`tasks.md ≠ 第 3 段测试计划`（`ac::lint` 硬拦
+  Given/When/Then）。README 里的「SDD 契约」= codebound frontmatter 约定，**不是** SDD 工具。
 
 ## 跨平台（踩过就忘不掉）
 - hook"是否已接入"的 marker **按词干**判定（`req-guard-check`/`req-guard-deny`，不带后缀）；只有渲染出的

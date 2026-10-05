@@ -93,3 +93,29 @@
 | 2026-10-05 12:34:34 | DERIVE_SOURCE_REFS REQ-013 - -> gui/src,gui,Cargo.lock,docs/设计 |
 | 2026-10-05 12:34:35 | APPROVE REQ-013 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-05 12:34:50 | APPROVE REQ-013 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:19:49 | APPROVE REQ-014 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:20:01 | DERIVE_SOURCE_REFS REQ-014 - -> tui/src,gui/src,docs/设计 |
+| 2026-10-05 14:20:01 | APPROVE REQ-014 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:20:09 | APPROVE REQ-014 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:20:44 | APPROVE REQ-015 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:21:27 | DERIVE_SOURCE_REFS REQ-015 - -> core/src,cli/src,gui/src,tui/src,README.md |
+| 2026-10-05 14:21:27 | APPROVE REQ-015 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:21:39 | APPROVE REQ-015 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:22:00 | APPROVE REQ-016 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:22:12 | DERIVE_SOURCE_REFS REQ-016 - -> gui/src,tui/src,README.md |
+| 2026-10-05 14:22:12 | APPROVE REQ-016 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:22:34 | APPROVE REQ-016 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:22:55 | APPROVE REQ-017 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:23:03 | DERIVE_SOURCE_REFS REQ-017 - -> core/src,gui/src,tui/src,README.md |
+| 2026-10-05 14:23:03 | APPROVE REQ-017 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:23:20 | APPROVE REQ-017 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:23:30 | APPROVE REQ-018 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:23:37 | DERIVE_SOURCE_REFS REQ-018 - -> Cargo.toml,Cargo.lock,mdast,mdast/src,gui,gui/src,tui,tui/src,docs/设计 |
+| 2026-10-05 14:23:37 | APPROVE REQ-018 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:23:45 | APPROVE REQ-018 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:27:41 | AMEND REQ-013 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:41:58 | APPROVE REQ-013 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:45:16 | AMEND REQ-013 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:45:40 | APPROVE REQ-013 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-05 14:46:48 | TOUCH.EXTEND REQ-013 actor=Mike_Zhu added=gui/src/app.rs reason=G8_切段视口修复落在_render_center reapprove=1 |
+| 2026-10-05 14:47:24 | APPROVE REQ-013 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
