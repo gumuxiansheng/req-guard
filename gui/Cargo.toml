@@ -18,7 +18,13 @@ description = "req-guard 桌面门禁管理台（eframe / egui）"
 # 原生执行机构建（无 Linux 交叉编译，见 scripts/build-release.sh）。
 # 将来若要支持 Linux GUI：补 `features = [..., "x11", "wayland"]` 并在环境里装
 # X11/Wayland 系统库，再放开 CI 的排除。
+#
+# pulldown-cmark：**只做 Markdown 解析，不带任何渲染 / 取数能力**（正文渲染与
+# "链接不激活、图片不加载" 的安全纪律仍在本 crate 的 markdown.rs 里，见 REQ-013）。
+# `default-features = false` 关掉 `html`（省掉 pulldown-cmark-escape）与 `getopts`，
+# 传递依赖恰为 bitflags / memchr / unicase 三个（实测见 REQ-013 的 G6 与验收门槛）。
 [dependencies]
 req-guard-core = { path = "../core" }
 eframe = { version = "0.36.1", default-features = false, features = ["wgpu"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
 rfd = "0.15"

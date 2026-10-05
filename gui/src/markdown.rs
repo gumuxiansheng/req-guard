@@ -1,34 +1,45 @@
-//! 清单正文的**轻量 Markdown 渲染**（零新增依赖）。
+//! 清单正文的 **Markdown 渲染**：解析用 `pulldown-cmark`，渲染与安全纪律自己写。
 //!
 //! 为什么要渲染：审核人真正要读的是**内容**，不是 `- [ ]`、`**`、`` ` `` 这些标记。
 //! 过去 GUI 把 `core::requirement::section_of` 的切片原样塞进只读文本框（等宽纯文本），
 //! 段落、任务勾选框、表格全靠人脑翻译，审阅体验明显落后于编辑器里的同一份清单。
 //!
-//! 为什么不用 `egui_extras` / `egui_markdown`：
-//! - **供应链**：本项目 core 零依赖、GUI 才允许重量依赖，而正文渲染是纯展示需求，
-//!   为它新增一条 crates.io 依赖链（pulldown-cmark / syntect / …）不值得；
-//! - **安全**：渲染器**永不激活链接、永不加载图片**。清单正文由 AI 生成，
-//!   一个 `[点我](https://evil.tld)` 若能被审核人一点就唤起浏览器，
-//!   等于给 AI 留了一条"骗人类点击"的通道——门禁工具尤其不能开这个口子。
-//!   链接 / 图片只渲染成**带下划线的纯文本**，真实地址以悬停提示展示（要看就瞄一眼，不点）。
-//! - **可控**：HTML 注释（`<!-- GATE:… -->` 标记行）整块跳过，不再糊在正文里干扰阅读。
+//! ## 依赖边界：只借解析器，不借渲染器（REQ-013）
 //!
-//! 渲染范围刻意"少而够用"：标题 / 段落 / 有序无序列表 / 任务列表 / 围栏代码块 /
-//! 表格 / 引用 / 分隔线 + 行内的 `**粗**` `*斜*` `~~删~~` `` `码` ``。
-//! 不支持的语法一律按**纯文本原样显示**（不吞、不报错）——
-//! 渲染只是"更好读"的叠加层，宁可显示成原文，也不能让人看不到清单里的某句话。
+//! 解析层换成 `pulldown-cmark`（CommonMark + 三条 GFM 扩展），因为自研解析器只覆盖
+//! "够用"子集，边界写法要靠几百行状态码自己兜。**渲染与安全纪律仍在本文件里**：
+//! - `egui_extras 0.36.2` **已无 markdown 模块**（实测其模块表里没有、依赖表里也没有
+//!   `pulldown-cmark`），`egui_markdown` 在 crates.io 上只剩同名 0.1.0 的新包，都不引；
+//! - `egui_commonmark 0.25` 的链接走 `ui.hyperlink_to` 且**无开关**，等于给 AI 留了一条
+//!   "骗审核人点外链"的通道；它的表格还走 `egui::Grid`（末列吃剩余宽度，见 [`table`]）。
 //!
-//! 两条被真实缺陷教出来的纪律，改渲染代码前先读 [`cells_of`] 与 [`table`] 的注释：
-//! - **竖线只在真的分列时才是分隔符**：代码段内的 `` `a|b` ``、转义的 `\|` 都算内容，
-//!   见 [`cells_of`]；
-//! - **宽度只有版心一个来源**：段落 / 列表 / 标题 / 表格共用同一栏宽度，
-//!   表格列宽也由它分配，见 [`show`] 与 [`distribute`]。
+//! ## 四条安全纪律（渲染器永不主动对外）
 //!
-//! 分层：解析（[`parse`] / [`parse_inlines`]，纯函数、不碰 egui、可单测）与渲染
-//! （[`show`]）分离，测试断言的是"解析出的结构"，不需要跑窗口。
+//! 1. **永不激活链接、永不加载图片**：清单正文由 AI 生成，一个 `[点我](https://evil.tld)`
+//!    若能被审核人一点就唤起浏览器，等于给 AI 留了一条骗人类点击的通道——门禁工具尤其
+//!    不能开这个口子。链接 / 图片只渲染成**带下划线的纯文本**（[`rt_of`]）。
+//! 2. **HTML 注释整块隐藏**：模板里的 `<!-- GATE:… -->` 是给门禁工具看的标记行，
+//!    不该糊在正文里（[`escape_table_code_pipes`] 之后的解析阶段丢弃 `Event::Html`）。
+//! 3. **不丢内容**：宁可显示成原文，也不能让人看不到清单里的某句话。
+//! 4. **版心唯一**：段落 / 列表 / 标题 / 表格共用同一栏宽度，表格列宽也由它分配。
+//!
+//! 渲染范围：标题 / 段落 / 有序无序列表 / 任务列表 / 围栏代码块 / 表格 / 引用 /
+//! 分隔线 + 行内的 `**粗**` `*斜*` `~~删~~` `` `码` ``。不支持的语法（脚注、定义列表）
+//! 按**不渲染**处理——它们在清单里不会出现，出现时也不该冒充正文。
+//!
+//! ## 三条被真实缺陷教出来的纪律，改代码前先读对应注释
+//!
+//! - **竖线只在真的分列时才是分隔符**：代码段内的 `` `a|b` ``、转义的 `\|` 都算内容。
+//!   GFM 要求表格内必须转义，而清单里大量不转义，故先过 [`escape_table_code_pipes`]；
+//! - **宽度只有版心一个来源**，且版心有上限 [`MEASURE_W`]，见 [`show`] 与 [`distribute`]；
+//! - **列表缩进按层级递增**：常量缩进套在每一层上，两层挤在一起就看不出层级，见 [`list_block`]。
+//!
+//! 分层：解析（[`parse`]，纯函数、不碰 egui、可单测）与渲染（[`show`]）分离，
+//! 测试断言的是"解析出的结构"或"离屏画出的几何"，不需要跑窗口。
 
 use crate::palette;
 use eframe::egui;
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::sync::Arc;
 
 /// 块级元素。
@@ -98,453 +109,557 @@ pub enum Inline {
 }
 
 // ===================== 解析 =====================
+// ===================== 解析 =====================
+
+/// 解析开关：**只开清单里真实用到的三条 GFM 扩展**。
+///
+/// 表格（`| --- |` 分列）、任务列表（`- [x]`）、删除线（`~~废弃~~`）是 AI 写清单时最高频的三种
+/// 写法；脚注 / 定义列表 / front-matter 一律不开（非目标 N6）——它们要么在清单里不会出现，
+/// 要么（HTML 注释那种）本来就该隐藏而不是渲染成正文。
+fn options() -> Options {
+    let mut o = Options::empty();
+    o.insert(Options::ENABLE_TABLES);
+    o.insert(Options::ENABLE_TASKLISTS);
+    o.insert(Options::ENABLE_STRIKETHROUGH);
+    o
+}
 
 /// 解析整段 Markdown 文本为块序列。
+///
+/// **先过一遍 [`escape_table_code_pipes`] 再交给解析器**，原因写在那个函数的注释里：
+/// GFM 规定表格里的竖线必须转义（代码段内也一样），直接喂原文会被切成多列并**静默丢内容**。
 pub fn parse(src: &str) -> Vec<Block> {
-    let lines: Vec<&str> = src.lines().collect();
-    let mut blocks = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let t = lines[i].trim_start();
-        // HTML 注释整块跳过（模板里的 `<!-- GATE:… -->` 标记行不是给人看的）。
-        if t.starts_with("<!--") {
-            i += 1;
-            // 单行注释（`<!-- … -->` 同一行内闭合）到此为止，否则继续找闭合行。
-            if !lines[i - 1].contains("-->") {
-                while i < lines.len() && !lines[i].contains("-->") {
-                    i += 1;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if t.is_empty() {
-            i += 1;
-            continue;
-        }
-        if let Some(fence) = fence_of(t) {
-            let lang = t[fence.len()..].trim().to_string();
-            let mut text = String::new();
-            i += 1;
-            while i < lines.len() {
-                let l = lines[i].trim_start();
-                if fence_of(l).is_some_and(|f| f.len() >= fence.len()) {
-                    i += 1;
-                    break;
-                }
-                text.push_str(lines[i]);
-                text.push('\n');
-                i += 1;
-            }
-            blocks.push(Block::Code { lang, text });
-            continue;
-        }
-        if is_rule(t) {
-            blocks.push(Block::Rule);
-            i += 1;
-            continue;
-        }
-        if let Some((level, rest)) = heading_of(t) {
-            blocks.push(Block::Heading {
-                level,
-                inlines: parse_inlines(rest),
-            });
-            i += 1;
-            continue;
-        }
-        // 引用块：连续 `> ` 行整体取出，去前缀后**递归解析**（引用里可以再放列表 / 代码块）。
-        if t.starts_with('>') {
-            let mut inner = String::new();
-            while i < lines.len() {
-                let l = lines[i].trim_start();
-                if let Some(rest) = l.strip_prefix('>') {
-                    inner.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-                    inner.push('\n');
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            blocks.push(Block::Quote(parse(&inner)));
-            continue;
-        }
-        // 表格：当前行含 `|` 且下一行是 `| --- |` 形式的对齐分隔行。
-        if t.contains('|') && lines.get(i + 1).is_some_and(|n| is_delimiter_row(n.trim())) {
-            let aligns = aligns_of(lines[i + 1].trim());
-            let header = inlines_of_row(lines[i].trim());
-            let mut rows = Vec::new();
-            i += 2;
-            while i < lines.len() && is_table_row(lines[i].trim()) {
-                rows.push(inlines_of_row(lines[i].trim()));
-                i += 1;
-            }
-            blocks.push(Block::Table(Table {
-                header,
-                aligns,
-                rows,
-            }));
-            continue;
-        }
-        if list_marker(lines[i]).is_some() {
-            let (list, eaten) = parse_list(&lines[i..]);
-            blocks.push(list);
-            i += eaten;
-            continue;
-        }
-        // 段落：吃到空行 / 下一个块级起始为止。
-        let mut text = String::new();
-        while i < lines.len() {
-            let t = lines[i].trim_start();
-            if t.is_empty()
-                || is_rule(t)
-                || heading_of(t).is_some()
-                || fence_of(t).is_some()
-                || t.starts_with('>')
-                || list_marker(lines[i]).is_some()
-            {
-                break;
-            }
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(t);
-            i += 1;
-        }
-        blocks.push(Block::Paragraph(parse_inlines(&text)));
-    }
-    blocks
+    Builder::default().run(&escape_table_code_pipes(src))
 }
 
-/// 解析行内元素。
-pub fn parse_inlines(src: &str) -> Vec<Inline> {
-    let c: Vec<char> = src.chars().collect();
-    let mut out: Vec<Inline> = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-    while i < c.len() {
-        let ch = c[i];
-        // 反斜杠转义。
-        if ch == '\\' && i + 1 < c.len() {
-            push_char(&mut buf, c[i + 1]);
-            i += 2;
-            continue;
-        }
-        // 行内代码：取最近的下一个反引号，成对才算代码，否则原样保留。
-        if ch == '`' {
-            if let Some(end) = find(&c, i + 1, '`') {
-                push_text(&mut out, &mut buf);
-                out.push(Inline::Code(c[i + 1..end].iter().collect()));
-                i = end + 1;
-                continue;
-            }
-            buf.push(ch);
-            i += 1;
-            continue;
-        }
-        // 图片 / 链接：括号不闭合就当普通字符。
-        if ch == '!' || ch == '[' {
-            let is_img = ch == '!' && c.get(i + 1) == Some(&'[');
-            let lb = if is_img { i + 1 } else { i };
-            if let Some((text, dest, end)) = link_of(&c, lb) {
-                push_text(&mut out, &mut buf);
-                if is_img {
-                    out.push(Inline::Image { alt: text, dest });
-                } else {
-                    out.push(Inline::Link {
-                        text: parse_inlines(&text),
-                        dest,
-                    });
-                }
-                i = end;
-                continue;
-            }
-        }
-        // 强调：`**` `__` 优先于 `*` `_`；`~~` 为删除线。
-        if ch == '~' && c.get(i + 1) == Some(&'~') {
-            if let Some(inner) = delim(&c, i + 2, '~', 2) {
-                push_text(&mut out, &mut buf);
-                out.push(Inline::Strikethrough(parse_inlines(&inner)));
-                i += 2 + inner.chars().count() + 2;
-                continue;
-            }
-        }
-        if ch == '*' || ch == '_' {
-            // `_` 在词内不算强调（CommonMark 的 intraword 规则）：
-            // 否则 `req_guard_hook.sh`、`snake_case` 会被拆成斜体，标识符就不可读了。
-            if ch == '_' && i > 0 && is_word_char(c[i - 1]) {
-                buf.push(ch);
-                i += 1;
-                continue;
-            }
-            let wide = c.get(i + 1) == Some(&ch);
-            let n = if wide { 2 } else { 1 };
-            if let Some(inner) = delim(&c, i + n, ch, n) {
-                push_text(&mut out, &mut buf);
-                let inlines = parse_inlines(&inner);
-                out.push(if wide {
-                    Inline::Strong(inlines)
-                } else {
-                    Inline::Emphasis(inlines)
-                });
-                i += n + inner.chars().count() + n;
-                continue;
-            }
-            // 孤立标记当普通字符（`_` / `*` 极常出现在标识符与算式里，如 `a_b * 2`）。
-            push_char(&mut buf, ch);
-            i += 1;
-            continue;
-        }
-        push_char(&mut buf, ch);
-        i += 1;
-    }
-    push_text(&mut out, &mut buf);
-    out
+// ---------- 事件流 → AST ----------
+
+/// 事件流 → [`Block`] 的状态机（显式栈，不递归）。
+///
+/// 两种"容器"必须分开推，否则表格单元格（装**行内**）与列表项（装**块**）会互相串位：
+/// - [`Frame`]：装块的容器（文档 / 引用 / 列表 / 列表项 / 表格）；
+/// - [`Leaf`]：装行内的栈栈（段落 / 标题 / 单元格 / 列表项正文 / 强调嵌套共用一条）。
+#[derive(Default)]
+struct Builder {
+    frames: Vec<Frame>,
+    leaves: Vec<Leaf>,
+    /// 代码块累积（`Tag::CodeBlock` 期间非空）：`(语言, 原文)`。
+    code: Option<(String, String)>,
 }
 
-/// 内嵌字体缺字形时的**降级替换**：AI 写的清单很爱用 `✅` / `❌` / `⭐`，
-/// 而 Noto Sans SC 没有这些 emoji 的字形（emoji 在 Noto Color Emoji 里，本项目没内嵌），
-/// 不降级就会在界面上显示成 `?`（豆腐块），审核人看到的是" inexplicable 的问号"。
-/// 换成字体里有的等义单字符（`✓ ✗ ⚠ ★` 都在子集范围内）——信息不丢，也不必为几个符号再内嵌一份字体。
-fn fallback_glyph(c: char) -> Option<char> {
-    match c {
-        '✅' | '☑' | '✔' => Some('\u{2713}'),  // ✓
-        '❌' | '✖' | '❎' => Some('\u{2717}'), // ✗
-        '⭐' => Some('\u{2605}'),              // ★
-        '\u{fe0f}' => None,                    // 变体选择符：跟着前一个符号一起被替换掉了
-        _ => None,
+/// 装块的容器。
+enum Frame {
+    Doc(Vec<Block>),
+    Quote(Vec<Block>),
+    List(List),
+    /// 列表项：`checked` 由 `TaskListMarker` 事件补上。
+    Item {
+        checked: Option<bool>,
+        blocks: Vec<Block>,
+    },
+    Table(TableFrame),
+}
+
+/// 一段行内内容，外加"它该被包成什么"。
+struct Leaf {
+    kind: LeafKind,
+    inlines: Vec<Inline>,
+}
+
+enum LeafKind {
+    /// 普通段落，以及"没有叶子时兜底新建"的叶子。
+    Para,
+    /// 标题（级别 1–6）。
+    Heading(u8),
+    /// 表格单元格。
+    Cell,
+    /// 列表项的直接正文：紧凑列表里 `- 甲` 是不带 `Paragraph` 包裹的。
+    ItemBody,
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Link(String),
+    Image(String),
+}
+
+/// 表格累积状态。
+struct TableFrame {
+    aligns: Vec<Align>,
+    head: Vec<Vec<Inline>>,
+    rows: Vec<Vec<Vec<Inline>>>,
+    /// 当前行累积的各格。
+    row: Vec<Vec<Inline>>,
+    /// 当前是否在表头里（表头结束时搬进 `head`，数据行结束时搬进 `rows`）。
+    in_head: bool,
+}
+
+impl TableFrame {
+    fn into_table(mut self) -> Table {
+        // 解析器会把缺格补成空串（实测），这里再兜一次：列数取表头与数据行的最大值，
+        // 短行补空格 —— 宁可多出空列，也不要少一列把内容挤到错位。
+        let cols = self
+            .head
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0));
+        for row in self.rows.iter_mut() {
+            while row.len() < cols {
+                row.push(Vec::new());
+            }
+        }
+        while self.head.len() < cols {
+            self.head.push(Vec::new());
+        }
+        Table {
+            header: self.head,
+            aligns: self.aligns,
+            rows: self.rows,
+        }
     }
 }
 
-fn push_char(buf: &mut String, c: char) {
-    // VS16（U+FE0F）只在 emoji 后面成对出现，去掉它、保留被替换后的符号。
-    if c == '\u{fe0f}' {
-        return;
+impl Builder {
+    fn run(mut self, src: &str) -> Vec<Block> {
+        self.frames.push(Frame::Doc(Vec::new()));
+        for ev in Parser::new_ext(src, options()) {
+            self.event(ev);
+        }
+        self.take_outer()
     }
-    buf.push(fallback_glyph(c).unwrap_or(c));
-}
 
-fn push_text(out: &mut Vec<Inline>, buf: &mut String) {
-    if !buf.is_empty() {
-        out.push(Inline::Text(std::mem::take(buf)));
+    /// 取栈底容器的块序列作为结果。
+    ///
+    /// 事件流里**没有"文档结束"事件**（`TagEnd` 枚举里没有 `Document` 变体），所以收尾
+    /// 只能靠取栈底 —— 正常情况下此时栈里就只剩 [`Frame::Doc`] 一个。
+    fn take_outer(&mut self) -> Vec<Block> {
+        match self.frames.first_mut() {
+            Some(Frame::Doc(bs)) | Some(Frame::Quote(bs)) => std::mem::take(bs),
+            // 栈底不是块容器：事件流被异常截断。返回空列表也不 panic ——
+            // 渲染层本来就有"渲染路径不 panic"的底线用例兜着。
+            _ => Vec::new(),
+        }
     }
-}
 
-/// 从 `lb`（`[` 的下标）开始解析 `[text](dest)`，返回文本 / 地址 / 右括号之后的下标。
-fn link_of(c: &[char], lb: usize) -> Option<(String, String, usize)> {
-    if c.get(lb) != Some(&'[') {
-        return None;
-    }
-    // 找与 `lb` 处 `[` 配对的 `]`（跳过链接文字里的嵌套方括号）。
-    let mut depth = 0i32;
-    let mut close = None;
-    for (k, ch) in c.iter().enumerate().skip(lb) {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(k);
-                    break;
+    fn event(&mut self, ev: Event<'_>) {
+        match ev {
+            Event::Start(t) => self.start(t),
+            Event::End(t) => self.end(t),
+            Event::Text(t) => {
+                // 代码块里的文本是**原文**，不经行内解析（行内代码是 `Event::Code`）。
+                if let Some((_, buf)) = self.code.as_mut() {
+                    buf.push_str(&t);
+                    return;
+                }
+                self.push_text(sanitize(&t));
+            }
+            Event::Code(t) => self.push_inline(Inline::Code(sanitize(&t))),
+            // 软换行渲染成空格：源码里的换行只是折行排版，渲染成硬换行会在段落里留下莫名空隙。
+            Event::SoftBreak | Event::HardBreak => self.soft_break(),
+            // HTML 注释（模板里的 `<!-- GATE:… -->` 标记行）与内联标签都**不进正文**：
+            // 那些标记是给门禁工具看的，不是给审核人看的。
+            Event::Html(_) | Event::InlineHtml(_) => {}
+            Event::TaskListMarker(done) => {
+                if let Some(Frame::Item { checked, .. }) = self.frames.last_mut() {
+                    *checked = Some(done);
                 }
             }
+            Event::Rule => self.push_block(Block::Rule),
+            // 脚注 / 定义列表 / 元数据：非目标 N6，按"不渲染"处理。
             _ => {}
         }
     }
-    let close = close?;
-    if c.get(close + 1) != Some(&'(') {
-        return None;
-    }
-    let text: String = c[lb + 1..close].iter().collect();
-    let mut dest = String::new();
-    let mut quoted = false;
-    let mut k = close + 2;
-    while k < c.len() && (c[k] != ')' || quoted) {
-        if c[k] == '"' {
-            quoted = !quoted;
-        }
-        dest.push(c[k]);
-        k += 1;
-    }
-    if k >= c.len() {
-        return None;
-    }
-    Some((text, dest.split_whitespace().collect(), k + 1))
-}
 
-/// 从 `start` 起找长度为 `n` 的成对分隔符，返回中间内容（空内容不算命中）。
-fn delim(c: &[char], start: usize, ch: char, n: usize) -> Option<String> {
-    let mut k = start;
-    while k + n <= c.len() {
-        if c[k..k + n].iter().all(|&x| x == ch) {
-            let inner: String = c[start..k].iter().collect();
-            if !inner.is_empty() {
-                return Some(inner);
+    fn start(&mut self, t: Tag<'_>) {
+        match t {
+            Tag::Paragraph => self.push_leaf(LeafKind::Para),
+            Tag::Heading { level, .. } => self.push_leaf(LeafKind::Heading(heading_level(level))),
+            // 这四种都是**块**：开始之前先把列表项的直接正文（`- 外` 里的"外"）落成段落，
+            // 否则它会被挤到嵌套块后面（渲染时"外"就跑到了子列表下面，缩进也不对）。
+            Tag::BlockQuote(_) => {
+                self.flush_item_text();
+                self.frames.push(Frame::Quote(Vec::new()));
             }
-        }
-        k += 1;
-    }
-    None
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() && c.is_ascii() || c == '_'
-}
-
-fn find(c: &[char], start: usize, ch: char) -> Option<usize> {
-    (start..c.len()).find(|&k| c[k] == ch)
-}
-
-/// 列表标记 → (缩进宽度, 任务勾选态, 有序编号, 正文)。
-type Marker = (usize, Option<bool>, u64, String);
-
-fn list_marker(line: &str) -> Option<Marker> {
-    let indent = line.len() - line.trim_start().len();
-    let t = line.trim_start();
-    let body = if let Some(rest) = t
-        .strip_prefix("- ")
-        .or_else(|| t.strip_prefix("* "))
-        .or_else(|| t.strip_prefix("+ "))
-    {
-        rest
-    } else if let Some((_, rest)) = split_ordered(t) {
-        rest
-    } else {
-        return None;
-    };
-    let (checked, body) = match task_mark(body) {
-        Some((c, rest)) => (Some(c), rest),
-        None => (None, body),
-    };
-    Some((indent, checked, 0, body.to_string()))
-}
-
-/// `1. ` / `1) ` → (编号, 正文)；不是有序列表则 `None`。
-fn split_ordered(t: &str) -> Option<(u64, &str)> {
-    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    let rest = &t[digits.len()..];
-    let rest = rest
-        .strip_prefix(". ")
-        .or_else(|| rest.strip_prefix(") "))?;
-    digits.parse().ok().map(|n| (n, rest))
-}
-
-/// GFM 任务标记：`[ ]` / `[x]`（`x` 大小写不敏感）。
-fn task_mark(body: &str) -> Option<(bool, &str)> {
-    let rest = body.strip_prefix('[')?;
-    let checked = match rest.chars().next()? {
-        ' ' | ']' => false,
-        'x' | 'X' => true,
-        _ => return None,
-    };
-    let rest = rest[1..].strip_prefix(']')?;
-    Some((checked, rest.strip_prefix(' ').unwrap_or(rest)))
-}
-
-/// 解析连续的同级列表项，返回列表与"消费掉的行数"（缩进更深的行并入上一项 → 嵌套列表）。
-fn parse_list(lines: &[&str]) -> (Block, usize) {
-    let Some((base, _, _, _)) = list_marker(lines[0]) else {
-        return (Block::Paragraph(parse_inlines(lines[0])), 1);
-    };
-    let mut ordered = false;
-    let mut start = 1;
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let Some((indent, checked, _num, body)) = list_marker(lines[i]) else {
-            break;
-        };
-        if indent < base {
-            break;
-        }
-        if indent > base {
-            // 缩进更深：并入上一项继续解析（`- 外\n  - 内` → 外项里含一个子列表）。
-            let Some(last) = items.last_mut() else {
-                break;
-            };
-            let mut text = body;
-            let mut j = i + 1;
-            while let Some(l) = lines.get(j) {
-                let ind = l.len() - l.trim_start().len();
-                if ind > base || (l.trim().is_empty() && next_indent(lines, j) > base) {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(l.trim_start());
-                    j += 1;
-                } else {
-                    break;
+            Tag::CodeBlock(k) => {
+                self.flush_item_text();
+                self.code = Some((code_lang(k), String::new()));
+            }
+            Tag::List(start) => {
+                self.flush_item_text();
+                self.frames.push(Frame::List(List {
+                    ordered: start.is_some(),
+                    start: start.unwrap_or(1),
+                    items: Vec::new(),
+                }))
+            }
+            Tag::Item => {
+                self.push_leaf(LeafKind::ItemBody);
+                self.frames.push(Frame::Item {
+                    checked: None,
+                    blocks: Vec::new(),
+                });
+            }
+            Tag::Table(aligns) => {
+                self.flush_item_text();
+                self.frames.push(Frame::Table(TableFrame {
+                    aligns: aligns.into_iter().map(align_of_cmark).collect(),
+                    head: Vec::new(),
+                    rows: Vec::new(),
+                    row: Vec::new(),
+                    in_head: false,
+                }));
+            }
+            Tag::TableHead => {
+                if let Some(Frame::Table(t)) = self.frames.last_mut() {
+                    t.in_head = true;
+                    t.row.clear();
                 }
             }
-            last.blocks = parse(&text);
+            Tag::TableRow => {
+                if let Some(Frame::Table(t)) = self.frames.last_mut() {
+                    t.row.clear();
+                }
+            }
+            Tag::TableCell => self.push_leaf(LeafKind::Cell),
+            Tag::Emphasis => self.push_leaf(LeafKind::Emphasis),
+            Tag::Strong => self.push_leaf(LeafKind::Strong),
+            Tag::Strikethrough => self.push_leaf(LeafKind::Strikethrough),
+            Tag::Link { dest_url, .. } => self.push_leaf(LeafKind::Link(sanitize(&dest_url))),
+            Tag::Image { dest_url, .. } => self.push_leaf(LeafKind::Image(sanitize(&dest_url))),
+            // 整块 HTML / 元数据：正文里不该出现，直接丢。
+            Tag::HtmlBlock | Tag::MetadataBlock(_) => {}
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, t: TagEnd) {
+        match t {
+            TagEnd::Paragraph | TagEnd::Heading(_) => self.finish_leaf(),
+            TagEnd::BlockQuote(_) => {
+                // 引用里若直接是文字（没有 `Paragraph` 包裹），先补成段落再收块。
+                self.finish_leaf();
+                if let Some(Frame::Quote(bs)) = self.frames.pop() {
+                    self.push_block(Block::Quote(bs));
+                }
+            }
+            TagEnd::CodeBlock => {
+                if let Some((lang, text)) = self.code.take() {
+                    self.push_block(Block::Code { lang, text });
+                }
+            }
+            TagEnd::List(_) => {
+                if let Some(Frame::List(l)) = self.frames.pop() {
+                    self.push_block(Block::List(l));
+                }
+            }
+            TagEnd::Item => self.finish_item(),
+            TagEnd::TableCell => self.finish_cell(),
+            TagEnd::TableHead => {
+                if let Some(Frame::Table(t)) = self.frames.last_mut() {
+                    t.head = std::mem::take(&mut t.row);
+                    t.in_head = false;
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(Frame::Table(t)) = self.frames.last_mut() {
+                    let row = std::mem::take(&mut t.row);
+                    if !row.is_empty() {
+                        t.rows.push(row);
+                    }
+                }
+            }
+            TagEnd::Table => {
+                if let Some(Frame::Table(t)) = self.frames.pop() {
+                    self.push_block(Block::Table(t.into_table()));
+                }
+            }
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Link
+            | TagEnd::Image => self.finish_inline_leaf(),
+            _ => {}
+        }
+    }
+
+    /// 块挂到**当前容器**（栈顶 frame）。
+    fn push_block(&mut self, b: Block) {
+        match self.frames.last_mut() {
+            Some(Frame::Doc(bs) | Frame::Quote(bs)) => bs.push(b),
+            Some(Frame::Item { blocks, .. }) => blocks.push(b),
+            // 表格与列表容器里不会出现裸块：解析器保证单元格只装行内、列表只装列表项。
+            // 走到这里说明上游事件流变了 —— 宁可丢一块，也不要挂到错位置造成静默错乱。
+            Some(Frame::Table(_) | Frame::List(_)) | None => {}
+        }
+    }
+
+    fn push_leaf(&mut self, kind: LeafKind) {
+        self.leaves.push(Leaf {
+            kind,
+            inlines: Vec::new(),
+        });
+    }
+
+    /// 行内元素挂到**当前叶子**；没有叶子时兜底开一个段落叶子（宁可多一段，也不丢字）。
+    fn push_inline(&mut self, i: Inline) {
+        if self.leaves.is_empty() {
+            self.push_leaf(LeafKind::Para);
+        }
+        if let Some(leaf) = self.leaves.last_mut() {
+            leaf.inlines.push(i);
+        }
+    }
+
+    fn push_text(&mut self, s: String) {
+        if !s.is_empty() {
+            self.push_inline(Inline::Text(s));
+        }
+    }
+
+    /// 换行补一个空格，但**不叠出两个**：`- 甲\n  续行` 之类紧跟着的行已经带前导空白。
+    fn soft_break(&mut self) {
+        let trailing = self
+            .leaves
+            .last()
+            .is_some_and(|l| matches!(l.inlines.last(), Some(Inline::Text(t)) if t.ends_with(' ')));
+        if !trailing {
+            self.push_text(" ".to_string());
+        }
+    }
+
+    /// 列表项的直接正文在**嵌套块之前**先落成段落。
+    ///
+    /// 紧凑列表里 `- 外` 的"外"是不带 `Paragraph` 包裹的行内（[`LeafKind::ItemBody`]），
+    /// 一旦项里还有嵌套块（`- 外\n  - 内`），不先冲刷的话嵌套列表会先进块序列、
+    /// 段落被挤到它后面 —— 渲染时"外"就落到了子列表下面，缩进与行序一起错。
+    fn flush_item_text(&mut self) {
+        let pending = matches!(self.frames.last(), Some(Frame::Item { .. }))
+            && self
+                .leaves
+                .last()
+                .is_some_and(|l| matches!(l.kind, LeafKind::ItemBody) && !l.inlines.is_empty());
+        if pending {
+            self.finish_leaf();
+        }
+    }
+
+    /// 结束块级叶子（段落 / 标题）：内容落成块。
+    fn finish_leaf(&mut self) {
+        let Some(leaf) = self.leaves.pop() else {
+            return;
+        };
+        if leaf.inlines.is_empty() {
+            return;
+        }
+        match leaf.kind {
+            LeafKind::Heading(level) => self.push_block(Block::Heading {
+                level,
+                inlines: leaf.inlines,
+            }),
+            _ => self.push_block(Block::Paragraph(leaf.inlines)),
+        }
+    }
+
+    /// 结束行内叶子（强调 / 链接 / 图片）：内容包成对应 `Inline` 塞回上一层。
+    fn finish_inline_leaf(&mut self) {
+        let Some(leaf) = self.leaves.pop() else {
+            return;
+        };
+        let wrapped = match leaf.kind {
+            LeafKind::Emphasis => Inline::Emphasis(leaf.inlines),
+            LeafKind::Strong => Inline::Strong(leaf.inlines),
+            LeafKind::Strikethrough => Inline::Strikethrough(leaf.inlines),
+            LeafKind::Link(dest) => Inline::Link {
+                text: leaf.inlines,
+                dest,
+            },
+            LeafKind::Image(dest) => Inline::Image {
+                alt: inline_text(&leaf.inlines),
+                dest,
+            },
+            // 段落 / 标题 / 单元格 / 列表项正文不走这里（它们落成块，见 `finish_leaf`）。
+            // 万一走到（例如上游改了事件顺序），拍平成文本而不是丢字。
+            LeafKind::Para | LeafKind::Heading(_) | LeafKind::Cell | LeafKind::ItemBody => {
+                Inline::Text(inline_text(&leaf.inlines))
+            }
+        };
+        self.push_inline(wrapped);
+    }
+
+    /// 结束表格单元格：本格行内挂到当前行。
+    fn finish_cell(&mut self) {
+        let Some(leaf) = self.leaves.pop() else {
+            return;
+        };
+        if let Some(Frame::Table(t)) = self.frames.last_mut() {
+            t.row.push(leaf.inlines);
+        }
+    }
+
+    /// 结束列表项：直接正文（紧凑列表没有 `Paragraph` 包裹）先补成段落，再挂回所属列表。
+    fn finish_item(&mut self) {
+        self.finish_leaf();
+        let Some(Frame::Item { checked, blocks }) = self.frames.pop() else {
+            return;
+        };
+        match self.frames.last_mut() {
+            Some(Frame::List(l)) => l.items.push(ListItem { checked, blocks }),
+            // 列表项没有所属列表：解析器保证不会发生，兜成单项列表而不是丢内容。
+            _ => self.push_block(Block::List(List {
+                ordered: false,
+                start: 1,
+                items: vec![ListItem { checked, blocks }],
+            })),
+        }
+    }
+}
+
+fn heading_level(l: HeadingLevel) -> u8 {
+    match l {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+/// 代码块语言：围栏取 ``` 后的标记，缩进代码块没有语言。
+fn code_lang(k: CodeBlockKind) -> String {
+    match k {
+        CodeBlockKind::Fenced(l) => sanitize(&l),
+        CodeBlockKind::Indented => String::new(),
+    }
+}
+
+fn align_of_cmark(a: Alignment) -> Align {
+    match a {
+        // GFM 的"未指定对齐"与左对齐在排版上等价（解析器实测给的就是 `Alignment::None`）。
+        Alignment::None | Alignment::Left => Align::Left,
+        Alignment::Center => Align::Center,
+        Alignment::Right => Align::Right,
+    }
+}
+
+/// 解析器给回的文本 → 可显示文本：字形降级 + 去掉变体选择符。
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            // VS16（U+FE0F）只在 emoji 后面成对出现，去掉它、保留被替换后的符号。
+            '\u{fe0f}' => None,
+            other => Some(fallback_glyph(other).unwrap_or(other)),
+        })
+        .collect()
+}
+
+// ---------- 表格竖线预归一化 ----------
+
+/// 把**表格行**里、代码段中、未转义的裸竖线补上反斜杠（GFM 表格转义）。
+///
+/// **为什么必须有这一步**：GFM 规定表格里的竖线必须转义，**代码段内也不例外**，
+/// `pulldown-cmark` 严格照办。清单里"字段用 `file|anchor|replacement` 分隔"这类写法极常见，
+/// 直接喂原文会被切成多列，而且**多出来的列会被静默丢弃**（实测：REQ-011 那条验收里的原例
+/// 被切成 3 格，`repl` 之后的内容与 `2h` 一起消失）。"看不见"比"难看"严重得多。
+/// 表格单元格内反斜杠转义会被解析器解开，所以补了转义之后显示结果与原文一致。
+///
+/// **只动表格行**：普通段落里的 `` `a|b` `` 若补转义，内容就真的变了——代码段内反斜杠
+/// 不生效（实测：`` `a\|b` `` 会原样显示 `a\|b`），等于把对的写成错的。
+///
+/// 判"表格行"两条：① 本行的下一行是分隔行（`| --- |`）且**格数与本行相同**（格数按
+/// [`cells_of`] 统计，与解析器口径一致，可挡掉"普通段落里恰好有 `|` 且下一行像分隔行"）；
+/// ② 表格块内后续形如表格的数据行，直到空行或非表格行。围栏代码块内的行一律不动。
+///
+/// 已知边界：跨行代码段（软换行把一段代码断开）不会被识别，该行按 GFM 照常切列——清单里
+/// 不这么写，且这种错是"能看见"的错（列多了一列），不会静默丢内容。
+fn escape_table_code_pipes(src: &str) -> String {
+    // 用 `split('\n')` 而不是 `lines()`：后者会把 CRLF 归一成 LF，等于顺手改了正文。
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut is_table = vec![false; lines.len()];
+    let mut in_fence = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if fence_of(lines[i].trim_start()).is_some() {
+            in_fence = !in_fence;
+            i += 1;
+            continue;
+        }
+        let header_of_table = !in_fence
+            && lines.get(i + 1).is_some_and(|n| {
+                let n = n.trim();
+                is_delimiter_row(n) && cells_of(n).len() == cells_of(lines[i].trim()).len()
+            });
+        if header_of_table {
+            is_table[i] = true;
+            let mut j = i + 2;
+            while j < lines.len() && is_table_row(lines[j].trim()) {
+                is_table[j] = true;
+                j += 1;
+            }
             i = j;
             continue;
         }
-        if items.is_empty() {
-            ordered = split_ordered(lines[i].trim_start()).is_some();
-            start = split_ordered(lines[i].trim_start()).map_or(1, |(n, _)| n);
+        i += 1;
+    }
+    if !is_table.iter().any(|b| *b) {
+        // 绝大多数正文没有表格，别为它重建整篇。
+        return src.to_string();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(k, l)| {
+            if is_table[k] {
+                escape_code_span_pipes(l)
+            } else {
+                (*l).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 单行内把**代码段中未转义的裸竖线**加上反斜杠，其余字符一字不动。
+///
+/// 等长反引号才闭合（GFM）：`` `a``b` `` 里的 `` `` `` 不该结束单个反引号开头的代码段；
+/// 不成对时按普通字符处理（fail-closed 到"照常切列"）。
+fn escape_code_span_pipes(line: &str) -> String {
+    let c: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < c.len() {
+        // 已有转义对整体进格（`\|` 不再重复加反斜杠）。
+        if c[i] == '\\' && i + 1 < c.len() {
+            out.push(c[i]);
+            out.push(c[i + 1]);
+            i += 2;
+            continue;
         }
-        // 本项正文 = 首行内容 + 其后更深缩进 / 顶格续行（AI 常这么写）。
-        let mut text = body;
-        let mut j = i + 1;
-        while let Some(l) = lines.get(j) {
-            if l.trim().is_empty() {
-                if next_indent(lines, j) > base {
-                    text.push('\n');
-                    j += 1;
+        if c[i] == '`' {
+            let n = tick_run(&c, i);
+            match tick_close(&c, i + n, n) {
+                Some(end) => {
+                    for k in i..=end {
+                        if c[k] == '|' && (k == 0 || c[k - 1] != '\\') {
+                            out.push('\\');
+                        }
+                        out.push(c[k]);
+                    }
+                    i = end + n;
                     continue;
                 }
-                break;
+                None => {
+                    out.push(c[i]);
+                    i += 1;
+                    continue;
+                }
             }
-            let ind = l.len() - l.trim_start().len();
-            if ind > base || list_marker(l).is_none() {
-                text.push('\n');
-                text.push_str(l.trim_start());
-                j += 1;
-                continue;
-            }
-            break;
         }
-        items.push(ListItem {
-            checked,
-            blocks: parse(&text),
-        });
-        i = j;
+        out.push(c[i]);
+        i += 1;
     }
-    (
-        Block::List(List {
-            ordered,
-            start,
-            items,
-        }),
-        i,
-    )
+    out
 }
 
-fn next_indent(lines: &[&str], j: usize) -> usize {
-    lines
-        .get(j + 1)
-        .map(|l| l.len() - l.trim_start().len())
-        .unwrap_or(0)
-}
-
-/// 行内结构的纯文本化（渲染标题文本 / 测试断言 / 调试都用它）。
-pub fn inline_text(v: &[Inline]) -> String {
-    let mut s = String::new();
-    for i in v {
-        match i {
-            Inline::Text(t) | Inline::Code(t) => s.push_str(t),
-            Inline::Strong(c) | Inline::Emphasis(c) | Inline::Strikethrough(c) => {
-                s.push_str(&inline_text(c))
-            }
-            Inline::Link { text, .. } => s.push_str(&inline_text(text)),
-            Inline::Image { alt, .. } => s.push_str(alt),
-        }
-    }
-    s
-}
+// ---------- 表格行判定（GFM 口径） ----------
 
 fn fence_of(t: &str) -> Option<&'static str> {
     if t.starts_with("```") {
@@ -587,34 +702,15 @@ fn is_table_row(t: &str) -> bool {
     t.contains('|') && !is_rule(t) && heading_of(t).is_none()
 }
 
-fn aligns_of(t: &str) -> Vec<Align> {
-    cells_of(t)
-        .iter()
-        .map(|c| {
-            let c = c.trim();
-            match (c.starts_with(':'), c.ends_with(':')) {
-                (true, true) => Align::Center,
-                (false, true) => Align::Right,
-                _ => Align::Left,
-            }
-        })
-        .collect()
-}
-
-/// 表格一行的各格（已解析行内）。
-fn inlines_of_row(t: &str) -> Vec<Vec<Inline>> {
-    cells_of(t).iter().map(|c| parse_inlines(c)).collect()
-}
-
 /// 拆分表格行：去掉首尾竖线后按 `|` 切，逐格 trim。
+///
+/// 现在它只服务于**表格行的判定**（[`escape_table_code_pipes`] 要拿格数与分隔行比对），
+/// 不再直接产出单元格 —— 单元格由解析器给。
 ///
 /// **`|` 不是见到就切**。两种竖线必须放过，否则 AI 写的表格会被切碎：
 /// - 反斜杠转义的 `\|`（GFM 明确支持把竖线写进单元格里）；
-/// - 反引号代码段里的竖线 —— 清单里"字段用 `file|anchor|replacement` 分隔"这类
-///   行几乎都这么写，按列切开就变成多出好几列、内容整体错位（`预估工时` 被甩到最后）。
-///
-/// 单元格原文**不剥反斜杠**，原样交给 [`parse_inlines`]：GFM 里反斜杠转义在代码段内
-/// 不生效，这条规则该由行内解析器解释一次；拆列与行内各解释一遍，迟早会对不上。
+/// - 反引号代码段里的竖线 —— 清单里"字段用 `file|anchor|replacement` 分隔"这类行
+///   几乎都这么写，按列切开就变成多出好几列、内容整体错位。
 fn cells_of(t: &str) -> Vec<String> {
     let t = t.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
@@ -626,7 +722,7 @@ fn cells_of(t: &str) -> Vec<String> {
     while i < cs.len() {
         match cs[i] {
             '\\' if i + 1 < cs.len() => {
-                // 转义对：两个字符一起进本格，`\` 留给行内解析器去解释。
+                // 转义对：两个字符一起进本格。
                 buf.push('\\');
                 buf.push(cs[i + 1]);
                 i += 2;
@@ -686,6 +782,36 @@ fn tick_close(c: &[char], start: usize, n: usize) -> Option<usize> {
     None
 }
 
+// ---------- 字形降级 ----------
+
+/// 内嵌字体缺字形时的**降级替换**：AI 写的清单很爱用 `✅` / `❌` / `⭐`，
+/// 而 Noto Sans SC 没有这些 emoji 的字形（emoji 在 Noto Color Emoji 里，本项目没内嵌），
+/// 不降级就会在界面上显示成 `?`（豆腐块），审核人看到的是" inexplicable 的问号"。
+/// 换成字体里有的等义单字符（`✓ ✗ ⚠ ★` 都在子集范围内）——信息不丢，也不必为几个符号再内嵌一份字体。
+fn fallback_glyph(c: char) -> Option<char> {
+    match c {
+        '✅' | '☑' | '✔' => Some('\u{2713}'),  // ✓
+        '❌' | '✖' | '❎' => Some('\u{2717}'), // ✗
+        '⭐' => Some('\u{2605}'),              // ★
+        _ => None,
+    }
+}
+
+/// 行内结构的纯文本化（渲染标题文本 / 测试断言 / 调试都用它）。
+pub fn inline_text(v: &[Inline]) -> String {
+    let mut s = String::new();
+    for i in v {
+        match i {
+            Inline::Text(t) | Inline::Code(t) => s.push_str(t),
+            Inline::Strong(c) | Inline::Emphasis(c) | Inline::Strikethrough(c) => {
+                s.push_str(&inline_text(c))
+            }
+            Inline::Link { text, .. } => s.push_str(&inline_text(text)),
+            Inline::Image { alt, .. } => s.push_str(alt),
+        }
+    }
+    s
+}
 /// 渲染缓存：同一段、同一份原文只解析一次。
 ///
 /// egui 是即时模式、每帧重画：不清缓存就得每帧重跑一遍解析（还要反复克隆原文）。
@@ -716,46 +842,98 @@ impl Cache {
 
 /// 渲染块序列（垂直流式排布；纵向滚动交给外层 `ScrollArea`）。
 ///
-/// **版心宽度是整篇正文唯一的宽度基准**：进来时 `ui.available_width()` 就是版心，
+/// **版心宽度是整篇正文唯一的宽度基准**，这里同时是它**唯一的收口处**：
+/// 版心 = `min(可用宽, MEASURE_W)`，再交给一个"限宽 + 左对齐 + 整体居中"的子 ui 往下传。
 /// 往下每一层只能是"上层宽度减去一个固定量"（引用块的边框留白、列表符号的缩进），
 /// 不能有哪一层自己另问一个宽度——那样同段里就会出现"这段行数多、那段行数少"。
 /// 两处最容易破这条的地方：列表（一项一行，见 [`list_block`]）与表格
 /// （列宽由版心分配，见 [`table`]）。
+///
+/// **为什么收口在入口而不是各块自己算**：子 ui 的 rect 就是版心，于是段落折行、表格列宽分配、
+/// 代码块滚动区读到的 `available_width()` 全都自动变成同一个版心——一处改动全局收敛，
+/// 也不会有哪块"忘了"上限而把行拉宽。
 pub fn show(ui: &mut egui::Ui, blocks: &[Block]) {
     // 正文允许框选复制：审核人常要摘一段回评论里，渲染不能把这条路堵死。
     ui.style_mut().interaction.selectable_labels = true;
+    let avail = ui.available_rect_before_wrap();
+    let measure = avail.width().min(MEASURE_W);
+    // **摆正的是"版心这一块"，不是每个子控件**。所以不用 `vertical_centered`：
+    // 它把每个子控件在**自己的可用宽度里**居中，于是"符号 + 短标签"这种窄行会被推到
+    // 版心中间——符号的 x 随文字宽度变，列表缩进与"同列表各项正文起点一致"当场作废。
+    //
+    // ⚠ **必须用 `scope_builder`，不能换成 `new_child`**（都实测过，见单测
+    // `在滚动区里不遮挡后续控件_且内容高度可滚动`）：
+    // `new_child` 把子 ui 摆到 `max_rect` 上却**不推进父游标**，于是正文会压住后面的控件
+    // （下一段的标题与按钮），且外层 `ScrollArea` 量到的内容高度只有视口高 → 整篇滚不动。
+    // `scope_builder` = `new_child` + `advance_cursor_after_rect(child.min_rect())`：
+    // 父游标按子 ui **实际内容高**推进，滚动区才量得出真实高度。
+    //
+    // 高度取 `avail.max.y` 而不是写死高度：滚动区里它是无限高，正文多长就长多高。
+    let x0 = avail.min.x + (avail.width() - measure) / 2.0;
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(x0, avail.min.y),
+        egui::pos2(x0 + measure, avail.max.y),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| show_at(ui, blocks, 0),
+    );
+}
+
+/// 按列表嵌套层级渲染块序列（`depth = 0` 是最外层）。
+///
+fn show_at(ui: &mut egui::Ui, blocks: &[Block], depth: usize) {
     for (i, b) in blocks.iter().enumerate() {
         // 每块一个 id 作用域：同段里出现多个表格 / 勾选框也不会互相串 id。
-        ui.push_id(i, |ui| {
+        // 键带上层级：嵌套列表与外层列表的下标会重号，只用下标会串到同一块去。
+        ui.push_id((depth, i), |ui| {
             if i > 0 {
-                ui.add_space(6.0);
+                ui.add_space(gap_before(b));
             }
-            block(ui, b);
+            block(ui, b, depth);
+            // 标题自带"后间距"，与"块间距"分开：标题后面留得多一点，标题就成了"小节"。
+            if matches!(b, Block::Heading { .. }) {
+                ui.add_space(HEADING_GAP_AFTER);
+            }
         });
     }
 }
 
-fn block(ui: &mut egui::Ui, b: &Block) {
+/// 块间距：标题前给大一些，让标题与小节内容脱开。
+fn gap_before(b: &Block) -> f32 {
+    match b {
+        Block::Heading { .. } => HEADING_GAP_BEFORE,
+        _ => BLOCK_GAP,
+    }
+}
+
+fn block(ui: &mut egui::Ui, b: &Block, depth: usize) {
     match b {
         Block::Heading { level, inlines } => {
-            let size = match level {
-                1 => 22.0,
-                2 => 19.0,
-                3 => 17.0,
-                _ => 15.0,
+            // 层级靠**字号 + 明度**两档区分：1–2 级是正文色（视觉重心在前面），
+            // 3–4 级用弱化色（`Tone::Muted` 浅底 6.63 / 深底 6.04，均过 WCAG AA，见 palette）。
+            // 走 `inline_job` 而不是拍平成纯文本，是为了让标题里的 `**粗**` 与 `` `码` `` 留住样式。
+            let size = heading_size(*level);
+            let deco = |rt: egui::RichText| {
+                let rt = rt.size(size).strong();
+                if *level >= 3 {
+                    rt.color(palette::Tone::Muted.color(ui))
+                } else {
+                    rt
+                }
             };
-            ui.label(
-                egui::RichText::new(inline_text(inlines))
-                    .size(size)
-                    .strong(),
-            );
+            let style = ui.style().clone();
+            let w = ui.available_width();
+            ui.label(inline_job(ui, inlines, w, &style, deco));
         }
         Block::Paragraph(inlines) => {
             if !inlines.is_empty() {
                 inline_label(ui, inlines);
             }
         }
-        Block::List(list) => list_block(ui, list),
+        Block::List(list) => list_block(ui, list, depth),
         Block::Code { lang, text } => code_block(ui, lang, text),
         Block::Quote(inner) => {
             egui::Frame::new()
@@ -763,12 +941,22 @@ fn block(ui: &mut egui::Ui, b: &Block) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .corner_radius(4)
                 .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .show(ui, |ui| show(ui, inner));
+                // 引用不改变列表层级：引用块只是缩进 + 边框，不是另一层列表。
+                .show(ui, |ui| show_at(ui, inner, depth));
         }
         Block::Table(t) => table(ui, t),
         Block::Rule => {
             ui.separator();
         }
+    }
+}
+
+fn heading_size(level: u8) -> f32 {
+    match level {
+        1 => 22.0,
+        2 => 19.0,
+        3 => 17.0,
+        _ => 15.0,
     }
 }
 
@@ -779,10 +967,38 @@ fn block(ui: &mut egui::Ui, b: &Block) {
 /// 对齐（egui 的 `Label` 在 wrap 布局里还会额外按首行缩进重排）—— 万一两项被排到同一行，
 /// 第二项的折行宽度就成了"版心 − 上一项宽度"，同一列表里每行字数不一样。
 /// 规则写死成一行一项，这个自由度就不要了（宽度基准见 [`show`]）。
-fn list_block(ui: &mut egui::Ui, list: &List) {
+///
+/// **缩进按层级递增**（符号列落在 `LIST_INDENT_W * (depth + 1)`）：早先每一层都只加同一个
+/// 常量，于是"外层项"与"内层项"的符号挤在同一列，看不出层级。
+///
+/// **有序编号按本列表最大编号位数右对齐**（画在定宽符号列里，见 [`LIST_SYMBOL_W`]）：
+/// 否则 `9.` 与 `10.` 宽度差一个字符，同一列表里每项的正文起点都在动（跨过 9 的那一项
+/// 整列文字会横向跳一下）。
+///
+/// **嵌套项的其余块另起一行、从行左边缘重新算缩进**（`ui.indent` 那段）：早先把嵌套列表排进
+/// 父项的**正文列**里，于是每层的缩进都叠在父列偏移上（16 变成"16 + 符号宽 + 列间距"），
+/// 层级步长不匀、第���层的正文还会比父层的符号还靠右。现在第 `depth` 层的符号列一律落在
+/// `LIST_INDENT_W * (depth + 1)`：每深入一层正好右移一个 [`LIST_INDENT_W`]。
+fn list_block(ui: &mut egui::Ui, list: &List, depth: usize) {
+    // 编号位数（含小数点）取本列表最大编号的宽度。
+    let num_w = list
+        .items
+        .len()
+        .saturating_add(list.start.saturating_sub(1) as usize)
+        .max(1)
+        .to_string()
+        .len()
+        + 1;
+    let row_h = ui.spacing().interact_size.y;
     for (i, item) in list.items.iter().enumerate() {
+        // 首段（紧凑项）与符号同一行；其余块另起，见下面 `ui.indent` 那段。
+        let (first, rest): (Option<&Vec<Inline>>, &[Block]) = match item.blocks.as_slice() {
+            [Block::Paragraph(v)] => (Some(v), &[]),
+            [Block::Paragraph(v), tail @ ..] => (Some(v), tail),
+            other => (None, other),
+        };
         ui.horizontal_top(|ui| {
-            ui.add_space(LIST_INDENT_W);
+            ui.add_space(LIST_INDENT_W * (depth + 1) as f32);
             match item.checked {
                 // 任务项渲染成灰色只读勾选框：`[x]` 已完成 / `[ ]` 未完成。
                 // 只读是刻意的：正文由 AI / 编辑器维护，界面只做审核决策，不代改清单。
@@ -796,20 +1012,55 @@ fn list_block(ui: &mut egui::Ui, list: &List) {
                         });
                 }
                 None => {
-                    if list.ordered {
-                        ui.label(format!("{}.", list.start + i as u64));
+                    let text = if list.ordered {
+                        format!("{:>num_w$}.", list.start + i as u64)
                     } else {
-                        ui.label("•");
-                    }
+                        "\u{2022}".to_string()
+                    };
+                    symbol(ui, &text, row_h);
                 }
             }
-            ui.vertical(|ui| match item.blocks.as_slice() {
-                // 紧凑列表：项内只有一段就直接跟在符号后面（否则会多出一大片空隙）。
-                [Block::Paragraph(inlines)] => inline_label(ui, inlines),
-                blocks => show(ui, blocks),
+            // 首段必须放进 `ui.vertical`：`horizontal_top` 是横向布局，
+            // 那里 `available_width()` 是 inf，直接 label 就**不折行**了（会横向溢出）。
+            ui.vertical(|ui| {
+                if let Some(v) = first {
+                    if !v.is_empty() {
+                        inline_label(ui, v);
+                    }
+                }
             });
         });
+        if rest.is_empty() {
+            continue;
+        }
+        // 其余块（嵌套列表 / 表格 / 代码块 / 副标题）另起一行。
+        // **嵌套列表自己已经按层级缩进**（`depth + 1` 级），这里再 `ui.indent` 就叠成两级；
+        // 没有列表可缩进的块（表格 / 代码块 / 副标题）才统一进一级。
+        if rest.iter().all(|b| matches!(b, Block::List(_))) {
+            show_at(ui, rest, depth + 1);
+        } else {
+            // `ui.indent` 读的是**调用前**的 `spacing().indent`，所以必须先改后调、再还原。
+            let saved = ui.spacing_mut().indent;
+            ui.spacing_mut().indent = LIST_INDENT_W;
+            ui.indent(("li", depth, i), |ui| show_at(ui, rest, depth + 1));
+            ui.spacing_mut().indent = saved;
+        }
     }
+}
+
+/// 在**定宽**符号列里画符号 / 编号（编号右对齐），让正文起点只由列宽决定。
+///
+/// 不用 `ui.label`：标签按文字自然宽度排，`9.` 与 `10.` 就会把后面的正文推到不同起点。
+fn symbol(ui: &mut egui::Ui, text: &str, row_h: f32) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, ui.visuals().text_color());
+    let (_id, rect) = ui.allocate_space(egui::vec2(LIST_SYMBOL_W, row_h));
+    let x = rect.min.x + (LIST_SYMBOL_W - galley.size().x).max(0.0);
+    let y = rect.min.y + (row_h - galley.size().y).max(0.0) / 2.0;
+    ui.painter()
+        .galley(egui::pos2(x, y), galley, ui.visuals().text_color());
 }
 
 fn code_block(ui: &mut egui::Ui, lang: &str, text: &str) {
@@ -1070,7 +1321,23 @@ const MIN_COL_W: f32 = 56.0;
 const CELL_PAD_X: f32 = 8.0;
 const CELL_PAD_Y: f32 = 3.0;
 /// 列表符号前的缩进（有序无序同宽，两种列表看起来才是一套的）。
+/// **每深入一层加一个**——固定缩进套在每层上会让嵌套列表看起来是"平的两段"（见 [`list_block`]）。
 const LIST_INDENT_W: f32 = 16.0;
+/// 列表符号列的**定宽**：符号 / 勾选框 / 编号都占这么宽，正文起点只由它决定。
+/// 定宽是"编号右对齐"与"层级步长稳定"两条的前提（见 [`list_block`] 与 [`symbol`]）。
+const LIST_SYMBOL_W: f32 = 20.0;
+/// 版心宽度上限：正文折行不超过它，超出部分留白、内容水平居中。
+///
+/// 为什么要有上限：中央面板在宽屏下能到 1200+px，一行塞 50 多个汉字，而中文正文的
+/// 舒适区是 30–40 字/行（≈ 640–720px）——超了"扫行时找不到下一行的开头"。
+/// 680 ≈ 34 个汉字。这是**审美取值**，要改只改这一个常量。
+const MEASURE_W: f32 = 680.0;
+/// 块与块之间的间距（标题另算，见 [`gap_before`]）。
+const BLOCK_GAP: f32 = 10.0;
+/// 标题与它前面那块内容的间距：比块间距大，标题才像"小节标题"而不只是"大一号的行"。
+const HEADING_GAP_BEFORE: f32 = 14.0;
+/// 标题与它后面内容的间距：小一点，否则标题会与小节内容脱开、像换了个区域。
+const HEADING_GAP_AFTER: f32 = 4.0;
 
 fn align_of(t: &Table, i: usize) -> Align {
     t.aligns.get(i).copied().unwrap_or(Align::Left)
@@ -1191,6 +1458,19 @@ mod tests {
         blocks.iter().map(block_text).collect::<Vec<_>>().join("\n")
     }
 
+    /// 解析一段**单块**正文并取出行内序列。
+    ///
+    /// 解析层换成 `pulldown-cmark` 之后没有"只解析行内"的入口了，而用例要断言的恰恰是
+    /// "**公开入口**解析出的结构"，所以统一从 [`parse`] 进——直接调内部辅助函数断言的用例
+    /// 会在重构时静默失效（测的是实现细节，不是行为）。
+    fn inlines_of(src: &str) -> Vec<Inline> {
+        let blocks = parse(src);
+        match blocks.first() {
+            Some(Block::Paragraph(v)) | Some(Block::Heading { inlines: v, .. }) => v.clone(),
+            other => panic!("首块应含行内：{other:?}"),
+        }
+    }
+
     /// 离屏跑一帧的上下文，**必须**带内嵌字体。
     ///
     /// `Context::default()` 里没有可用的中文字形，长出来的 galley 尺寸全是 0，
@@ -1275,13 +1555,13 @@ mod tests {
     fn 字体缺字形的符号降级为等义字符() {
         // 内嵌字体没有 ✅/❌ 的字形，不降级就显示成 `?`。
         assert_eq!(
-            inline_text(&parse_inlines("✅ 通过　❌ 未做")),
+            inline_text(&inlines_of("✅ 通过　❌ 未做")),
             "✓ 通过　✗ 未做"
         );
-        assert_eq!(inline_text(&parse_inlines("⚠️ 注意")), "⚠ 注意");
-        assert_eq!(inline_text(&parse_inlines("⭐ 重要")), "★ 重要");
+        assert_eq!(inline_text(&inlines_of("⚠️ 注意")), "⚠ 注意");
+        assert_eq!(inline_text(&inlines_of("⭐ 重要")), "★ 重要");
         // 没有被降级的字符原样保留。
-        assert_eq!(inline_text(&parse_inlines("正常 ✓ 字符")), "正常 ✓ 字符");
+        assert_eq!(inline_text(&inlines_of("正常 ✓ 字符")), "正常 ✓ 字符");
     }
 
     #[test]
@@ -1298,6 +1578,10 @@ mod tests {
     fn 表格单元格内的竖线不切列() {
         // 真实缺陷：清单里"字段用 `file|anchor|replacement` 分隔"这类行，
         // 按 `|` 硬切就变成多出好几列、内容整体错位（列数还会被数据行顶大）。
+        //
+        // 解析器（GFM）要求表格内的竖线必须转义，**代码段内也不例外**，而清单里大量不转义；
+        // 直接喂原文会被切成 3 格并把 `repl` 之后的内容与 `2h` **静默丢掉**（实测）。
+        // 是 [`escape_table_code_pipes`] 把它补回来的 —— 这条用例守的就是那一层。
         let b = parse(
             "| 编号 | 子任务 | 预估工时 |\n| --- | --- | --- |\n\
              | T1 | 变异清单文件格式（`file|anchor|replacement|test-filter|理由`） | 2h |\n",
@@ -1320,17 +1604,57 @@ mod tests {
     #[test]
     fn 表格里转义的竖线也不切列() {
         // GFM：`\|` 与代码段内的竖线同义，都是"内容里的竖线"。
-        let cells = cells_of(r"| a\|b | `c|d` | e |");
-        assert_eq!(cells, vec!["a\\|b", "`c|d`", "e"]);
-        // 反斜杠由行内解析器解释（GFM 里代码段内不解释转义）。
-        assert_eq!(inline_text(&parse_inlines(&cells[0])), "a|b");
-        assert_eq!(inline_text(&parse_inlines(&cells[1])), "c|d");
+        let b = parse("| a | b |\n| --- | --- |\n| `a|b` | c\\|d |\n");
+        let Block::Table(t) = &b[0] else {
+            panic!("应为表格：{:?}", b[0])
+        };
+        assert_eq!(t.header.len(), 2);
+        assert_eq!(t.rows[0].len(), 2);
+        assert_eq!(inline_text(&t.rows[0][0]), "a|b");
+        assert_eq!(inline_text(&t.rows[0][1]), "c|d");
     }
 
     #[test]
     fn 未闭合的反引号仍按列分隔() {
         // 不成对的反引号不是代码段（GFM），否则整行会被并成一格、后面几列全丢。
-        assert_eq!(cells_of("| a | b`c | d |"), vec!["a", "b`c", "d"]);
+        let b = parse("| a | b | c |\n| --- | --- | --- |\n| b`c | d | e |\n");
+        let Block::Table(t) = &b[0] else {
+            panic!("应为表格：{:?}", b[0])
+        };
+        assert_eq!(t.rows[0].len(), 3);
+        assert_eq!(inline_text(&t.rows[0][0]), "b`c");
+        assert_eq!(inline_text(&t.rows[0][2]), "e");
+    }
+
+    #[test]
+    fn 已转义的竖线不被重复转义() {
+        // 归一化只在**未转义**的裸竖线前加 `\`。这里若也加一次，单元格里会多一个反斜杠
+        // （代码段内反斜杠不生效，`a\\|b` 会原样显示出来）。
+        let b = parse("| a | b |\n| --- | --- |\n| `x\\|y` | z |\n");
+        let Block::Table(t) = &b[0] else {
+            panic!("应为表格：{:?}", b[0])
+        };
+        assert_eq!(t.rows[0].len(), 2);
+        assert_eq!(inline_text(&t.rows[0][0]), "x|y");
+    }
+
+    #[test]
+    fn 围栏代码块与普通段落里的竖线一字不改() {
+        // 归一化**只动表格行**：代码段内反斜杠不生效，给普通段落的 `` `a|b` `` 补转义
+        // 等于把对的写成错的（会显示成 `a\|b`）。
+        let b = parse("段落里有 `a|b` 和 | 竖线\n\n```\n| a | `x|y` |\n```\n");
+        assert_eq!(
+            inline_text(&inlines_of("段落里有 `a|b` 和 | 竖线")),
+            "段落里有 a|b 和 | 竖线"
+        );
+        let code: Vec<&str> = b
+            .iter()
+            .filter_map(|x| match x {
+                Block::Code { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, vec!["| a | `x|y` |\n"]);
     }
 
     #[test]
@@ -1353,14 +1677,91 @@ mod tests {
     }
 
     #[test]
+    fn 版心宽度有上限且正文居中() {
+        // 800 宽的屏：中央面板可用宽（约 784）远大于版心 680，
+        // 于是正文必须被限到 680 并水平居中——早先正文直接吃满可用宽，
+        // 一行能塞 50 多个汉字，"扫行时找不到下一行的开头"。
+        let ctx = ctx_with_fonts();
+        let blocks = parse(&format!("{}。\n", "这".repeat(200)));
+        let measure = std::cell::Cell::new(0.0f32);
+        let avail = std::cell::Cell::new(egui::Rect::NOTHING);
+        let mut out = ctx.run_ui(raw(), |ui| {
+            measure.set(ui.available_width().min(MEASURE_W));
+            avail.set(ui.available_rect_before_wrap());
+            show(ui, &blocks);
+        });
+        out.textures_delta.clear();
+        let para = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("这") => Some(t.clone()),
+                _ => None,
+            })
+            .expect("应画出段落文字");
+        let wrap = para.galley.job.wrap.max_width;
+        assert_eq!(measure.get(), MEASURE_W, "800 宽屏下版心应取上限");
+        assert!(
+            (wrap - measure.get()).abs() < 1.0,
+            "折行宽度 {wrap} 应等于版心 {}",
+            measure.get()
+        );
+        // 居中量的是**版心这一块**的左右留白，不是墨迹：
+        // 段落实际排出来的每行宽度取决于字形（实测最宽的一行 676 而版心是 680），
+        // 拿墨迹中线断言"左右留白相等"会永远差那几像素。版心左边缘 = 段落排版原点。
+        let pad_left = para.pos.x - avail.get().min.x;
+        let pad_right = avail.get().max.x - (para.pos.x + measure.get());
+        assert!(
+            (pad_left - pad_right).abs() < 1.0,
+            "版心左右留白应相等：左 {pad_left} vs 右 {pad_right}（版心宽 {}）",
+            measure.get()
+        );
+    }
+
+    #[test]
+    fn 版心在窄面板下退化为可用宽() {
+        // 面板比版心还窄时不能硬撑 680（会溢出），`min` 必须生效。
+        let ctx = ctx_with_fonts();
+        let blocks = parse(&format!("{}。\n", "短".repeat(4)));
+        let mut raw = raw();
+        raw.screen_rect = Some(eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(400.0, 600.0),
+        ));
+        let measure = std::cell::Cell::new(0.0f32);
+        let mut out = ctx.run_ui(raw, |ui| {
+            measure.set(ui.available_width());
+            show(ui, &blocks);
+        });
+        out.textures_delta.clear();
+        let wrap = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("短") => {
+                    Some(t.galley.job.wrap.max_width)
+                }
+                _ => None,
+            })
+            .expect("应画出段落文字");
+        assert!(measure.get() < MEASURE_W, "400 宽屏的可用宽应小于版心");
+        assert!(
+            (wrap - measure.get()).abs() < 1.0,
+            "折行宽度 {wrap} 应等于可用宽 {}",
+            measure.get()
+        );
+    }
+
+    #[test]
     fn 表格宽度等于版心而不是等于内容() {
         // 两列短表曾经只有百来 px 宽（列宽上限 300px + 整表按内容收缩），
         // 与同页段落不齐；表头底色的宽度就是整表宽度，拿它跟版心比最直接。
+        // 基准是 `min(可用宽, MEASURE_W)`：版心加了上限之后，"版心"不再是可用宽本身。
         let ctx = ctx_with_fonts();
         let blocks = parse("一段正文。\n\n| 项 | 值 |\n| --- | --- |\n| a | 1 |\n");
         let measure = std::cell::Cell::new(0.0f32);
         let mut out = ctx.run_ui(raw(), |ui| {
-            measure.set(ui.available_width());
+            measure.set(ui.available_width().min(MEASURE_W));
             show(ui, &blocks);
         });
         out.textures_delta.clear();
@@ -1394,18 +1795,81 @@ mod tests {
             measure.get()
         );
         // 单元格文字不得越出版心右边缘（列宽分配错了就会越界）。
-        let right = out
+        let (left, right) = out
             .shapes
             .iter()
             .filter_map(|s| match &s.shape {
-                egui::epaint::Shape::Text(t) => Some(t.visual_bounding_rect().max.x),
+                egui::epaint::Shape::Text(t) => Some(t.visual_bounding_rect()),
                 _ => None,
             })
-            .fold(0.0f32, f32::max);
+            .fold((f32::MAX, 0.0f32), |(lo, hi), r| {
+                (lo.min(r.min.x), hi.max(r.max.x))
+            });
         assert!(
-            right <= measure.get() + 1.0,
-            "文字右边缘 {right} 不应越出版心宽 {}",
-            measure.get()
+            right <= left + measure.get() + 1.0,
+            "文字右边缘 {right} 不应越过版心右边缘 {}",
+            left + measure.get()
+        );
+    }
+
+    #[test]
+    fn 列表缩进按层级递增() {
+        // 早先每一层都只加同一个常量缩进，内外层的正文起点只差 16px，
+        // 两层挤在一起看不出层级。守住"每深入一层 +LIST_INDENT_W"这条。
+        // 比的是两项**正文**的起点：符号相同（都是 `•`），差值就等于缩进差。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("- 外\n  - 内\n");
+        let mut out = ctx.run_ui(raw(), |ui| show(ui, &blocks));
+        out.textures_delta.clear();
+        let x_of = |name: &str| {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    // 取**排版原点**而不是视觉矩形：后者含字形边距，
+                    // 不同字的边距不同（"外"与"内"就差 1px），会污染缩进断言。
+                    egui::epaint::Shape::Text(t) if t.galley.text().trim() == name => Some(t.pos.x),
+                    _ => None,
+                })
+                .fold(None::<f32>, |acc: Option<f32>, x| {
+                    Some(acc.map_or(x, |a| a.min(x)))
+                })
+                .unwrap_or_else(|| panic!("没画出 {name}"))
+        };
+        let delta = x_of("内") - x_of("外");
+        assert!(
+            (delta - LIST_INDENT_W).abs() < 0.5,
+            "内外层正文起点应差 {LIST_INDENT_W}，实得 {delta}"
+        );
+    }
+
+    #[test]
+    fn 有序编号按最大位数右对齐() {
+        // `9.` 与 `10.` 宽度差一个字符：不右对齐的话，同一列表里跨过 9 的那一项
+        // 整列文字会横向跳一下。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("9. 九\n10. 十\n");
+        let mut out = ctx.run_ui(raw(), |ui| show(ui, &blocks));
+        out.textures_delta.clear();
+        let right_of = |num: &str| {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    // 排版右边缘（绘制原点 + 排版矩形右端），不含字形边距。
+                    egui::epaint::Shape::Text(t) if t.galley.text().trim() == num => {
+                        Some(t.pos.x + t.galley.rect.max.x)
+                    }
+                    _ => None,
+                })
+                .fold(None::<f32>, |acc: Option<f32>, x| {
+                    Some(acc.map_or(x, |a| a.min(x)))
+                })
+                .unwrap_or_else(|| panic!("没画出编号 {num}"))
+        };
+        assert!(
+            (right_of("9.") - right_of("10.")).abs() < 1.0,
+            "编号右边缘应一致：{} vs {}",
+            right_of("9."),
+            right_of("10.")
         );
     }
 
@@ -1463,7 +1927,7 @@ mod tests {
 
     #[test]
     fn 链接与图片只降级为文本不丢内容() {
-        let v = parse_inlines("见 [文档](https://a.tld/x) 与 ![图](a.png)");
+        let v = inlines_of("见 [文档](https://a.tld/x) 与 ![图](a.png)");
         let Inline::Link { dest, .. } = &v[1] else {
             panic!("应为链接：{:?}", v[1])
         };
@@ -1475,14 +1939,14 @@ mod tests {
 
     #[test]
     fn 未闭合语法按原文保留() {
-        let v = parse_inlines("未闭合 **粗 与 `码");
+        let v = inlines_of("未闭合 **粗 与 `码");
         assert_eq!(inline_text(&v), "未闭合 **粗 与 `码");
     }
 
     #[test]
     fn 标识符里的下划线不被当成斜体() {
         assert_eq!(
-            inline_text(&parse_inlines("see req_guard_hook.sh")),
+            inline_text(&inlines_of("see req_guard_hook.sh")),
             "see req_guard_hook.sh"
         );
     }
@@ -1531,11 +1995,117 @@ mod tests {
         assert_eq!(&again, c.get(0, "- [ ] 一"));
         // 正文改了 → 立刻换成新内容（否则审核人看的是上一版清单）。
         assert!(matches!(&c.get(0, "- [ ] 二")[0], Block::List(l)
-            if l.items[0].blocks[0] == Block::Paragraph(parse_inlines("二"))));
+            if l.items[0].blocks[0] == Block::Paragraph(inlines_of("二"))));
         // 段下标变了 → 取的是新一段的内容（不是上一段的缓存）。
         assert!(matches!(c.get(1, "## b")[0], Block::Heading { .. }));
         c.clear();
         assert!(matches!(c.get(1, "## b")[0], Block::Heading { .. }));
+    }
+
+    #[test]
+    fn 标题与注释的块序稳定() {
+        // HTML 注释在事件流里是 `HtmlBlock` + `Html`，整块丢弃后
+        // "标题后面紧跟列表"这个次序必须不变（清单的段结构就靠它）。
+        let b = parse("## 1. 需求分解\n\n<!-- GATE:STEP name=decomposition -->\n\n- [ ] 背景\n");
+        assert!(matches!(b[0], Block::Heading { level: 2, .. }));
+        assert!(matches!(b[1], Block::List(_)));
+        assert_eq!(b.len(), 2, "不该多出空块：{b:?}");
+    }
+
+    #[test]
+    fn 链接地址与图片地址都不进正文() {
+        // 安全纪律的可观测面：渲染出来的文字里**不许**出现真实地址，
+        // 否则等于把 `https://evil.tld` 摆在审核人眼前等他照抄。
+        let ctx = ctx_with_fonts();
+        let blocks = parse("见 [文档](https://a.tld/x) 与 ![图](a.png)\n");
+        let mut out = ctx.run_ui(raw(), |ui| show(ui, &blocks));
+        out.textures_delta.clear();
+        let drawn: String = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(drawn.contains("文档") && drawn.contains("图"), "{drawn:?}");
+        assert!(!drawn.contains("a.tld"), "链接地址不应被渲染：{drawn:?}");
+        assert!(!drawn.contains("a.png"), "图片地址不应被渲染：{drawn:?}");
+    }
+
+    #[test]
+    fn 在滚动区里不遮挡后续控件_且内容高度可滚动() {
+        // 复现**真实容器**（`app.rs` 的结构）：纵向 ScrollArea → CollapsingHeader 正文 → show()。
+        //
+        // 曾经的故障：`show()` 用 `new_child` 把版心子 ui 直接摆到父 ui 的可用区里，
+        // **父游标不推进**（`new_child` 不像 `scope_builder` 那样 advance_cursor），
+        // 于是正文压在了下一段标题/按钮上，且 ScrollArea 量到的内容高度只有视口高 → 滚不动。
+        // 裸 ui 里的离屏测试（版心宽度那几条）**测不出这个故障**：它们不经过滚动区。
+        let ctx = ctx_with_fonts();
+        let body = (0..40)
+            .map(|i| format!("第 {i} 段：{}", "内容".repeat(30)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let blocks = parse(&body);
+        let end_y = std::cell::Cell::new(0.0f32);
+        let content_h = std::cell::Cell::new(0.0f32);
+        let mut out = ctx.run_ui(raw(), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("md_scroll")
+                .show(ui, |ui| {
+                    egui::CollapsingHeader::new("1. 需求分解")
+                        .open(Some(true))
+                        .show(ui, |ui| show(ui, &blocks));
+                    end_y.set(ui.label("END-OF-BODY").rect.max.y);
+                    content_h.set(ui.min_rect().height());
+                });
+        });
+        out.textures_delta.clear();
+        let last_text_y = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if !t.galley.text().contains("END-OF-BODY") => {
+                    Some(t.visual_bounding_rect().max.y)
+                }
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        // 正文必须排在**它自己的段标题下方**（截图里的故障形态：正文压住段标题）。
+        let header_y = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("需求分解") => {
+                    Some(t.visual_bounding_rect().max.y)
+                }
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        let first_text_y = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("第 0 段") => {
+                    Some(t.visual_bounding_rect().min.y)
+                }
+                _ => None,
+            })
+            .fold(f32::MAX, f32::min);
+        assert!(
+            first_text_y > header_y,
+            "正文首行 y={first_text_y} 应在段标题 y={header_y} 之下：正文压住了段标题"
+        );
+        assert!(
+            end_y.get() > last_text_y,
+            "后续控件应排在正文下方（END y={} <= 正文末行 y={last_text_y}）：正文压住了后续控件",
+            end_y.get()
+        );
+        assert!(
+            content_h.get() > 600.0,
+            "ScrollArea 量到的内容高度 {} 应超过视口 600，否则滚不动",
+            content_h.get()
+        );
     }
 
     #[test]
