@@ -46,6 +46,9 @@ use crate::error::GateError;
 /// 邮箱的环境变量覆盖名（无 git 身份时的逃生口）。
 pub const EMAIL_ENV: &str = "REQ_GUARD_REVIEWER_EMAIL";
 
+/// 操作人姓名的环境变量覆盖名（三级回退的第二档）。
+pub const REVIEWER_ENV: &str = "REQ_GUARD_REVIEWER";
+
 /// 身份指纹的派生盐。改动会让全部历史 `sig` 失效，故视为**格式版本**：
 /// 一旦发布过审批记录就不要改，否则旧记录无法与新记录同口径核对。
 const SIG_SALT: &str = "req-guard-id-v1";
@@ -134,13 +137,20 @@ pub fn fingerprint(root: &Path, name: &str, email: &str) -> String {
 
 /// 读 git 身份（`user.name` + `user.email`）。
 ///
-/// 结果按进程缓存：一次审批链路上有多处要读（bind + 台账 + marker），
+/// 结果按**仓库**缓存：一次审批链路上有多处要读（bind + 台账 + marker），
 /// 而每次都是一个 `git config` 子进程。缓存的生命周期是进程级，
 /// 因此同一次命令内改 git config 不会二次生效——这在门禁工具里可接受
 /// （也避免审批过程中身份中途漂移）。
 ///
 /// 用 `Mutex<Option<..>>` 而非 `OnceLock`：单测需要在同一进程内反复改 git 配置
 /// 再重读（`OnceLock` 一旦 set 就再也写不进去，`reset` 是静默空操作）。
+///
+/// ⚠️ 已知缺陷（**不在 REQ-015 范围内修**）：这份缓存是**进程级**的，
+/// root 参数只在第一次调用时被使用——同一进程里先问 A 仓再问 B 仓，
+/// `current(B)` 返回的仍是 A 的身份，而 `sig` 也是按 A 的路径算的。
+/// 单进程只碰一个仓库时看不出来，但界面与单测都会在一个进程里问多个仓库。
+/// 修它要动 `current` 的语义（REQ-015 G7 明确「不改 identity 语义」），
+/// 故单独立项；新增的 [`resolve_claimed`] **不复用这份缓存**（见该函数注释）。
 static GIT_ID: Mutex<Option<Option<Identity>>> = Mutex::new(None);
 
 fn read_git_identity(root: &Path) -> Option<Identity> {
@@ -296,6 +306,79 @@ pub fn decide(root: &Path, claimed: &str, facts: &Facts, level: u8) -> Result<St
         )));
     }
     Ok(Stamp::unbound(claimed))
+}
+
+/// 解析「谁在做这个动作」：显式参数 → 环境变量 → git 身份，三级回退。
+///
+/// 从 `cli/src/main.rs` 的私有 `resolve_identity` **逐字搬迁**而来（REQ-015 G5/T1）：
+/// 三个前端（CLI / GUI / TUI）必须共用同一条回退链。各写一份的话，
+/// 下一个需要「操作人」的功能就会出现第四种写法，而回退链的**优先级**恰恰是
+/// 那种错了以后看日志也发现不了的东西（三种取值都可能非空）。
+///
+/// `label` / `flag_name` 是错误文案里的「操作人」与 `--author`（或「审核人」与
+/// `--reviewer`）——参数化是必须的：把它们焊死在 core 里，等于让 core 知道
+/// CLI 的具体命令名。
+///
+/// ⚠️ 语义边界：本函数只回答「默认填什么」，**不做**默认值回退。
+/// 调用方拿到结果后若用户把它清空再提交，必须报错——
+/// 「没填」与「填了预填值」在审计上不可区分，而这是 L3 可归属性的基础。
+///
+/// 拆成 [`resolve_decided`]（纯策略）+ 本函数（唯一的 I/O 入口）与模块里
+/// `collect` / `decide` 的划分是同一条纪律：**优先级矩阵必须能被单测穷举**。
+/// 三级回退的三个输入都是进程级状态（参数 / 环境变量 / git 配置），
+/// 若策略与 I/O 写在一起，用例就只能在测试进程里真的去改环境变量和 git 配置，
+/// 而 Rust 的测试是并行的——那会造出一批时绿时红的用例，
+/// 比没有用例更糟（它会让人习惯性忽略红灯）。
+///
+/// ⚠️ 走 [`read_git_identity`] 而**不是**带缓存的 [`current`]：
+/// 那份缓存是进程级且**忽略 root**（见 `GIT_ID` 的注释），
+/// 而本函数的语义恰恰是「**这个仓库**的操作人是谁」——
+/// 界面会在一个进程里切换项目根，复用那份缓存会答出上一个仓库的人。
+/// 代价是每次调用多一个 `git config` 子进程；本函数一次动作只调一次，
+/// 且门禁本来就要为变更集跑 `git diff --cached`，故不改变量级。
+pub fn resolve_claimed(
+    root: &Path,
+    flag: Option<&str>,
+    label: &str,
+    flag_name: &str,
+) -> Result<String, GateError> {
+    resolve_decided(
+        read_git_identity(root).as_ref(),
+        env_nonempty(REVIEWER_ENV).as_deref(),
+        flag,
+        label,
+        flag_name,
+    )
+}
+
+/// 纯策略：给定 git 身份与环境变量，按「显式参数 > 环境变量 > git 身份」定出操作人。
+///
+/// 与 [`resolve_claimed`] 是策略 / I/O 的拆分，理由见那里的注释。
+pub fn resolve_decided(
+    git: Option<&Identity>,
+    env_reviewer: Option<&str>,
+    flag: Option<&str>,
+    label: &str,
+    flag_name: &str,
+) -> Result<String, GateError> {
+    if let Some(s) = flag {
+        if !s.trim().is_empty() {
+            return Ok(s.trim().to_string());
+        }
+    }
+    if let Some(s) = env_reviewer {
+        if !s.trim().is_empty() {
+            return Ok(s.trim().to_string());
+        }
+    }
+    if let Some(id) = git {
+        return Ok(id.name.clone());
+    }
+    Err(GateError::Validation(format!(
+        "缺少{}：请使用 {} <姓名>，或设置环境变量 {}，\
+         或配置 git 身份（git config user.name \"你的名字\"）后由 req-guard 自动取用",
+        label, flag_name, REVIEWER_ENV
+    )))
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -484,5 +567,129 @@ mod tests {
             .expect("邮箱自报名与声明邮箱一致，应放行");
         assert_eq!(s.email, "kou@corp.com");
         assert!(!s.mismatch, "姓名取自报名、邮箱取自声明，两者不冲突");
+    }
+
+    // ---- REQ-015 T1/T2：resolve_claimed 的三级回退 ----
+
+    /// git 姓名为 `Mike Zhu` 的事实（AC-005/006/007 的形态）。
+    fn mike() -> Identity {
+        Identity {
+            name: "Mike Zhu".into(),
+            email: "mike@corp.com".into(),
+            sig: fingerprint(Path::new(ROOT), "Mike Zhu", "mike@corp.com"),
+        }
+    }
+
+    #[test]
+    fn resolve_显式参数优先于环境变量与git身份() {
+        // U1 第一档。三者同时非空 —— 这是唯一能证明「优先级」的形态：
+        // 若实现写反了（比如先取环境变量），这条会红。
+        let got = resolve_decided(
+            Some(&mike()),
+            Some("代审人"),
+            Some("命令行指定"),
+            "审核人",
+            "--reviewer",
+        )
+        .expect("显式参数应命中");
+        assert_eq!(got, "命令行指定");
+    }
+
+    #[test]
+    fn resolve_显式参数为空白时继续回退() {
+        // 空白显式参数**不等于**「没传」也不等于「传了空白」：
+        // 后者会写进台账，而空名字的审批是不可归属的。
+        let got = resolve_decided(
+            Some(&mike()),
+            Some("代审人"),
+            Some("   "),
+            "审核人",
+            "--reviewer",
+        )
+        .expect("应回退到环境变量");
+        assert_eq!(got, "代审人", "空白参数必须被当作没传，而不是被采用");
+    }
+
+    #[test]
+    fn resolve_环境变量优先于git身份() {
+        // AC-007：环境变量 `代审人` 覆盖 git 的 `Mike Zhu`。
+        let got = resolve_decided(Some(&mike()), Some("代审人"), None, "审核人", "--reviewer")
+            .expect("环境变量应命中");
+        assert_eq!(got, "代审人");
+    }
+
+    #[test]
+    fn resolve_无环境变量时取git姓名() {
+        // AC-006
+        let got = resolve_decided(Some(&mike()), None, None, "审核人", "--reviewer")
+            .expect("git 身份应命中");
+        assert_eq!(got, "Mike Zhu");
+    }
+
+    #[test]
+    fn resolve_三级皆空时报错并点名git配置() {
+        // AC-005 / U1 第四档。报错必须给出**可执行的**出路，
+        // 而不是一句「缺少审核人」——后者会让人去翻文档。
+        let e = resolve_decided(None, None, None, "审核人", "--reviewer")
+            .expect_err("三者皆空必须报错");
+        let msg = e.to_string();
+        assert!(msg.contains("git config user.name"), "{}", msg);
+        assert!(msg.contains("--reviewer"), "须点明该用哪个 flag：{}", msg);
+        assert!(msg.contains("审核人"), "须点明缺的是什么：{}", msg);
+        assert!(msg.contains(REVIEWER_ENV), "须给出环境变量这条路：{}", msg);
+    }
+
+    #[test]
+    fn resolve_错误文案随label与flag参数化() {
+        // 参数化的意义：core 不该知道 CLI 的命令名。同一条报错在
+        // 评论作者那里必须说「缺少评论作者：请使用 --author <姓名>」。
+        let e = resolve_decided(None, None, None, "评论作者", "--author")
+            .expect_err("三者皆空必须报错");
+        let msg = e.to_string();
+        assert!(msg.contains("缺少评论作者"), "{}", msg);
+        assert!(msg.contains("--author"), "{}", msg);
+        assert!(!msg.contains("--reviewer"), "不得焊死 CLI 命令名：{}", msg);
+    }
+
+    #[test]
+    fn resolve_环境变量为空白时继续回退到git() {
+        // 与「显式参数为空白」同源：空环境变量不该产出空名字。
+        let got = resolve_decided(Some(&mike()), Some("  "), None, "审核人", "--reviewer")
+            .expect("应回退到 git 身份");
+        assert_eq!(got, "Mike Zhu");
+    }
+
+    #[test]
+    fn resolve_真实仓库下走通三级回退() {
+        // 端到端兜底：不 mock，真的造一个带 git 身份的临时仓，确认
+        // `resolve_claimed`（I/O 版）与 `resolve_decided`（策略版）结论一致。
+        // 之所以敢在并行测试里造真仓：`resolve_claimed` 走的是**不带缓存**的
+        // `read_git_identity`（见该函数注释），临时仓路径唯一，
+        // 既不污染进程级缓存，也不被它污染。
+        let root = crate::testutil::temp_dir("resolve-claimed");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "临时目录应能 git init");
+        for (k, v) in [("user.name", "Mike Zhu"), ("user.email", "mike@corp.com")] {
+            let ok = std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "应能设置 git {}", k);
+        }
+        let got = resolve_claimed(&root, None, "审核人", "--reviewer").expect("git 身份应命中");
+        assert_eq!(got, "Mike Zhu", "I/O 版应取到刚配的 git 姓名");
+        // 显式参数仍优先（证明 I/O 版没把优先级写反）
+        assert_eq!(
+            resolve_claimed(&root, Some("命令行"), "审核人", "--reviewer").expect("显式参数"),
+            "命令行"
+        );
+        crate::testutil::cleanup(&root);
     }
 }

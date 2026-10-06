@@ -13,6 +13,11 @@
 >    `cli` + `full` 双产物分发、不保留 `tui`/`gui` 独立二进制（结论见本文 §1.1/§3.1/§4.4 与 README）。
 > 4. §6 构建矩阵的 zigbuild 表述与现行 `scripts/build-release.sh` 不一致：
 >    现为 Linux 执行机 + rust-lld（仅两个 macOS 目标用 cargo-zigbuild），5 目标 × 2 变体。
+> 5. **P4 的一项遗留接线已收口（REQ-014，2026-10-06）**：两个界面的「执行门禁检查」
+>    原走裸 `gate::gate_check`（无变更集、无 hint），多需求仓库下**恒判 Ambiguous**。
+>    现改为 `gate::gate_check_with`，把"当前选中需求"作为显式选择 hint 传入
+>    （无选中项时与改前逐字一致），并把判定口径（按谁判、用哪份变更集）与拦截类别
+>    显示在结果上。判定真相仍在 core，前端只补了原就存在、却被界面丢掉的信息。
 
 ---
 
@@ -351,7 +356,7 @@ cc.egui_ctx.set_fonts(fonts);
 | **P1** | core API 结构化：新增 `ReqStatus`/`StepStatus`/`GateVerdict`/`UiMode`；`print_status` 改为返回数据 | core API | 单测：状态机与解析 | ✅ 完成（+13 单测；渲染下沉到 `cli::render`） |
 | **P2** | **TUI 先行**：ratatui 0.30 + crossterm 0.29，列表/详情/批准/打回/审计 | `req-guard ui --tui` | 真机键盘全流程 | ✅ 完成（+5 渲染冒烟测试；真机可起界面） |
 | **P3** | GUI：eframe 0.36.1 + Noto Sans SC 子集 + rfd | `req-guard ui --gui` | 真机截图 + 中文无豆腐块 | ✅ 完成（真机截图验证通过；字体 7.95MB→1.51MB 子集内嵌） |
-| **P4** | 合一：`ui` 子命令自动探测 + GUI 失败回退 TUI + `--features full` | 单二进制 | 桌面走 GUI、SSH 走 TUI、无图形的 Linux 会回退 | ✅ 完成（探测决策表 + `full` feature + GUI→TUI 回退均已落地） |
+| **P4** | 合一：`ui` 子命令自动探测 + GUI 失败回退 TUI + `--features full` | 单二进制 | 桌面走 GUI、SSH 走 TUI、无图形的 Linux 会回退 | ✅ 完成（探测决策表 + `full` feature + GUI→TUI 回退均已落地；**遗留接线项「界面检查恒报 Ambiguous」已于 REQ-014 收口**） |
 | **P5** | CI 多平台矩阵 + 文档更新 | 产物 + 文档 | 三平台可下载 | 🔶 部分（三平台 fmt/clippy/test/build 已接入，产物上传待补） |
 
 ### 为什么 TUI 先行（P2 早于 P3）

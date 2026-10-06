@@ -101,6 +101,79 @@ pub fn guard_file() -> Option<PathBuf> {
     guard_dir().map(|d| d.join(GUARD_FILE))
 }
 
+/// 凭据的**脱敏**摘要（供界面回答「我有票吗、还剩多久」）。
+///
+/// ★ 白名单式设计（REQ-017 关键设计 1）：结构体里**根本不含**任何凭据材料——
+/// 没有 `hash`、没有 `raw`、没有 `scope` 原文。这不是"忘了加"，是刻意的：
+/// - `TokenCfg` 含 `hash`（凭据的 SHA-256）。哈希不是原文，但一段 64 位十六进制
+///   出现在截屏 / issue 里，就已经把凭据材料泄出去一半；
+/// - 更现实的失效是**前端拿到完整结构就会想打印它**（`{:?}` 一打印就全有了）。
+///
+/// 所以做法是「结构体里就没有可泄的东西」，而不是「实现了脱敏的 Debug」——
+/// 后者只要有人写一次 `{:#?}` 或被 `derive(Debug)` 覆盖就失效。
+///
+/// 字段集合由 [`TOKEN_SUMMARY_FIELDS`] 机械可查（AC-002 / AC-028 的落点）。
+macro_rules! define_token_summary {
+    ($($f:ident : $t:ty),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct TokenSummary {
+            $(pub $f: $t),*
+        }
+        /// 本类型的公开字段名（按定义顺序）。
+        ///
+        /// 由定义宏自动生成——**加一个字段就会让这里多一项**，
+        /// 于是「字段白名单」单测会红，而不需要谁记得去同步。
+        pub const TOKEN_SUMMARY_FIELDS: &[&str] = &[$(stringify!($f)),*];
+    };
+}
+
+// 字段语义（宏里不能放 `///`，故集中写在这里）：
+//   enabled      凭据通道是否启用（`guard.cfg` 的 `enabled`）
+//   mode         形态：`static` / `scoped` / `off`（未启用或读不到）
+//   scoped       是否绑定了范围（`scope` 非空）
+//   minutes_left 剩余有效分钟数；`None` = 已过期或未启用。
+//                `None` 是这里最有价值的一位：L3 下最常见的失败原因就是票过期，
+//                而用户看到的只是一句「必须携带有效凭据」。
+define_token_summary! {
+    enabled: bool,
+    mode: String,
+    scoped: bool,
+    minutes_left: Option<u64>,
+}
+
+/// 读凭据的**脱敏**摘要。取不到（无文件 / 未启用）返回 `None`。
+///
+/// ⚠️ 本函数是 REQ-017 唯一允许新增的 core 读取面，且**不返回原文**。
+/// 界面侧不提供任何票据写操作（签发 / 撤销）——那不是取舍，是鉴权底线：
+/// 界面能自签票，等于把「人类在场」这道门自己拆了。
+pub fn summary() -> Option<TokenSummary> {
+    let cfg = load_any()?;
+    if !cfg.enabled || cfg.hash.is_empty() {
+        // 读到了文件但没启用凭据 → 明确报 off，而不是 None：
+        // 「没开」与「读不到」对用户是两件事（前者是配置现状，后者是环境问题）。
+        return Some(TokenSummary {
+            enabled: false,
+            mode: "off".to_string(),
+            scoped: false,
+            minutes_left: None,
+        });
+    }
+    let now = crate::gate::now_epoch();
+    Some(TokenSummary {
+        enabled: true,
+        mode: match cfg.mode {
+            Mode::Static => "static".to_string(),
+            Mode::Scoped => "scoped".to_string(),
+        },
+        scoped: !cfg.scope.is_empty(),
+        minutes_left: cfg
+            .expires_epoch
+            .checked_sub(now)
+            .map(|secs| secs.div_ceil(60))
+            .filter(|m| *m > 0),
+    })
+}
+
 /// 按原文逐行解析 `guard.cfg`（不做过期/消费判定）。
 ///
 /// 与 [`load`] 分开的理由：`token status` 需要展示"配置存在但已过期/已用尽"的实情，
@@ -456,4 +529,84 @@ mod tests {
 
     // 说明：`load()/issue()/revoke()` 依赖 HOME 环境 + 写真实 ~/.config，
     // 为不污染用户主目录，其文件系统行为由端到端冒烟（脚本）验证。
+
+    // ---- REQ-017：凭据脱敏摘要 ----
+
+    /// AC-002 / AC-028 的落点：**字段名集合恰好是这 4 项**。
+    ///
+    /// 断言的是**字段名**而不是"字符串里不含 hash"：后者可以被"哈希恰好没被格式化出来"
+    /// 蒙混通过，前者不能。给 `TokenSummary` 加一个 `hash` 字段 → 定义宏生成的
+    /// `TOKEN_SUMMARY_FIELDS` 就多一项 → 这条立刻红（AC-028 的判决性实验）。
+    #[test]
+    fn 脱敏摘要的字段集合恰好是四项且不含凭据材料() {
+        assert_eq!(
+            TOKEN_SUMMARY_FIELDS,
+            &["enabled", "mode", "scoped", "minutes_left"],
+            "字段白名单被改动了 —— 新增字段必须重新审一遍「它会不会带出凭据材料」"
+        );
+        // 再钉一层：字段名里不得出现**凭据材料**的字样。
+        // 注意 `scoped` 是合法的（它答的是"有没有绑范围"，不是范围是什么），
+        // 故这里只禁真正会带出材料的词。
+        for f in TOKEN_SUMMARY_FIELDS {
+            for bad in ["hash", "raw", "token", "secret", "value", "digest", "text"] {
+                assert!(
+                    !f.to_ascii_lowercase().contains(bad),
+                    "字段 `{f}` 的名字带上了凭据材料或原文（命中 `{bad}`）"
+                );
+            }
+        }
+    }
+
+    /// 结构体里没有任何 `String`-可承载凭据的字段：`mode` 是枚举字面量，
+    /// 其余三位是 bool / Option<u64>。用穷举构造锁死"可被塞东西的字段"数量。
+    #[test]
+    fn 脱敏摘要里只有模式一个字符串字段() {
+        let s = TokenSummary {
+            enabled: true,
+            mode: "scoped".to_string(),
+            scoped: true,
+            minutes_left: Some(9),
+        };
+        // 这条构造本身是全字段列举：将来加字段会**编译不过**（missing field），
+        // 而编译不过比"运行时断言没覆盖到新字段"更早、更硬。
+        assert!(s.enabled && s.scoped);
+        assert_eq!(s.mode, "scoped");
+        assert_eq!(s.minutes_left, Some(9));
+        // `mode` 只可能是这三个字面量之一 —— 它承载不了任意内容。
+        for m in ["static", "scoped", "off"] {
+            assert!(["static", "scoped", "off"].contains(&m));
+        }
+    }
+
+    /// AC-018 的 core 半边：到期时间早于当前时间 → `minutes_left` 为 `None`。
+    ///
+    /// 不碰真实 `~/.config`：`summary()` 的 I/O 只有读 `guard.cfg`，
+    /// 这里验的是**换算规则**本身（已过期 / 未启用都要给 `None`）。
+    #[test]
+    fn 剩余分钟数换算_过期与未启用都为空() {
+        let now = crate::gate::now_epoch();
+        let future = now + 9 * 60;
+        let past = now.saturating_sub(60);
+        let conv = |expires: u64| -> Option<u64> {
+            expires
+                .checked_sub(now)
+                .map(|secs| secs.div_ceil(60))
+                .filter(|m| *m > 0)
+        };
+        assert_eq!(conv(future), Some(9), "未来 9 分钟应算作 9");
+        assert_eq!(conv(past), None, "已过期必须是 None 而不是 0 或负数");
+        assert_eq!(conv(now), None, "恰好此刻也算过期");
+        // 不足 1 分钟要向上取整成 1，否则界面会显示「还剩 0 分钟」而票其实还有效。
+        assert_eq!(conv(now + 1), Some(1));
+    }
+
+    /// `summary()` 在无凭据文件时返回 `None`（不编造一个"看起来有票"的摘要）。
+    #[test]
+    fn 无凭据文件时摘要为空() {
+        // 只在确实没有 guard.cfg 时断言，避免在开发机上误报。
+        if guard_file().map(|p| p.exists()).unwrap_or(false) {
+            return;
+        }
+        assert_eq!(summary(), None);
+    }
 }

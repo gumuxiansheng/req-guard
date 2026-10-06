@@ -716,8 +716,14 @@ fn run_ui(root: &Path, a: &cli::Args) -> Result<()> {
     }
 }
 
-/// 身份：优先命令行参数，回退环境变量 `REQ_GUARD_REVIEWER`，都没有则报错。
 /// 解析审批人/作者名：命令行 > 环境变量 > **git 身份**。
+///
+/// 三级回退**已下沉到 core**（`identity::resolve_claimed`，REQ-015 G5/T1）：
+/// 这里只做一层薄封装转调，好让 `main.rs` 里 9 处调用点一行不动。
+///
+/// 为什么不直接删掉本函数、各处改调 core：那要动 9 处调用点，
+/// 而本需求对 CLI 的硬要求是「输出逐字不变」——改动面越小，
+/// 这个要求越可能被守住。薄封装的代价只有一次多余的栈帧。
 ///
 /// 最后一档取 git 身份（`git config user.name`）是刻意的：审批人本来就等于
 /// 提交署名者，让人每次手打姓名既啰嗦又容易打错（打错会在 auth.level≥1 下
@@ -728,24 +734,7 @@ fn resolve_identity(
     flag: &str,
     root: &std::path::Path,
 ) -> Result<String> {
-    if let Some(s) = v {
-        if !s.trim().is_empty() {
-            return Ok(s.trim().to_string());
-        }
-    }
-    if let Ok(s) = std::env::var("REQ_GUARD_REVIEWER") {
-        if !s.trim().is_empty() {
-            return Ok(s.trim().to_string());
-        }
-    }
-    if let Some(id) = req_guard_core::identity::current(root) {
-        return Ok(id.name);
-    }
-    Err(GateError::Validation(format!(
-        "缺少{}：请使用 {} <姓名>，或设置环境变量 REQ_GUARD_REVIEWER，\
-         或配置 git 身份（git config user.name \"你的名字\"）后由 req-guard 自动取用",
-        label, flag
-    )))
+    req_guard_core::identity::resolve_claimed(root, v, label, flag)
 }
 
 /// `req-guard ac check`：验收标准机械校验。
@@ -1025,4 +1014,56 @@ fn run_seal(root: &Path, a: &cli::Args) -> Result<()> {
     }
     println!("\n共绑定 {n} 段。今后改动这些段都需要 reject → 重审；确实无需重审时再次执行本命令。");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_identity;
+
+    /// REQ-015 T2 / AC-008：三级回退落空时的报错必须**逐字**保持原样。
+    ///
+    /// `resolve_identity` 的实现已下沉到 core（`identity::resolve_claimed`），
+    /// 这里只留一层薄封装。这条用例钉死的是「下沉没把文案改坏」——
+    /// 下沉类改动最典型的失效就是顺手改了措辞，而 CLI 的用户（含脚本）
+    /// 依赖的是**完整句子**，不是"有报错就行"。
+    ///
+    /// 期望文本取自下沉前的 `main.rs:736-748`，一字未改。
+    #[test]
+    fn 身份三级回退落空的报错与下沉前逐字相同() {
+        let root = std::path::Path::new("/nonexistent/req-guard-cli-test");
+        let e = resolve_identity(None, "审核人", "--reviewer", root)
+            .expect_err("三级回退全部落空时应报错");
+        // `GateError` 的 Display 带一个「参数校验失败: 」前缀，故这里比对**句子本身**。
+        // 前缀是错误类型的固定外壳，不属于本次要锁的措辞。
+        let msg = e.to_string();
+        assert!(
+            msg.contains(
+                "缺少审核人：请使用 --reviewer <姓名>，或设置环境变量 REQ_GUARD_REVIEWER，\
+                 或配置 git 身份（git config user.name \"你的名字\"）后由 req-guard 自动取用"
+            ),
+            "报错措辞应与下沉前逐字相同：{msg}"
+        );
+    }
+
+    /// 显式参数优先（证明薄封装没把参数顺序搞反：`flag` 在最前）。
+    #[test]
+    fn 显式参数优先于环境变量与git身份() {
+        let root = std::path::Path::new("/nonexistent/req-guard-cli-test");
+        assert_eq!(
+            resolve_identity(Some("命令行指定"), "审核人", "--reviewer", root)
+                .expect("显式参数应命中"),
+            "命令行指定"
+        );
+    }
+
+    /// `label` / `flag` 参数化没有被焊死：评论作者那条命令的报错要说 `--author`。
+    #[test]
+    fn 报错随label与flag参数化() {
+        let root = std::path::Path::new("/nonexistent/req-guard-cli-test");
+        let e = resolve_identity(None, "评论作者", "--author", root)
+            .expect_err("三级回退全部落空时应报错");
+        let msg = e.to_string();
+        assert!(msg.contains("缺少评论作者：请使用 --author"), "{}", msg);
+        assert!(!msg.contains("--reviewer"), "不得串到别的命令名：{}", msg);
+    }
 }
