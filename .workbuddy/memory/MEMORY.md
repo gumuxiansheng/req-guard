@@ -72,3 +72,10 @@
 ## 未完成
 - P5：GUI 产物的原生矩阵（GH Actions windows/macos）未做；CNB 流水线未在真实 tag 上端到端跑过
   （remote `cnb` = `https://cnb.cool/mikezhu/req-guard` 已配置、未 push）。
+
+## 自举开发（本仓库本身就是被门禁管的）
+- **req-guard 给自己的仓库装了 pre-commit 门禁**：`req-guard` 二进制须在 PATH 上，否则
+  `req-guard-check.sh` fail-closed 恒拦提交（"无法裁决，req-guard 不在 PATH"）。`req-guard install`
+  子命令只生成钩子/注入 AI 工具配置，**不**安装二进制本身。
+- 开发期推荐把 `target/release/req-guard` 软链进 `~/.cargo/bin`（`~/.cargo/bin` 在 PATH 上，且
+  `cargo build --release` 后钩子自动用最新二进制，无快照过期问题）。等价做法 `cargo install --path cli --force`。
