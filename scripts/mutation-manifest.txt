@@ -9,6 +9,13 @@
 #
 # 跑法：bash scripts/verify_tests_have_teeth.sh [--only <行号|理由关键字>]
 #
+# 变异文本的一条硬要求：**必须能编译**。编译失败（build_failed）只证明「代码与该
+# 文件有耦合」，不证明判据有人守 —— 脚本据此判为「不计为守住」。写变异时若锚点行
+# 以 `{` 结尾，追加文本必须自带闭合（`if ... { ... }` 这类），否则整个文件少一个括号。
+# 另：锚点选在**判定所在的那一行**（如谓词函数首行）比选在调用点更好 —— 调用点后面
+# 跟着的是块体，在那里追加条件只会把语义改成另一个方向（实测踩过：台账交叉核对那条
+# 长期 build_failed，从未被真正验过）。
+#
 # 收录判据的口径（N2）：只收「失效方向最坏」的 —— 即失效时门禁表现为
 # **看起来在拦、实际没拦**。清单只能覆盖已经想到的失效方向；
 # 「没想到的」靠每次复盘追加，不是自动化能解决的。
@@ -39,12 +46,12 @@ core/src/requirement.rs	pub fn steps(&self) -> Vec<&str> {	return Vec::new();	P0
 # 且该文件 gitignore + 台账零记录 —— 门禁被静默关掉，且**事后无从发现**。
 # 这是本清单里唯一一条「绕过门禁本身」的判据，故收录：它的失效方向不是误拦，
 # 而是全盘放行且无痕。
-core/src/resolve.rs	if !ledger_has_bypass_open(root, &actor) {	if false &&	U0_绕过令牌	台账交叉核对失效时伪造令牌即可解除全部门禁，且伪造在 PR 里完全不可见
+core/src/resolve.rs	fn ledger_has_bypass_open(root: &Path, actor: &str) -> bool {	return true;	resolve::tests::U03	台账交叉核对失效时伪造令牌即可解除全部门禁，且伪造在 PR 里完全不可见
 
 # ── REQ-012：绕过令牌的身份自证 ──
 # 失效形态：同上，但绕过「actor/email/sig 三字段缺失」这一最小门槛 ——
 # 一行 printf 就能凑出全部字段形状。
-core/src/resolve.rs	crate::gate::audit(root, "BYPASS-REJECT reason=missing-fields");	if false { crate::gate::audit(root, "BYPASS-DEGRADED reason=missing-fields"); } else { return None; };	U0_绕过令牌	缺字段校验失效时随手一个 printf 即可伪造出形状完整的令牌
+core/src/resolve.rs	crate::gate::audit(root, "BYPASS-REJECT reason=missing-fields");	if let None = str_field(&text, "actor") { return Some(crate::gate::now_epoch() + 3600); }	resolve::tests::U01	缺字段校验失效时随手一个 printf 即可伪造出形状完整的令牌
 # ── REQ-019：有效改动行剔除注释（轻档的根据）──
 # 失效形态：注释行不再被剔除 → 「加 120 行注释」与「加 120 行逻辑」同档，
 # 分级形同虚设；更坏的方向是门禁**看起来**在按有效行判，实际按物理行判。
