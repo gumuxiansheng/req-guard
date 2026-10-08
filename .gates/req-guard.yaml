@@ -50,9 +50,22 @@ bypass:
 
 # 变更范围契约（GATE:TOUCH）
 touch:
-  # REQ-012 T9：`.gates/**` 通配已拆成具名清单。`.gates/req-guard.yaml` 与
-  # `.gates/audit/ledger.md` **刻意不在豁免内** —— 它们是门禁配置与审批轨迹，
-  # 放进豁免区等于允许 AI 自己把门禁调松。改它们须由 REQ-012 声明 + CI 漂移检测兜住。
+  # REQ-012 T9：`.gates/**` 通配已拆成具名清单。
+  #
+  # 本列表是**追加**到 `core/src/gate.rs::touch_exempt_patterns` 的默认集之上的，
+  # 故「到底豁免了什么」要看两处（REQ-005 G3）。下方条目与那边的 RUNTIME 有重叠。
+  #
+  # 刻意**不在**豁免内的：`.gates/req-guard.yaml`（门禁配置，含 auth.level /
+  # enforce.ci / touch.exempt）。放进豁免区等于允许 AI 自己把门禁调松。
+  # 改它须由清单 `GATE:TOUCH` 声明 + 服务端漂移检测兜住（`config_drift_undeclared`），
+  # 这样「改门禁配置」会在 PR 里变成一条明确的 CI 失败。
+  #
+  # 刻意**在**豁免内的：`.gates/audit/ledger.md`（审批台账）。此处更正一条**过时注释**
+  # （REQ-020）：旧注释写它与 `req-guard.yaml` 一并「刻意不在豁免内」，与代码事实相反。
+  # `gate.rs` 第 1448–1460 行记载了这是 REQ-012 实施期的刻意修正 —— 台账是工具在
+  # 每次审批时自动追加的产物，移出豁免区等于「每次 approve 都让工作区变成 NotDeclared」，
+  # 团队只有三条路：加回豁免 / `--no-verify` / 停止用台账。而台账真正的保护从来不是
+  # touch：它已入库，任何篡改都是 PR 里可见的 diff，配上 CODEOWNERS 即为有效评审。
   exempt:
     - .gates/hooks/**
     - .gates/ci/**

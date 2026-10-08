@@ -13,7 +13,7 @@ source_refs: [core/src, scripts, docs/规范]
 > 本文件是硬拦截依据——`.gates/hooks/req-guard-check.{sh,ps1}` 只解析下列 `GATE` 标记行；
 > 正文可自由编辑，但**请勿手工修改 GATE 行**（请用 `req-guard approve`）。
 
-<!-- GATE:HEAD id=REQ-008 status=approved created=2026-10-04_19:39:24 -->
+<!-- GATE:HEAD id=REQ-008 status=done created=2026-10-04_19:39:24 done=2026-10-08_10:27:25 -->
 <!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-04_19:43:18 sum=a4167c631cb1cf3f5038c8d446777869b30fe4a28c67ebac82f81af3f4f845ba -->
 <!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-04_19:43:27 sum=f5edd57359bf7c1853f279bcec9c61ac667ff70d99867f3bff3d30c73c569527 -->
 <!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-04_19:43:44 sum=64d9bc8213ecafc320676758dfcfd14e36d582effa4d0b8acb21f7e3ae7c8070 -->

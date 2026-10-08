@@ -119,3 +119,21 @@
 | 2026-10-05 14:45:40 | APPROVE REQ-013 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-05 14:46:48 | TOUCH.EXTEND REQ-013 actor=Mike_Zhu added=gui/src/app.rs reason=G8_切段视口修复落在_render_center reapprove=1 |
 | 2026-10-05 14:47:24 | APPROVE REQ-013 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:26:23 | DONE REQ-001 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:26:41 | DONE REQ-002 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:01 | DONE REQ-003 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:05 | DONE REQ-004 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:08 | DONE REQ-005 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:11 | DONE REQ-006 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:21 | DONE REQ-007 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:27:25 | DONE REQ-008 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:28:14 | ARCHIVE REQ-001 actor=Mike_Zhu auto=0 channel=interactive tty=1 ai=0 |
+| 2026-10-08 10:28:25 | ARCHIVE REQ-002 actor=Mike_Zhu auto=0 channel=interactive tty=1 ai=0 |
+| 2026-10-08 10:29:28 | APPROVE REQ-020 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:29:36 | DERIVE_SOURCE_REFS REQ-020 - -> core/src,docs/设计,.gates |
+| 2026-10-08 10:29:36 | APPROVE REQ-020 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 10:29:43 | APPROVE REQ-020 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 12:28:31 | AMEND REQ-020 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 12:31:56 | AMEND REQ-020 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 12:33:57 | APPROVE REQ-020 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 12:34:06 | APPROVE REQ-020 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |

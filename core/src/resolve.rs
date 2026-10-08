@@ -31,7 +31,7 @@
 //! ## 分层（可测性前提）
 //!
 //! ```text
-//! judge(live, paths, hint, mode, exempt) -> Verdict   ← 纯函数，不碰 git / 文件系统
+//! judge(live, paths, hint, mode, exempt, changeset) -> Verdict ← 纯函数，不碰 git / 文件系统
 //! resolve(root, ctx)                      -> Verdict   ← 薄壳：取参 + 审计 + 渲染
 //! ```
 //!
@@ -58,6 +58,30 @@ pub enum MultiMode {
     /// 保守档：候选恒为全部未归档清单。**不会漏拦，但会把互锁制度化**
     /// （起草中的需求会阻断一切编码）—— 仅在团队明确接受时开启。
     All,
+}
+
+/// 本次判定是否带变更集（REQ-020 设计 1）。
+///
+/// 区分「有变更集但剥除豁免后为空」与「根本没有变更集」——两者在 `judge` 眼里都是
+/// `&[]`，但语义相反，判错就是漏拦：
+///
+/// | 情形 | 正确裁决 | 判错的后果 |
+/// | --- | --- | --- |
+/// | [`Changeset::Provided`] 且剥除豁免后为空 | 放行 | 误拦 → 清单永远无法入库 |
+/// | [`Changeset::Absent`]（裸 `req-guard check` / TUI 状态面板） | `Ambiguous` | 误放行 → 「能不能开工」永远答「能」 |
+///
+/// 裸 `check` 在单需求仓库下是有意义的：`owned_by` 走 `live.len() == 1` 退化分支，
+/// 把那一份（哪怕未批）作为候选去判三段，等价于「能不能开工」。若空集一律放行，
+/// 这条语义会被静默抹掉 —— **那是把门禁调松，不是解堵**。
+///
+/// 用两变体枚举而非布尔值：`judge` 有约 10 处调用点（多为单测），布尔实参在调用点
+/// 不可读（`judge(&live, &paths, None, MultiMode::All, &ex(), true)` 无法自解释）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Changeset {
+    /// 无变更集：全局判定（[`PathSource::None`]）。
+    Absent,
+    /// 有变更集（可能为空集，例如 `--staged` 时无暂存文件）。
+    Provided,
 }
 
 /// 变更集来源（三个上下文各一种，**互斥**，由 CLI 显式指定）。
@@ -241,6 +265,7 @@ pub fn judge(
     hint: Option<&str>,
     mode: MultiMode,
     exempt: &[String],
+    changeset: Changeset,
 ) -> Verdict {
     let ids = |rs: &[&LiveReq]| -> Vec<String> { rs.iter().map(|r| r.id.clone()).collect() };
     let exempt_hit = |p: &str| -> bool {
@@ -297,6 +322,41 @@ pub fn judge(
             kind: BlockKind::UnknownSelection,
             reqs: vec![],
             message: unknown_selection_message(hint.unwrap_or_default(), live),
+        };
+    }
+
+    // ── R2b 受管路径为空 → 放行（改动全部落在豁免区，无需归属） ──────────
+    //
+    // 为什么不是报错：`touch.exempt` 的语义是「这些路径不要求 `GATE:TOUCH` 声明」，
+    // 而豁免区内根本没有可归属的对象。要求归属，等于要求「先有已批清单才能提交
+    // 第一份清单」—— `gate::touch_exempt_patterns` 的注释已预见并否决了这个循环
+    // （「AI 永远无法把填好的清单 commit 上去」），但判定侧当时没跟上，于是每次
+    // 提交新清单都撞 `Ambiguous`，且 `--no-verify` 也救不了（CI 侧同样算空集）。
+    //
+    // 为什么只在 `Changeset::Provided` 下生效：`Absent` 是裸 `req-guard check` 与
+    // TUI 状态面板，无变更集就无从归因 —— 放行会把「能不能开工」变成永远「能」。
+    //
+    // 位置三处约束，缺一不可：
+    //   · R15（内容冻结）之后 —— 「证据已被篡改」比「没审批」更严重，且与变更集正交；
+    //   · R3 之后 —— hint 指向不存在的清单是**用户犯错**，不是「改动无需归属」；
+    //     若 R2b 抢在前面，`HOOK_REQ=REQ-999` 会被静默放行，那条防呆失效；
+    //   · 候选推导之前 —— 无 hint 时 `owned_by` 已先返回空并落进 R8，放其后永不可达。
+    //
+    // 可追溯性：放行**必须**携带 `note`，审计侧叠一条 `NOTE`，使之在台账上与
+    // 「三段已批准」明确区分 —— 「看着在放行、其实没判」与「看着在拦、其实没拦」
+    // 是同一类失效。
+    //
+    // 为什么还要求「至少有一条非空路径」：**空变更集 ≠ 全豁免变更集**。
+    // `PathSource::Stdin` 在 payload 里取不到 `file_path` 时返回空集（`collect_paths`
+    // 的既定行为：「不是一次可识别的文件写操作」）。若此时也放行，AI 工具只要发一个
+    // 解析不出路径的 payload，L1 hook 就会从「拦」变成「放行」——这正是本项目定义的
+    // 最坏失效「看着在拦、其实没拦」。故空集必须落回原路径（多需求 → `Ambiguous`）,
+    // 保持 fail-closed。
+    let has_path = paths.iter().any(|p| !p.trim().is_empty());
+    if has_path && managed.is_empty() && changeset == Changeset::Provided {
+        return Verdict::Pass {
+            reqs: vec![],
+            note: Some("本次改动全部落在 touch.exempt 豁免区，未做任何归属判定".to_string()),
         };
     }
 
@@ -451,15 +511,19 @@ fn declares_of(content: &str) -> Vec<String> {
 /// 与 [`resolve`] 的区别只在于变更集从哪来：本函数**不碰 git / stdin**，故可被
 /// 单测用真实文件 + 显式路径直接驱动（`resolve` 依赖 `HOOK_STAGED_FILES` 这类
 /// 进程级环境变量，并行测试下有竞态，auth.rs 已记录过这个坑）。
+///
+/// `changeset` **不设默认值**：调用方必然知道本次有没有变更集（这正是 R2b 的判据），
+/// 让默认值替他表态等于允许「忘了就说有/无」—— 而这一处记反就是漏拦。
 pub fn decide(
     root: &Path,
     live: &[LiveReq],
     paths: &[String],
     hint: Option<&str>,
     mode: MultiMode,
+    changeset: Changeset,
 ) -> Verdict {
     let exempt = crate::gate::touch_exempt_patterns(root);
-    let v = judge(live, paths, hint, mode, &exempt);
+    let v = judge(live, paths, hint, mode, &exempt, changeset);
     audit_verdict(root, live, &v);
     v
 }
@@ -539,7 +603,15 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
     let live = live_snapshot(root)?;
     let verdict = if live.is_empty() {
         // R1 先于绕过：没有清单可批准时，绕过窗口不该凭空造出一个「通过」。
-        judge(&live, &[], ctx.hint.as_deref(), MultiMode::Resolve, &[])
+        // `changeset` 不参与判定（R1 在它之前返回），取 `Absent` 只为类型完整。
+        judge(
+            &live,
+            &[],
+            ctx.hint.as_deref(),
+            MultiMode::Resolve,
+            &[],
+            Changeset::Absent,
+        )
     } else if let Some(exp) = active_bypass(root) {
         Verdict::Bypassed {
             reqs: live.iter().map(|r| r.id.clone()).collect(),
@@ -549,7 +621,14 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
         let paths = collect_paths(root, &ctx.source)?;
         let exempt = crate::gate::touch_exempt_patterns(root);
         let mode = multi_mode(root);
-        let mut verdict = judge(&live, &paths, ctx.hint.as_deref(), mode, &exempt);
+        // 唯一需要按上下文取 `changeset` 的地方：裸 `check`（`PathSource::None`）
+        // 是「能不能开工」的全局判定，**没有**变更集 —— R2b 的放行对它不生效。
+        let changeset = if ctx.source == PathSource::None {
+            Changeset::Absent
+        } else {
+            Changeset::Provided
+        };
+        let mut verdict = judge(&live, &paths, ctx.hint.as_deref(), mode, &exempt, changeset);
         // R14 分支名消歧：**只**在歧义（= 无从归因）时兜底，且永不覆盖反查结果。
         // 放在 judge 之外而不是给它加参数：分支名不是权威选择，拿它去过 R3/R9 那些
         // 「选择必须与变更集相交」的校验毫无意义 —— 它恰恰是变更集推不出答案才被问的。
@@ -564,7 +643,15 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
         .flatten();
         if let Some((id, multi)) = branch_says {
             if let Some(target) = live.iter().find(|r| r.id == id) {
-                verdict = judge(&live, &paths, Some(target.id.as_str()), mode, &exempt);
+                // 重判必须与原判同参，否则同一变更集两次裁决口径不同。
+                verdict = judge(
+                    &live,
+                    &paths,
+                    Some(target.id.as_str()),
+                    mode,
+                    &exempt,
+                    changeset,
+                );
                 if verdict.is_pass() {
                     verdict = append_note(verdict, &branch_note(target, multi));
                 }
@@ -1137,8 +1224,17 @@ mod tests {
         EXEMPT.iter().map(|s| s.to_string()).collect()
     }
 
+    /// 带**变更集**的判定（R2b 生效）。测试里显式传路径即为「有变更集」，
+    /// 与 `resolve` 在 `--staged` / `--base` / `--stdin` 下的口径一致。
     fn judge_ok(live: &[LiveReq], paths: &[&str], hint: Option<&str>) -> Verdict {
-        judge(live, &p(paths), hint, MultiMode::Resolve, &ex())
+        judge(
+            live,
+            &p(paths),
+            hint,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+        )
     }
 
     fn ids(v: &Verdict) -> Vec<String> {
@@ -1148,14 +1244,21 @@ mod tests {
     // ── R1 ──────────────────────────────────────────────────────────────
     #[test]
     fn R1_无清单报NoRequirement() {
-        let v = judge(&[], &p(&["core/src/a.rs"]), None, MultiMode::Resolve, &ex());
+        let v = judge(
+            &[],
+            &p(&["core/src/a.rs"]),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+        );
         assert_eq!(v.block_kind(), Some(BlockKind::NoRequirement));
         assert!(!v.is_pass());
     }
 
     #[test]
     fn R1_msg_给出创建命令() {
-        let v = judge(&[], &[], None, MultiMode::Resolve, &ex());
+        let v = judge(&[], &[], None, MultiMode::Resolve, &ex(), Changeset::Absent);
         assert!(v.message().unwrap_or_default().contains("create -t"));
     }
 
@@ -1417,11 +1520,33 @@ mod tests {
             req("REQ-001", true, &["core/**"]),
             req("REQ-002", false, &["**"]),
         ];
-        let v = judge_ok(&live, &[".gates/README.md", "target/x.bin"], None);
+        let paths = &[".gates/README.md", "target/x.bin"];
+        // ① 无变更集口径（REQ-020 起由 `Changeset::Absent` 显式表达）：
+        //    剥完豁免即空集，不许当成「无改动」放行 —— 本条是原断言，逐字保留。
+        let absent = judge(
+            &live,
+            &p(paths),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Absent,
+        );
         assert_eq!(
-            v.block_kind(),
+            absent.block_kind(),
             Some(BlockKind::Ambiguous),
             "剥完豁免即空集，不许当成「无改动」放行"
+        );
+        // ② 有变更集口径（REQ-020 R2b）：放行，但**不是**降级为全量扫描 ——
+        //    候选集必须为空且不点名任何清单；把上面两份当裁决对象就等于「全量」。
+        let provided = judge_ok(&live, paths, None);
+        assert!(provided.is_pass(), "{provided:?}");
+        assert!(
+            provided.reqs().is_empty(),
+            "空集放行不得点名任何清单（否则即降级为全量）：{provided:?}"
+        );
+        assert!(
+            provided.note().unwrap_or_default().contains("豁免区"),
+            "放行必须自报「未做归属判定」，不得与「三段已批准」混淆：{provided:?}"
         );
     }
 
@@ -1430,6 +1555,182 @@ mod tests {
         let live = vec![req("REQ-001", true, &["core/**"])];
         let v = judge_ok(&live, &[".gates/README.md"], None);
         assert!(v.is_pass(), "{v:?}");
+    }
+
+    // ===================== REQ-020：受管路径为空时的归属放行（R2b） =====================
+    //
+    // 背景：`.gates/requirements/**` 在 `touch.exempt` 内，剥除豁免后受管路径为空，
+    // 而 `judge` 当时没有「空集 → 放行」规则 → 提交新清单必然撞 `Ambiguous`，
+    // 且 `--no-verify` 也救不了（CI 侧同样算空集）。门禁因此无法自举。
+    //
+    // 本组用例的编排原则：**放行与拒绝各一半**。只有放行用例等于没测。
+
+    /// U-01 的仓库形状：两份清单，1 已批 1 未批，均未声明豁免区路径。
+    fn u01_live() -> Vec<LiveReq> {
+        vec![
+            req("REQ-001", true, &["core/src/**"]),
+            req("REQ-002", false, &["cli/src/**"]),
+        ]
+    }
+
+    /// 一份「在豁免区内、且明显不是源码」的改动：新清单首次入库正是这个形状。
+    const U01_PATHS: [&str; 1] = [".gates/requirements/REQ-003.md"];
+
+    #[test]
+    fn U01_变更集全在豁免区时放行且不点名任何清单() {
+        let live = u01_live();
+        let v = judge_ok(&live, &U01_PATHS, None);
+        assert!(v.is_pass(), "改动全在豁免区不得拦：{v:?}");
+        assert!(
+            v.reqs().is_empty(),
+            "放行不得点名任何清单 —— 点名即等于做了归属判定：{v:?}"
+        );
+        assert!(
+            v.note().unwrap_or_default().contains("豁免区"),
+            "放行必须自报「未做任何归属判定」，否则审计上无法与「三段已批准」区分：{v:?}"
+        );
+    }
+
+    #[test]
+    fn U02_无变更集时空集仍报Ambiguous_不得放行() {
+        // 裸 `req-guard check` / TUI 状态面板走这条：无变更集就无从归因，
+        // 放行会把「能不能开工」变成永远「能」—— 那是漏拦，不是解堵。
+        let live = u01_live();
+        let v = judge(
+            &live,
+            &p(&U01_PATHS),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Absent,
+        );
+        assert_eq!(
+            v.block_kind(),
+            Some(BlockKind::Ambiguous),
+            "无变更集不得走 R2b 放行：{v:?}"
+        );
+        assert!(!v.is_pass());
+    }
+
+    #[test]
+    fn U03_单需求仓库里未批清单的自身入库也放行() {
+        // 修复前：走 `live.len() == 1` 退化分支 → `StepNotApproved`（拦）。
+        // 修复后：R2b 在候选推导**之前**生效 → 放行。这是**预期变化**，故显式锁定。
+        let live = vec![req("REQ-001", false, &["core/**"])];
+        let v = judge_ok(&live, &[".gates/requirements/REQ-001.md"], None);
+        assert!(v.is_pass(), "未批清单自身的入库不得被自己的门禁拦住：{v:?}");
+        assert!(v.reqs().is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn U04_混合变更集不得放行_只要还有一条受管路径() {
+        // 放行面严格等于「改动集 ⊆ 豁免区」。豁免路径 + 受管路径混在一起时，
+        // 受管路径必须照旧参与反查（此处命中未批清单 → 歧义）。
+        let live = vec![
+            req("REQ-001", false, &["core/**"]),
+            req("REQ-002", false, &["cli/**"]),
+        ];
+        let v = judge_ok(&live, &[".gates/README.md", "core/src/a.rs"], None);
+        assert!(!v.is_pass(), "混合变更集不得因含豁免路径而放行：{v:?}");
+        assert_eq!(v.block_kind(), Some(BlockKind::Ambiguous), "{v:?}");
+    }
+
+    #[test]
+    fn U05_内容冻结优先于空集放行() {
+        // R15 遍历全部非 done 清单、与变更集正交。只改豁免区也不能豁免「证据被篡改」。
+        let live = vec![req("REQ-001", true, &["core/**"]), req_sum_bad("REQ-002")];
+        let v = judge_ok(&live, &[".gates/drafts/REQ-002.draft.md"], None);
+        assert_eq!(
+            v.block_kind(),
+            Some(BlockKind::SumMismatch),
+            "内容冻结必须先于 R2b：{v:?}"
+        );
+        assert!(v.message().unwrap_or_default().contains("内容冻结"));
+    }
+
+    #[test]
+    fn U06_hint指向不存在的清单时不得被空集放行吞掉() {
+        // R3 在 R2b 之前：hint 指错是**用户犯错**，不是「改动无需归属」。
+        let live = u01_live();
+        let v = judge_ok(&live, &U01_PATHS, Some("REQ-999"));
+        assert_eq!(
+            v.block_kind(),
+            Some(BlockKind::UnknownSelection),
+            "hint 指错必须报出来，不得被 R2b 静默放行：{v:?}"
+        );
+        assert!(v
+            .message()
+            .unwrap_or_default()
+            .contains("不在可裁决的需求清单里"));
+    }
+
+    #[test]
+    fn U08_空变更集不得放行_取不到路径时保持fail_closed() {
+        // `--stdin` 解析不出 `file_path` 时 `collect_paths` 返回空集。此时若按
+        // 「空集 ⊆ 豁免区」放行，AI 只要发一个解析不出路径的 payload 就能穿过 L1 ——
+        // 那是「看着在拦、其实没拦」。空变更集必须落回原判定（多需求 → Ambiguous）。
+        let live = u01_live();
+        let v = judge(
+            &live,
+            &[],
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+        );
+        assert_eq!(
+            v.block_kind(),
+            Some(BlockKind::Ambiguous),
+            "取不到路径时不得放行：{v:?}"
+        );
+        // 只有空白路径同样算「取不到」，不得被 `trim` 后的空集蒙混过关。
+        let blank = judge(
+            &live,
+            &p(&["", "   "]),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+        );
+        assert_eq!(
+            blank.block_kind(),
+            Some(BlockKind::Ambiguous),
+            "空白路径不得当成豁免区改动：{blank:?}"
+        );
+    }
+
+    #[test]
+    fn U07_空集放行在审计上可追溯_且不与三段已批准混淆() {
+        let (root, dir) = parallel_repo("resolve-req020-u07");
+        write_req(&dir, "REQ-001", "approved", "approved", &["core/src/**"]);
+        write_req(&dir, "REQ-002", "draft", "pending", &["cli/src/**"]);
+        let live = live_snapshot(&root).unwrap();
+        let v = decide(
+            &root,
+            &live,
+            &p(&[".gates/requirements/REQ-003.md"]),
+            None,
+            MultiMode::Resolve,
+            Changeset::Provided,
+        );
+        assert!(v.is_pass(), "{v:?}");
+        let log = audit_tail(&root);
+        assert!(
+            log.contains("PASS no-managed-path"),
+            "审计须用既有专用标记，不得记成 `PASS <id>`：\n{log}"
+        );
+        assert!(
+            log.contains("NOTE "),
+            "审计须叠一条 NOTE 说明「未做归属判定」：\n{log}"
+        );
+        crate::testutil::cleanup(&root);
+    }
+
+    /// 造一份「已批准段正文被改」的清单（内容冻结硬伤）。
+    fn req_sum_bad(id: &str) -> LiveReq {
+        let mut r = req(id, true, &["docs/**"]);
+        r.sum_errors = vec!["「技术方案」的正文与批准时不一致".to_string()];
+        r
     }
 
     // ── R11 / R12 ───────────────────────────────────────────────────────
@@ -1478,7 +1779,14 @@ mod tests {
             req("REQ-001", true, &["cli/**"]),
             req("REQ-002", false, &["core/**"]),
         ];
-        let v = judge(&live, &p(&["core/a.rs"]), None, MultiMode::All, &ex());
+        let v = judge(
+            &live,
+            &p(&["core/a.rs"]),
+            None,
+            MultiMode::All,
+            &ex(),
+            Changeset::Provided,
+        );
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
         assert_eq!(ids(&v), vec!["REQ-002".to_string()], "保守档与路径无关");
     }
@@ -1489,7 +1797,8 @@ mod tests {
             req("REQ-001", true, &["cli/**"]),
             req("REQ-002", false, &["**"]),
         ];
-        let v = judge(&live, &[], None, MultiMode::All, &ex());
+        // 无变更集 → R2b 不生效（本用例正是「裸 check 不得因空集放行」的一道锁）
+        let v = judge(&live, &[], None, MultiMode::All, &ex(), Changeset::Absent);
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
     }
 
@@ -1616,7 +1925,7 @@ mod tests {
                 .iter()
                 .map(|r| r.id.clone())
                 .collect();
-            let v = judge(&live, &p(&paths), hint, mode, &ex());
+            let v = judge(&live, &p(&paths), hint, mode, &ex(), Changeset::Provided);
             let from_verdict: Vec<String> = match &v {
                 Verdict::Pass { reqs, .. } => reqs.clone(),
                 Verdict::Bypassed { reqs, .. } => reqs.clone(),
@@ -1708,7 +2017,14 @@ mod tests {
         vec![
             (
                 "R1",
-                judge(&[], &p(&["core/a.rs"]), None, MultiMode::Resolve, &ex()),
+                judge(
+                    &[],
+                    &p(&["core/a.rs"]),
+                    None,
+                    MultiMode::Resolve,
+                    &ex(),
+                    Changeset::Provided,
+                ),
             ),
             (
                 "R3",
@@ -2008,6 +2324,7 @@ mod tests {
             &p(&["core/src/resolve.rs"]),
             None,
             MultiMode::Resolve,
+            Changeset::Provided,
         );
         assert!(!v.is_pass(), "落在未批清单范围内的改动不得放行：{v:?}");
         assert_eq!(v.block_kind(), Some(BlockKind::Ambiguous));
@@ -2032,6 +2349,7 @@ mod tests {
             &p(&["core/src/resolve.rs"]),
             None,
             MultiMode::Resolve,
+            Changeset::Provided,
         );
         assert!(v.is_pass(), "无关未批清单不得阻断已批清单：{v:?}");
         assert_eq!(v.reqs(), &["REQ-001".to_string()]);
@@ -2063,6 +2381,7 @@ mod tests {
             &p(&["core/src/resolve.rs"]),
             None,
             MultiMode::Resolve,
+            Changeset::Provided,
         );
         assert!(v.is_pass(), "裁决对象由声明决定，不受文件名序影响：{v:?}");
         assert_eq!(v.reqs(), &["REQ-alice-001".to_string()]);
@@ -2075,7 +2394,14 @@ mod tests {
         write_req(&dir, "REQ-001", "approved", "approved", &["core/**"]);
         write_req(&dir, "REQ-002", "approved", "approved", &["core/**"]);
         let live = live_snapshot(&root).unwrap();
-        let v = decide(&root, &live, &p(&["core/a.rs"]), None, MultiMode::Resolve);
+        let v = decide(
+            &root,
+            &live,
+            &p(&["core/a.rs"]),
+            None,
+            MultiMode::Resolve,
+            Changeset::Provided,
+        );
         assert!(v.is_pass());
         assert!(
             audit_tail(&root).contains("PASS REQ-001 REQ-002"),
@@ -2097,7 +2423,14 @@ mod tests {
         );
         std::fs::write(&f, c).unwrap();
         let live = live_snapshot(&root).unwrap();
-        let v = decide(&root, &live, &p(&["core/a.rs"]), None, MultiMode::Resolve);
+        let v = decide(
+            &root,
+            &live,
+            &p(&["core/a.rs"]),
+            None,
+            MultiMode::Resolve,
+            Changeset::Provided,
+        );
         // 未批的那份不在索引里 → 候选只剩已批那份 → 放行（G2）
         assert!(v.is_pass(), "{v:?}");
         // 审计里 PASS 只列已批的那份
@@ -2122,6 +2455,7 @@ mod tests {
             &p(&["docs/a.md"]),
             Some("REQ-002"),
             MultiMode::Resolve,
+            Changeset::Provided,
         );
         assert!(ok.is_pass(), "{ok:?}");
         let bad = decide(
@@ -2130,6 +2464,7 @@ mod tests {
             &p(&["core/a.rs"]),
             Some("REQ-002"),
             MultiMode::Resolve,
+            Changeset::Provided,
         );
         assert_eq!(bad.block_kind(), Some(BlockKind::SelectionMismatch));
         crate::testutil::cleanup(&root);
@@ -2141,7 +2476,14 @@ mod tests {
         write_req(&dir, "REQ-001", "approved", "approved", &["cli/**"]);
         write_req(&dir, "REQ-002", "draft", "pending", &["core/**"]);
         let live = live_snapshot(&root).unwrap();
-        let v = decide(&root, &live, &p(&["core/a.rs"]), None, MultiMode::All);
+        let v = decide(
+            &root,
+            &live,
+            &p(&["core/a.rs"]),
+            None,
+            MultiMode::All,
+            Changeset::Provided,
+        );
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
         assert!(
             audit_tail(&root).contains("steps=decomposition+solution+testplan"),
