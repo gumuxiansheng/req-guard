@@ -145,3 +145,5 @@
 | 2026-10-08 14:09:50 | DERIVE_SOURCE_REFS REQ-019 - -> core/src,cli/src,templates/hooks/fragments,templates/ci,packaging/templates/ci,packaging/scripts,.github/workflows,.cnb.yml,scripts,.gates,docs/规范,docs/设计,packaging/docs,packaging,README.md |
 | 2026-10-08 14:09:50 | APPROVE REQ-019 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-08 14:09:57 | APPROVE REQ-019 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-08 18:03:28 | TOUCH.EXTEND REQ-019 actor=Mike_Zhu added=core/src/requirement.rs,scripts/mutation-manifest.txt reason=T6/T7_实施落点与判决清单 reapprove=1 |
+| 2026-10-08 18:05:08 | APPROVE REQ-019 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |

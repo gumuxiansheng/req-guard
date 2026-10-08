@@ -182,14 +182,18 @@ pub fn ensure_human(action: &str, root: &Path, scope: ScopeCheck<'_>) -> Result<
     authorize(
         &f,
         action,
-        || credential_ok(f.level, scope),
+        || credential_ok(root, f.level, scope),
         || prove_presence(action),
     )?;
     check_oob_forced(action)
 }
 
 /// 凭据是否有效（形态随等级收紧：L3 只认一次性范围票据）。
-fn credential_ok(level: u8, scope: ScopeCheck<'_>) -> bool {
+///
+/// 带了凭据却因**范围**被拒时留一条审计（`AUTH-REJECT reason=scope-mismatch`）：
+/// 「票过期」与「票对不上对象」是两种完全不同的处置（重签 vs 换票），不留痕时
+/// 两者在报错文案里长得一样，人只能靠猜。
+fn credential_ok(root: &std::path::Path, level: u8, scope: ScopeCheck<'_>) -> bool {
     let Some(cred) = provided_credential(level) else {
         return false;
     };
@@ -198,9 +202,22 @@ fn credential_ok(level: u8, scope: ScopeCheck<'_>) -> bool {
         Some(cfg) if cfg.mode == crate::token::Mode::Static => {
             level < 3 && crate::token::verify_static(&cred)
         }
-        Some(_) => crate::token::verify_scoped(&cred, scope),
+        Some(_) => {
+            let ok = crate::token::verify_scoped(&cred, scope);
+            if !ok && scope_mismatch() {
+                crate::gate::audit(root, "AUTH-REJECT reason=scope-mismatch");
+            }
+            ok
+        }
         None => false,
     }
+}
+
+/// 库里这张票的 `scope` 是否与本次审批对象不符（读不到票时返回 false）。
+fn scope_mismatch() -> bool {
+    crate::token::load_any()
+        .map(|c| !c.scope.is_empty())
+        .unwrap_or(false)
 }
 
 /// 凭据**管理**（重签/撤销）时"出示当前凭据"的校验：只看身份，**不看形态与范围**。
@@ -473,6 +490,8 @@ fn level_err(action: &str, f: &AuthFacts) -> GateError {
             "{} 属于审批类动作：本机审批严格等级 L{}（auth.level），必须出示**一次性范围票据**。\n\
              获取票据：在真实终端执行 req-guard token issue（可加 --req <需求ID> --step <步骤> 绑定对象），\n\
              再把打印出的原文用 --token <票据> 提交；同票据用后即废，不可重放。\n\
+             票据的 `scope` 必须与本次审批对象一致：分步批准要 `<需求ID>:<步骤>`，\n\
+             而 approve --all-steps 要 `<需求ID>:*` 的通配票（精确票不得用于通配批注，反之亦然）。\n\
              也可直接在 GUI 管理台里审批（界面进程内签发并内存持有票据）。",
             action, f.level
         ));

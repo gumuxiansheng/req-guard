@@ -209,6 +209,38 @@ pub enum AcTarget<'a> {
     IncludingArchived,
 }
 
+/// 按档位放宽 AC 强度（REQ-019 §2.6 / G5）。
+///
+/// **只放松两条**：A1（无 `GATE:AC` 块，[`AcIssueKind::MissingBlock`]）与
+/// A8（块内 0 条目，[`AcIssueKind::NoItem`]）在 `light` / `trivial` 档下降级为提示。
+/// A2–A7、A9–A12 **一律不放松** —— 写了就必须格式合规；`standard` / `critical`
+/// 档的 A1 / A8 仍是 error。
+///
+/// 残余风险（REQ-019 §2.6 已披露）：档位来自 frontmatter，AI 可以把 `tier` 写小来
+/// 逃避 AC。收口在两处：① 派生档由 CI 复算，逃逸只在 CI 之前有效；② 三段实质正文
+/// 判定不放松，一条命令批三段不可能批出一份三段空话的清单。
+pub fn relax_for_tier(issues: Vec<AcIssue>, tier: crate::tier::Tier) -> Vec<AcIssue> {
+    if !tier.ac_optional() {
+        return issues;
+    }
+    issues
+        .into_iter()
+        .map(|mut i| {
+            if matches!(i.kind, AcIssueKind::MissingBlock | AcIssueKind::NoItem)
+                && i.severity.is_error()
+            {
+                i.severity = Severity::Warn;
+                i.message = format!(
+                    "{}（`tier: {}`：验收标准选填，本条降级为提示；                     一旦写了 GATE:AC 块，A2–A12 全部照常生效）",
+                    i.message,
+                    tier
+                );
+            }
+            i
+        })
+        .collect()
+}
+
 /// 校验一份清单里所有目标的 AC 问题（跨清单聚合）。
 pub fn check(root: &Path, target: &AcTarget<'_>) -> Result<Vec<AcIssue>> {
     let reqs = match target {
@@ -228,8 +260,10 @@ pub fn check(root: &Path, target: &AcTarget<'_>) -> Result<Vec<AcIssue>> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let content = std::fs::read_to_string(&r.path).unwrap_or_default();
+        // 声明档（缺省 `standard`；非法取值 → 这里就报错，与 check 裁决同一条判据）。
+        let tier = crate::tier::declared_of(&content)?;
         // 严格分段：定位失败如实报「第 3 段定位失败」，绝不回退整篇（见模块文档）
-        let issues = match requirement::section_span(&content, 2) {
+        let raw_issues = match requirement::section_span(&content, 2) {
             Some((start, end)) => {
                 let lines: Vec<&str> = content.lines().collect();
                 let section = lines[start - 1..end].join("\n");
@@ -245,6 +279,8 @@ pub fn check(root: &Path, target: &AcTarget<'_>) -> Result<Vec<AcIssue>> {
                 ),
             )],
         };
+        // 轻档只放松 A1 / A8（REQ-019 §2.6）：做了才合规检查，不做不阻断。
+        let issues = relax_for_tier(raw_issues, tier);
         out.extend(issues.into_iter().map(|mut i| {
             i.message = format!("{} {}", r.id, i.message);
             i

@@ -484,6 +484,11 @@ fn ensure_cross_refs_ok(root: &Path, id: &str, content: &str) -> Result<()> {
     Err(GateError::Validation(msg))
 }
 
+/// 声明档（缺省 `standard`；非法取值报错 —— 与 `check` 裁决同一条判据，不各写一份）。
+fn declared_tier(content: &str) -> Result<crate::tier::Tier> {
+    crate::tier::declared_of(content)
+}
+
 fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
     let Some((start, end)) = section_span(content, 2) else {
         return Err(GateError::Validation(format!(
@@ -494,7 +499,8 @@ fn ensure_ac_compliant(id: &str, content: &str) -> Result<()> {
     };
     let lines: Vec<&str> = content.lines().collect();
     let section = lines[start - 1..end].join("\n");
-    let issues = crate::ac::lint(&section, start);
+    let tier = declared_tier(content)?;
+    let issues = crate::ac::relax_for_tier(crate::ac::lint(&section, start), tier);
     let errs: Vec<&crate::ac::AcIssue> = issues.iter().filter(|i| i.severity.is_error()).collect();
     if errs.is_empty() {
         return Ok(());
@@ -728,6 +734,45 @@ pub fn review(
             reason,
             strict,
             event: if pass { "APPROVE" } else { "REJECT" },
+            quick: false,
+        },
+    )
+}
+
+/// `approve --all-steps`：一条命令批三段（REQ-019 §2.5 / G4，轻档审批形态）。
+///
+/// 四条硬约束（任一条不满足即整体拒绝，**不留部分批准**）：
+///
+/// 1. **原子性**：三段任一段校验失败（实质正文为空 / AC 不合格 / `GATE:TOUCH` 为空）
+///    → 一段都不批。「批了两段」的状态比「一段没批」更危险 —— 前者看起来像快完成了。
+/// 2. **留痕不减**：仍写**三条** `APPROVE` 台账行，各带 `sum=` / `updated=` / `sig=`，
+///    `channel=quick`。quick 省的是**交互次数**，不是记录。
+/// 3. **凭据不放宽**：L3 下需要一张 `scope` 匹配 `<需求ID>:*` 的**通配票据**，
+///    且只允许消费一次（批三段算一次）。精确票不得用于 `--all-steps`，通配票不得用于
+///    分步批准（见 [`crate::token::ScopeCheck::AllSteps`]）。
+/// 4. **实质正文不放松**：第 3 段虽免 AC，但仍要求三段实质正文非空
+///    （[`crate::section::is_section_empty`] 继续生效）—— 轻档至少要写
+///    「改了什么 + 怎么自测」。
+///
+/// `strict_order` 在此场景是**显式豁免**（同批三段），豁免事实进台账。
+pub fn review_all(
+    root: &Path,
+    id: &str,
+    reviewer: &str,
+    reason: &str,
+    strict: bool,
+) -> Result<Requirement> {
+    review_inner(
+        root,
+        ReviewCall {
+            id,
+            step: STEPS[0].0,
+            reviewer,
+            pass: true,
+            reason,
+            strict,
+            event: "APPROVE",
+            quick: true,
         },
     )
 }
@@ -769,6 +814,7 @@ pub fn amend(
             reason,
             strict,
             event: "AMEND",
+            quick: false,
         },
     )
 }
@@ -784,6 +830,8 @@ struct ReviewCall<'a> {
     strict: bool,
     /// 台账事件名（`APPROVE` / `REJECT` / `AMEND`）。
     event: &'a str,
+    /// 一条命令批三段（`--all-steps`）：`step` 被忽略，按 [`STEPS`] 全批。
+    quick: bool,
 }
 
 /// `review` / `amend` 共用的内核。
@@ -796,10 +844,19 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
         reason,
         strict,
         event: event_kind,
+        quick,
     } = c;
+    // 本次实际要落的段：quick = 三段一次批（`--all-steps`），否则只有 `step`。
+    let steps: Vec<&str> = if quick {
+        STEPS.iter().map(|(k, _)| *k).collect()
+    } else {
+        vec![step]
+    };
     // 审批锁（§4.4）：approve/reject 不得在 AI 执行上下文内发生，
     // 否则 AI 经 Shell 自批即可把状态欺诈骗成 approved。
-    // L3 下凭据是**绑定该需求+步骤**的一次性票据（见 core/src/token.rs）。
+    // L3 下凭据是**绑定该需求+步骤**的一次性票据（见 core/src/token.rs）；
+    // `--all-steps` 要的是 `scope` 为 `<需求ID>:*` 的通配票（§2.5 约束 3）。
+    let exact_scope = format!("{}:{}", id, step);
     crate::auth::ensure_human(
         match event_kind {
             "AMEND" => "amend",
@@ -807,9 +864,14 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
             _ => "reject",
         },
         root,
-        crate::token::ScopeCheck::Exact(&format!("{}:{}", id, step)),
+        match quick {
+            true => crate::token::ScopeCheck::AllSteps(id),
+            false => crate::token::ScopeCheck::Exact(&exact_scope),
+        },
     )?;
-    validate_step(step)?;
+    if !quick {
+        validate_step(step)?;
+    }
     let r = find(root, id)?;
     let mut content = fs::read_to_string(&r.path).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
@@ -824,7 +886,9 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
         )));
     }
 
-    if strict {
+    // `strict_order` 在 `--all-steps` 下是**显式豁免**（同批三段，顺序天然满足）；
+    // 豁免事实进台账（§2.5 末），故此处只在非 quick 路径上逐段校验。
+    if strict && !quick {
         for s in STEPS {
             if s.0 == step {
                 break;
@@ -852,11 +916,15 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
     // 为什么任何等级都拒绝（不像 TOUCH 那样 L0 放行）：内容为空不是"管理严格度"问题。
     // 唯一的例外是段定位失败（标题被改坏），那由 `ac::check` 报 SectionNotFound。
     if pass {
-        if let Some(step) = STEPS.iter().position(|(k, _)| *k == step) {
-            let ph = template_placeholder_texts();
-            if crate::section::is_section_empty(&content, step, &ph) == Some(true) {
+        let ph = template_placeholder_texts();
+        for (i, s) in STEPS.iter().enumerate() {
+            if !steps.contains(&s.0) {
+                continue;
+            }
+            if crate::section::is_section_empty(&content, i, &ph) == Some(true) {
+                // 原子性：三段里任一段空 → 整体拒绝（上面还没落盘，故不存在部分批准）。
                 return Err(GateError::Validation(
-                    crate::section::empty_section_message(&r.id, step),
+                    crate::section::empty_section_message(&r.id, i),
                 ));
             }
         }
@@ -868,7 +936,7 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
     // 把校验挂在钥匙上，"第三段写成三段空话"就**物理上无法通过** ——
     // 不依赖任何人记得跑检查命令。`ac check` 只是把同一判据提前暴露给 AI 与 CI，
     // 用于早失败。两者共用 `ac::lint`，不存在两份判定。
-    if pass && step == "testplan" {
+    if pass && steps.contains(&"testplan") {
         ensure_ac_compliant(&r.id, &content)?;
     }
 
@@ -883,7 +951,7 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
     // 是否存在**，`source_refs: []` 一律通过；FRS004 需要非空列表才能匹配变更集。
     // 于是「声明为空」这条路径在 doc-guard 侧完全静默——规格看似接入时效治理，
     // 实则永远不会被判过期。故声明侧的门禁只能放在批准动作上。
-    if pass && step == "solution" {
+    if pass && steps.contains(&"solution") {
         content = ensure_touch_declared(root, &r.id, &content)?;
         // 交叉引用有效性（REQ-004 T5）：声明范围与引用有效性是**两件事**，
         // 前者管"改哪些文件"，后者管"引用的设计是否还在"。
@@ -909,19 +977,23 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
 
     let mut out = String::new();
     for line in content.lines() {
-        if is_marker_line(line) && line.contains("GATE:STEP") && token(line, "name") == step {
+        let this_step = is_marker_line(line)
+            && line.contains("GATE:STEP")
+            && steps.contains(&token(line, "name").as_str());
+        if this_step {
+            let cur = token(line, "name");
             let label = token(line, "label");
             // 内容冻结：approve 绑定**本次所批内容**的摘要；reject 写 `-`
             // （被拒绝的内容没有"已批准的正文"需要保护，留着旧摘要只会
             //  在下一轮 approve 前继续"保护"一份已经过时的内容）。
             let sum = if pass {
-                match section_sum(&content, step_index(step).unwrap_or(0)) {
+                match section_sum(&content, step_index(&cur).unwrap_or(0)) {
                     Some(v) => v,
                     None => {
                         return Err(GateError::Validation(format!(
                             "需求 {id} 的「{label}」段二级标题定位失败，无法绑定内容摘要。\n\
                              请把该段标题改回 `## {} . {label}`",
-                            step_index(step).unwrap_or(0) + 1
+                            step_index(&cur).unwrap_or(0) + 1
                         )))
                     }
                 }
@@ -930,7 +1002,7 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
             };
             out.push_str(&format!(
                 "<!-- GATE:STEP name={} label={} status={} reviewer={} email={} sig={} updated={} sum={} -->\n",
-                step, label, new_status, rv, em, sg, ts, sum
+                cur, label, new_status, rv, em, sg, ts, sum
             ));
         } else {
             out.push_str(line);
@@ -938,22 +1010,25 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
         }
     }
     out = set_head_status(&out, &recompute_head(&out), None);
-    out = append_audit(
-        &out,
-        &format!(
-            "- {} | {} <{}> | {} | {} | {}\n",
-            ts,
-            rv,
-            em,
-            step,
-            new_status,
-            if reason.trim().is_empty() {
-                "-"
-            } else {
-                reason.trim()
-            }
-        ),
-    );
+    // 审核记录：quick 一次写三条（三段各一条），逐段批准仍只写一条。
+    for st in &steps {
+        out = append_audit(
+            &out,
+            &format!(
+                "- {} | {} <{}> | {} | {} | {}\n",
+                ts,
+                rv,
+                em,
+                st,
+                new_status,
+                if reason.trim().is_empty() {
+                    "-"
+                } else {
+                    reason.trim()
+                }
+            ),
+        );
+    }
 
     fs::write(&r.path, out).map_err(|e| GateError::Io {
         path: Some(r.path.clone()),
@@ -961,22 +1036,38 @@ fn review_inner(root: &Path, c: ReviewCall<'_>) -> Result<Requirement> {
     })?;
 
     // L3：审批已落盘 → 消费一次性票据（用后即废，杜绝同一凭据重放第二次审批）。
+    // quick 下批三段**算一次**消费：省掉的是交互次数，不是「不可重放」。
     crate::auth::consume_credential_if_scoped();
 
     // 审计（§4.6）：审批/打回是关键事件——本机日志 + 入库台账（PR 可复核）；
-    // 渠道标注（方案 C）让"审批来自带外/交互"可审计。
-    let event = format!(
-        "{} {} step={} reviewer={} channel={} {} {}",
-        event_kind,
-        r.id,
-        step,
-        safe_field(&stamp.reviewer),
-        crate::auth::declared_channel(),
-        crate::auth::audit_ctx(),
-        stamp.audit_fields()
-    );
-    crate::gate::audit(root, &event);
-    crate::gate::audit_ledger(root, &event);
+    // 渠道标注（方案 C）让"审批来自带外/交互"可审计。quick 的渠道标成 `quick`，
+    // 一次批三段在台账上必须与三次分批区分得开（否则事后无法回答「哪份清单被批量放过」）。
+    let channel = match quick {
+        true => "quick".to_string(),
+        false => crate::auth::declared_channel().to_string(),
+    };
+    let order_note = match (quick, strict) {
+        (true, true) => format!(
+            " strict_order=exempt reason=approve-all-steps steps={}",
+            steps.join("+")
+        ),
+        _ => String::new(),
+    };
+    for st in &steps {
+        let event = format!(
+            "{} {} step={} reviewer={} channel={} {}{} {}",
+            event_kind,
+            r.id,
+            st,
+            safe_field(&stamp.reviewer),
+            channel,
+            order_note,
+            crate::auth::audit_ctx(),
+            stamp.audit_fields()
+        );
+        crate::gate::audit(root, &event);
+        crate::gate::audit_ledger(root, &event);
+    }
 
     Ok(r)
 }
@@ -2628,7 +2719,7 @@ const TESTPLAN_BODY: &str = "\
 #[allow(non_snake_case)] // 与既有中文测试命名一致
 mod tests {
     use super::*;
-    use crate::testutil::{cleanup, fill_sections, temp_dir};
+    use crate::testutil::{cleanup, disable_auth, fill_sections, set_auth_level, temp_dir};
 
     /// 基于真实模板造出指定三段状态的清单正文。
     fn content_with(states: [&str; 3]) -> String {
@@ -2773,6 +2864,359 @@ mod tests {
         assert_eq!(step_status(&content, "testplan"), "approved");
         assert_eq!(head_status(&content), "approved", "三步齐备应整体解锁");
         assert!(content.contains("## 审核记录"), "应写入审核记录区块");
+        cleanup(&root);
+    }
+
+    // ── REQ-019 T6：`approve --all-steps` ───────────────────────────────
+
+    /// 把第 3 段的 `GATE:AC` 块**替换**成一条合规 AC。
+    ///
+    /// 替换而不是追加：模板自带一块占位 AC（占位子句不合规），追加只会多一条
+    /// 跳号条目，`ensure_ac_compliant` 照样拒 —— 夹具必须**替掉**它才测到目标路径。
+    fn fill_ac(root: &std::path::Path, id: &str) {
+        upsert_ac_block(
+            root,
+            id,
+            "### AC-001\n\
+- Given: 一份三段正文均已填实质内容的需求清单\n\
+- When: 对该清单执行一次 approve --all-steps\n\
+- Then: 三段状态均为 approved 且台账新增 3 条 APPROVE\n",
+        )
+    }
+
+    /// 写入 `<!-- GATE:AC -->…<!-- /GATE:AC -->`（块已存在则替换其正文，否则整块插入）。
+    ///
+    /// 「已存在 / 不存在」两种形态都收在这里而不是调用方各判一次：夹具里这两条
+    /// 路径总是成对出现（先删块验证选填、再补块验证不合规），各写一遍必然有一处
+    /// 会在块不存在时 panic。
+    fn upsert_ac_block(root: &std::path::Path, id: &str, body: &str) {
+        let p = find(root, id).expect("清单应存在").path;
+        let c = fs::read_to_string(&p).expect("清单应可读");
+        if !c.contains("<!-- GATE:AC -->") {
+            let at = c.find("## 审核记录").expect("模板应含审核记录区块");
+            let block = format!("<!-- GATE:AC -->\n{body}<!-- /GATE:AC -->\n");
+            let out = format!("{}{}{}", &c[..at], block, &c[at..]);
+            fs::write(&p, out).expect("清单应可写");
+            return;
+        }
+        replace_ac_block(root, id, body);
+    }
+
+    /// 整体替换 `<!-- GATE:AC -->…<!-- /GATE:AC -->` 之间的正文（块本身由 req-guard 维护）。
+    fn replace_ac_block(root: &std::path::Path, id: &str, body: &str) {
+        let p = find(root, id).expect("清单应存在").path;
+        let c = fs::read_to_string(&p).expect("清单应可读");
+        let begin = c.find("<!-- GATE:AC -->").expect("模板应含 AC 块");
+        let after = begin + "<!-- GATE:AC -->".len();
+        let end = c[after..]
+            .find("<!-- /GATE:AC -->")
+            .map(|i| after + i)
+            .expect("模板应含 AC 结束标记");
+        // 注意 `&c[end..]` 已含结束标记，故这里**只补开标记**，不再补结束标记
+        // （补两次会留下一个块外孤立标记，A7 会判成块外条目）。
+        let out = format!("{}<!-- GATE:AC -->\n{}{}", &c[..begin], body, &c[end..]);
+        fs::write(&p, out).expect("清单应可写");
+    }
+
+    /// 删掉整个 `GATE:AC` 块（轻档「AC 选填」场景）。
+    fn drop_ac_block(root: &std::path::Path, id: &str) {
+        let p = find(root, id).expect("清单应存在").path;
+        let c = fs::read_to_string(&p).expect("清单应可读");
+        let begin = c.find("<!-- GATE:AC -->").expect("模板应含 AC 块");
+        let after = begin + "<!-- GATE:AC -->".len();
+        let end = after
+            + c[after..]
+                .find("<!-- /GATE:AC -->")
+                .expect("模板应含 AC 结束标记")
+            + "<!-- /GATE:AC -->".len();
+        let out = format!("{}{}", &c[..begin], &c[end..]);
+        fs::write(&p, out).expect("清单应可写");
+    }
+
+    /// 接线锁：批量批准走通配 scope、分步批准走精确 scope。
+    ///
+    /// 为什么不直接断言错误文案：范围判据的**真值**在 `token::ticket_usable`
+    /// （纯函数，见 token.rs 用例）；这里锁的是「哪条命令用哪种 scope」这根线 ——
+    /// 它写反的后果是「一张精确票就能批量批准三段」，而那条路在单测里只能靠
+    /// 文案间接观察。
+    fn quick_path_is_all_steps() -> bool {
+        // `review_all` 传 `ScopeCheck::AllSteps(id)`（见 review_inner）；
+        // 这里以源码事实自证：函数体内出现 AllSteps 且分步分支仍是 Exact。
+        let src = include_str!("requirement.rs");
+        src.contains("crate::token::ScopeCheck::AllSteps(id)")
+            && src.contains("crate::token::ScopeCheck::Exact(&exact_scope)")
+    }
+
+    /// 把 frontmatter 的 `tier` 改成给定值（仅测试用；真实路径由人类手改 / approve 派生）。
+    fn set_declared_tier(root: &std::path::Path, id: &str, tier: &str) {
+        let p = find(root, id).expect("清单应存在").path;
+        let c = fs::read_to_string(&p).expect("清单应可读");
+        let out = c
+            .lines()
+            .map(|l| {
+                if l.starts_with("tier:") {
+                    format!("tier: {tier}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, out).expect("清单应可写");
+    }
+
+    #[test]
+    fn u19_一条命令批三段且三条台账各带摘要() {
+        let root = temp_dir("req-quick-ok");
+        create(&root, None, "轻档批量批准").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        disable_auth(&root);
+
+        review_all(&root, "REQ-001", "寇工", "", true).unwrap();
+
+        let r = find(&root, "REQ-001").unwrap();
+        let content = fs::read_to_string(&r.path).unwrap();
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_eq!(step_status(&content, step), "approved", "{step} 应已批准");
+            assert!(
+                matches!(step_sum(&content, step), SumState::Frozen(_)),
+                "{step} 必须绑定 sum=（留痕不减）"
+            );
+        }
+        assert_eq!(head_status(&content), "approved");
+        let ledger = fs::read_to_string(root.join(crate::gate::LEDGER_REL)).unwrap();
+        let approves = ledger.matches("APPROVE REQ-001").count();
+        assert_eq!(approves, 3, "三段各一条 APPROVE：\n{ledger}");
+        assert_eq!(
+            ledger.matches("channel=quick").count(),
+            3,
+            "每条都要标 channel=quick：\n{ledger}"
+        );
+        assert!(
+            ledger.contains("strict_order=exempt"),
+            "顺序豁免必须留痕：\n{ledger}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u20_声明块为空在L0只告警在L1以上硬拦() {
+        // AC-010 的机械口径是「非零退出码 + 三段全 pending」，那条只在 **L1+** 成立：
+        // `ensure_touch_declared` 的缺声明路径是**既有**的 L0 放行（REQ 的 TOUCH 宽容档），
+        // 批量批准不得顺手把它收紧（那是另一条需求的改动），也不得假装它不存在。
+        // 故这里锁住两侧事实，L1+ 的拦截由 `scripts/verify_tier.py` 在真机上判决。
+        let root = temp_dir("req-quick-touch");
+        create(&root, None, "声明块为空").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        disable_auth(&root);
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        let out: String = c
+            .lines()
+            .filter(|l| l.trim() != "core/src/**")
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, out).unwrap();
+
+        // L0：只告警并放行（既有宽容档）
+        review_all(&root, "REQ-001", "寇工", "", true).unwrap();
+        let content = fs::read_to_string(&p).unwrap();
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_eq!(step_status(&content, step), "approved", "{step}");
+        }
+        cleanup(&root);
+
+        // L1+：连鉴权都过不去（无凭据、无 TTY）→ 非零退出码，三段全 pending
+        let root = temp_dir("req-quick-touch-l1");
+        create(&root, None, "声明块为空").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        set_auth_level(&root, 3);
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        let out: String = c
+            .lines()
+            .filter(|l| l.trim() != "core/src/**")
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, out).unwrap();
+        let e = review_all(&root, "REQ-001", "寇工", "", true).unwrap_err();
+        assert!(e.to_string().contains("票据"), "{e}");
+        let content = fs::read_to_string(&p).unwrap();
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_eq!(
+                step_status(&content, step),
+                "pending",
+                "{step} 应保持 pending"
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u20b_验收标准不合规时整体拒绝不得批了两段() {
+        // 与 u20 同一条原子性判据的另一条**等级无关**路径（AC 校验不看 auth 等级），
+        // 因此可以在单测里真正跑到「第二段校验失败」这一步而不依赖真机凭据。
+        let root = temp_dir("req-quick-ac-bad");
+        create(&root, None, "AC 不合规").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        disable_auth(&root);
+        // 编号跳号（A3）：声明档 standard 时是硬伤，且**不看 auth 等级**
+        upsert_ac_block(
+            &root,
+            "REQ-001",
+            "### AC-001\n\
+- Given: 一份三段正文均已填实质内容的需求清单\n\
+- When: 对该清单执行一次 approve --all-steps\n\
+- Then: 三段状态均为 approved 且台账新增 3 条 APPROVE\n\
+### AC-003\n\
+- Given: 一份编号从 001 跳到 003 的清单\n\
+- When: 执行 req-guard ac check REQ-001\n\
+- Then: 退出码为 1 且类别为 SeqGap\n",
+        );
+
+        assert!(review_all(&root, "REQ-001", "寇工", "", true).is_err());
+        let p = find(&root, "REQ-001").unwrap().path;
+        let content = fs::read_to_string(&p).unwrap();
+        for step in ["decomposition", "solution", "testplan"] {
+            assert_ne!(
+                step_status(&content, step),
+                "approved",
+                "{step} 不得被批准（原子性）"
+            );
+        }
+        assert!(
+            !fs::read_to_string(root.join(crate::gate::LEDGER_REL))
+                .unwrap_or_default()
+                .contains("APPROVE"),
+            "整体拒绝时不得留下任何 APPROVE 记录"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u21_第三段实质正文为空时整体拒绝() {
+        let root = temp_dir("req-quick-empty");
+        create(&root, None, "空段").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        disable_auth(&root);
+        // 把第 3 段正文清回模板占位（= 实质正文 0 行）
+        let p = find(&root, "REQ-001").unwrap().path;
+        let c = fs::read_to_string(&p).unwrap();
+        let out: String = c
+            .lines()
+            .filter(|l| !l.contains("测试计划：本用例的测试夹具。"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&p, out).unwrap();
+
+        assert!(review_all(&root, "REQ-001", "寇工", "", true).is_err());
+        let content = fs::read_to_string(&p).unwrap();
+        assert_ne!(step_status(&content, "decomposition"), "approved");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u22_批量批准要求通配票_错误文案点名scope() {
+        // 范围判定本身由 `token::u22_*` 纯函数用例锁死（那里不碰 $HOME 下的
+        // guard.cfg，否则并行测试互相污染）；这里锁**文案与人看到的出路**：
+        // L3 下用批量批准却没有通配票时，报错必须点名 scope 与取法。
+        let root = temp_dir("req-quick-scope");
+        create(&root, None, "票据范围").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        set_auth_level(&root, 3);
+        let e = review_all(&root, "REQ-001", "寇工", "", true).unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("scope"), "错误须点名 scope：{m}");
+        assert!(
+            m.contains("approve --all-steps"),
+            "须说明批量批准的取票口径：{m}"
+        );
+        assert!(m.contains("通配"), "{m}");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u24_通配票不得用于分步批准_由纯函数判据锁死() {
+        // 纯函数判据（精确票 ↔ 通配票互不对冲、用后即废）见 `core/src/token.rs`
+        // 的 `u22_精确票不得用于通配批注且通配票不得用于分步` / `u23_*`。
+        // 这里只锁接线：`review` 仍走 `ScopeCheck::Exact`，`review_all` 才走
+        // `ScopeCheck::AllSteps` —— 接线写反会让两条路互相放行。
+        let rq = quick_path_is_all_steps();
+        assert!(rq);
+    }
+
+    #[test]
+    fn u25_轻档缺验收标准降级为提示而编号跳号仍拦() {
+        let root = temp_dir("req-quick-ac");
+        create(&root, None, "轻档 AC").unwrap();
+        fill_sections(&root, "REQ-001");
+        fill_ac(&root, "REQ-001");
+        set_declared_tier(&root, "REQ-001", "light");
+        disable_auth(&root);
+
+        // ① 轻档 + 无 GATE:AC 块 → `ac check` 无硬伤且给提示
+        drop_ac_block(&root, "REQ-001");
+        let issues = crate::ac::check(&root, &crate::ac::AcTarget::Id("REQ-001")).unwrap();
+        assert!(
+            !crate::ac::has_errors(&issues),
+            "轻档缺 AC 块不得报错：{issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.message.contains("选填")),
+            "须明示「选填」：{issues:?}"
+        );
+
+        // ② 轻档 + 编号跳号 → 仍是 error（A2–A12 一律不放松）
+        upsert_ac_block(
+            &root,
+            "REQ-001",
+            "### AC-001\n\
+- Given: 一份三段正文均已填实质内容的需求清单\n\
+- When: 对该清单跳号写验收标准\n\
+- Then: 编号跳到 AC-003 时必须报 SeqGap\n\
+### AC-003\n\
+- Given: 一份编号跳号的清单\n\
+- When: 执行 req-guard ac check REQ-001\n\
+- Then: 退出码为 1 且类别为 SeqGap\n",
+        );
+        let issues = crate::ac::check(&root, &crate::ac::AcTarget::Id("REQ-001")).unwrap();
+        assert!(
+            crate::ac::has_errors(&issues),
+            "轻档也不得放松 A3：{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.kind == crate::ac::AcIssueKind::SeqGap),
+            "须命中 SeqGap：{issues:?}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u25b_standard档缺验收标准仍是硬伤() {
+        let root = temp_dir("req-std-ac");
+        create(&root, None, "标准档 AC").unwrap();
+        fill_sections(&root, "REQ-001");
+        disable_auth(&root);
+        drop_ac_block(&root, "REQ-001");
+        let issues = crate::ac::check(&root, &crate::ac::AcTarget::Id("REQ-001")).unwrap();
+        assert!(
+            crate::ac::has_errors(&issues),
+            "standard 档缺 AC 块必须报错：{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.kind == crate::ac::AcIssueKind::MissingBlock),
+            "须命中 A1：{issues:?}"
+        );
         cleanup(&root);
     }
 

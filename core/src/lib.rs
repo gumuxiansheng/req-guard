@@ -24,6 +24,10 @@ pub mod resolve;
 pub mod section;
 pub mod specmeta;
 pub mod status;
+/// 分级门禁：档位模型 + `classify` 纯函数（REQ-019 G1/G3）。
+pub mod tier;
+/// 有效改动行统计：`git diff -U0` 解析与双侧注释行号对齐（REQ-019 T2）。
+pub mod tierdiff;
 pub mod token;
 pub mod touch;
 pub mod ui_mode;

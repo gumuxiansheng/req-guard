@@ -71,6 +71,14 @@ pub enum ScopeCheck<'a> {
     Any,
     /// 必须与票据 `scope` 一致；票据 scope 为空（通用单次票）时放行。
     Exact(&'a str),
+    /// **通配票据**：仅 `approve --all-steps` 用（REQ-019 §2.5）。
+    ///
+    /// 要求票据 `scope` 逐字等于 `<需求ID>:*` —— 既不接受精确票（`REQ-001:solution`），
+    /// 也不接受通用单次票（scope 为空）。反向亦成立：通配票**不能**用于分步批准
+    /// （[`ScopeCheck::Exact`] 比的是全串，`REQ-001:*` ≠ `REQ-001:solution`）。
+    ///
+    /// 这条不可对冲是刻意的：省掉的是两次交互，不是「人类在场」与「不可重放」。
+    AllSteps(&'a str),
 }
 
 /// 一个审批凭据配置（读取/写入 `guard.cfg`）。
@@ -239,19 +247,43 @@ pub fn verify_static(provided: &str) -> bool {
     }
 }
 
+/// 通配 scope 字面量（`<需求ID>:*`）—— 签发与校验共用一份，**不各写一遍**。
+pub fn wildcard_scope(id: &str) -> String {
+    format!("{}:*", id.trim())
+}
+
+/// 范围是否匹配（**纯函数**，从 [`verify_scoped`] 里抽出以便可测）。
+///
+/// 抽出不是为了「好测」，而是为了让「票据范围」这条判据能被直接引用 —— 它同时决定
+/// 通配票与精确票**互不对冲**（REQ-019 §2.5 约束 3），那是本仓最容易被后续改动
+/// 「顺手放宽」的一处。
+pub fn scope_matches(cfg_scope: &str, scope: &ScopeCheck<'_>) -> bool {
+    match scope {
+        ScopeCheck::Any => true,
+        ScopeCheck::Exact(s) => cfg_scope.is_empty() || cfg_scope == *s,
+        ScopeCheck::AllSteps(id) => cfg_scope == wildcard_scope(id),
+    }
+}
+
+/// 票据是否可用（**纯函数**）：形态 scoped、未消费、未过期、范围匹配、哈希命中。
+///
+/// `cfg` 由调用方给（生产传 [`load`] 的结果，测试传构造值）—— `now` 也由调用方给，
+/// 于是「一次性」与「范围」两条判据都能脱离进程环境单测，而不必去动 `$HOME`
+/// 下的 `guard.cfg`（并行测试改它必然互相污染，token.rs 既有注释已记过这个坑）。
+pub fn ticket_usable(cfg: &TokenCfg, provided: &str, scope: &ScopeCheck<'_>, now: u64) -> bool {
+    cfg.mode == Mode::Scoped
+        && !cfg.used
+        && cfg.expires_epoch > now
+        && scope_matches(&cfg.scope, scope)
+        && crate::digest::sha256_hex(provided.as_bytes()) == cfg.hash
+}
+
 /// 校验**一次性范围票据**（L3）：形态必须是 `scoped`、未消费、范围匹配、哈希命中。
 pub fn verify_scoped(provided: &str, scope: ScopeCheck<'_>) -> bool {
     let Some(cfg) = load() else {
         return false;
     };
-    if cfg.mode != Mode::Scoped {
-        return false;
-    }
-    let scope_ok = match scope {
-        ScopeCheck::Any => true,
-        ScopeCheck::Exact(s) => cfg.scope.is_empty() || cfg.scope == s,
-    };
-    scope_ok && crate::digest::sha256_hex(provided.as_bytes()) == cfg.hash
+    ticket_usable(&cfg, provided, &scope, crate::gate::now_epoch())
 }
 
 /// 消费当前票据（`scoped` 用后即废）。返回是否确实标记成功。
@@ -459,6 +491,88 @@ mod tests {
         assert_eq!(Mode::parse(""), Mode::Static);
         assert_eq!(Mode::parse("STATIC"), Mode::Static);
         assert_eq!(Mode::parse("scoped"), Mode::Scoped);
+    }
+
+    /// 造一张「一切正常」的一次性票据（`scope` 由调用方给）。
+    fn ticket(scope: &str, raw: &str) -> TokenCfg {
+        TokenCfg {
+            enabled: true,
+            mode: Mode::Scoped,
+            hash: crate::digest::sha256_hex(raw.as_bytes()),
+            scope: scope.to_string(),
+            used: false,
+            expires_epoch: 1_000,
+        }
+    }
+
+    #[test]
+    fn u22_精确票不得用于通配批注且通配票不得用于分步() {
+        let exact = ticket("REQ-001:solution", "raw");
+        assert!(
+            !ticket_usable(&exact, "raw", &ScopeCheck::AllSteps("REQ-001"), 0),
+            "精确票不得用于 --all-steps"
+        );
+        let wildcard = ticket("REQ-001:*", "raw");
+        assert!(
+            !ticket_usable(&wildcard, "raw", &ScopeCheck::Exact("REQ-001:solution"), 0),
+            "通配票不得用于分步批准"
+        );
+        // 空 scope 的通用单次票同样不认（否则「一张票批一切」）
+        let any = ticket("", "raw");
+        assert!(!ticket_usable(
+            &any,
+            "raw",
+            &ScopeCheck::AllSteps("REQ-001"),
+            0
+        ));
+        // 反面对照：各自的对象都能用
+        assert!(ticket_usable(
+            &wildcard,
+            "raw",
+            &ScopeCheck::AllSteps("REQ-001"),
+            0
+        ));
+        assert!(ticket_usable(
+            &exact,
+            "raw",
+            &ScopeCheck::Exact("REQ-001:solution"),
+            0
+        ));
+    }
+
+    #[test]
+    fn u23_票据用后即废第二次消费不得通过() {
+        let mut t = ticket("REQ-001:*", "raw");
+        assert!(ticket_usable(
+            &t,
+            "raw",
+            &ScopeCheck::AllSteps("REQ-001"),
+            0
+        ));
+        t.used = true; // 第一次消费
+        assert!(
+            !ticket_usable(&t, "raw", &ScopeCheck::AllSteps("REQ-001"), 0),
+            "同一张票不得重放第二次"
+        );
+    }
+
+    #[test]
+    fn 票据过期或形态不对一律不通过() {
+        let mut t = ticket("REQ-001:*", "raw");
+        assert!(
+            !ticket_usable(&t, "raw", &ScopeCheck::AllSteps("REQ-001"), t.expires_epoch),
+            "到期当刻即失效"
+        );
+        t.mode = Mode::Static;
+        assert!(
+            !ticket_usable(&t, "raw", &ScopeCheck::Any, 0),
+            "L3 不受理静态令牌"
+        );
+    }
+
+    #[test]
+    fn 通配scope字面量与签发共用一份() {
+        assert_eq!(wildcard_scope(" REQ-001 "), "REQ-001:*");
     }
 
     #[test]

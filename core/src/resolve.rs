@@ -126,6 +126,8 @@ pub enum BlockKind {
     OpenBlockingComment,
     /// 某份非 `done` 清单的已批准段正文与批准时不一致（REQ-002 内容冻结）。
     SumMismatch,
+    /// 本次改动派生出的档位高于清单声明档（REQ-019 §2.4 升档）。
+    TierEscalation,
 }
 
 impl BlockKind {
@@ -138,6 +140,7 @@ impl BlockKind {
             BlockKind::StepNotApproved => "StepNotApproved",
             BlockKind::OpenBlockingComment => "OpenBlockingComment",
             BlockKind::SumMismatch => "SumMismatch",
+            BlockKind::TierEscalation => "TierEscalation",
         }
     }
 
@@ -148,6 +151,7 @@ impl BlockKind {
             BlockKind::Ambiguous => "BLOCK-AMBIGUOUS",
             BlockKind::SelectionMismatch => "BLOCK-SELECTION",
             BlockKind::SumMismatch => "BLOCK-SUM",
+            BlockKind::TierEscalation => "BLOCK-TIER",
             BlockKind::UnknownSelection => "BLOCK-UNKNOWN-SELECTION",
             BlockKind::NoRequirement => "BLOCK no-requirement",
             BlockKind::StepNotApproved => "BLOCK",
@@ -178,6 +182,12 @@ pub struct LiveReq {
     /// 内容冻结**告警**（如「已批准但未 seal」）。**一条都不许静默丢弃** ——
     /// 静默跳过等于「看起来有冻结、实际没有」。
     pub sum_warnings: Vec<String>,
+    /// frontmatter 的 `tier` **声明档**（缺省 `standard`；非法值在
+    /// [`live_snapshot`] 阶段就报错，不会走到这里）。
+    ///
+    /// 派生档是**变更集**的属性（并集算一次，见 REQ-019 B-06），声明档是**清单**的属性，
+    /// 故两者分别住在两个结构里，判定时在 R11 之前逐份比对。
+    pub tier: crate::tier::Tier,
 }
 
 impl LiveReq {
@@ -259,6 +269,13 @@ impl Verdict {
 ///
 /// `exempt` 是豁免 glob（来自 `touch.exempt`），在反查前剥除 —— 豁免集**单源**，
 /// 不在此处另写一份默认集。
+///
+/// `tier` 是本次变更集的**派生档**（REQ-019），由薄壳用 [`crate::tier::gate_for`] 算好：
+/// 判据要读 git 与文件全文，那是薄壳的事，`judge` 保持纯函数。`None` = 分级未启用
+/// （缺省段 / `tier.enabled: false`），此时**输出与改造前逐字一致**（回滚口）。
+///
+/// 派生档按**并集**算一次，逐份候选清单各自与自己的声明档比（REQ-019 B-06）；
+/// 故声明档住在 [`LiveReq::tier`]，派生档住在这里。
 pub fn judge(
     live: &[LiveReq],
     paths: &[String],
@@ -266,6 +283,7 @@ pub fn judge(
     mode: MultiMode,
     exempt: &[String],
     changeset: Changeset,
+    tier: Option<&crate::tier::Classify>,
 ) -> Verdict {
     let ids = |rs: &[&LiveReq]| -> Vec<String> { rs.iter().map(|r| r.id.clone()).collect() };
     let exempt_hit = |p: &str| -> bool {
@@ -393,6 +411,32 @@ pub fn judge(
         owned
     };
 
+    // ── R16 派生档 > 声明档 → 升档拦截（REQ-019 §2.4） ──────────────────
+    //
+    // 位置三处约束：
+    //   · 候选推导**之后** —— 派生档是变更集的属性，变更集归属哪几份清单定了才知道
+    //     该拿谁的声明档来比；放在推导前就得对着全部清单比，误报到无关清单；
+    //   · R11（三段状态）**之前** —— 轻档补 `standard` 差额的出路就是「再执行两次分段
+    //     approve」，若先报「某段未批准」会让人以为只要补那一段，实际补完仍被同一处拦；
+    //   · 阻塞评论检查之后 —— 评论是内容问题，与档位无关，不必混在一条消息里。
+    //
+    // 「升档」不需要新状态：它表现为**同一份清单被按更高档重新批准**
+    // （N2 得以成立，见 REQ-019 §2.4）。
+    if let Some(t) = tier {
+        let escalated: Vec<&LiveReq> = candidates
+            .iter()
+            .filter(|r| t.derived.rank() > r.tier.rank())
+            .copied()
+            .collect();
+        if !escalated.is_empty() {
+            return Verdict::Block {
+                kind: BlockKind::TierEscalation,
+                reqs: ids(&escalated),
+                message: tier_escalation_message(&escalated, t),
+            };
+        }
+    }
+
     // ── R11 逐份判定：只点名真正有问题的那些 ────────────────────────────
     let unapproved: Vec<&LiveReq> = candidates.iter().filter(|r| !r.approved).copied().collect();
     if !unapproved.is_empty() {
@@ -445,12 +489,14 @@ pub fn live_snapshot(root: &Path) -> Result<Vec<LiveReq>> {
         if requirement::head_status(&content) == "done" {
             continue;
         }
-        out.push(snapshot_of(root, &r, &content));
+        // 声明档解析**可能失败**（非法取值）：响亮的红优于沉默地当 `standard`（AC-017）。
+        let declared = crate::tier::declared_of(&content)?;
+        out.push(snapshot_of(root, &r, &content, declared));
     }
     Ok(out)
 }
 
-fn snapshot_of(root: &Path, r: &Requirement, content: &str) -> LiveReq {
+fn snapshot_of(root: &Path, r: &Requirement, content: &str, tier: crate::tier::Tier) -> LiveReq {
     let mut pending_steps = Vec::new();
     for (key, _) in STEPS.iter() {
         if requirement::step_status(content, key) != "approved" {
@@ -472,6 +518,7 @@ fn snapshot_of(root: &Path, r: &Requirement, content: &str) -> LiveReq {
         declares: declares_of(content),
         sum_errors,
         sum_warnings,
+        tier,
     }
 }
 
@@ -521,11 +568,96 @@ pub fn decide(
     hint: Option<&str>,
     mode: MultiMode,
     changeset: Changeset,
+    tier: Option<&crate::tier::Classify>,
 ) -> Verdict {
     let exempt = crate::gate::touch_exempt_patterns(root);
-    let v = judge(live, paths, hint, mode, &exempt, changeset);
+    let v = judge(live, paths, hint, mode, &exempt, changeset, tier);
     audit_verdict(root, live, &v);
     v
+}
+
+/// 派生档（薄壳：读配置 + 读 git）。返回 `None` = 本次**不参与定档**。
+///
+/// 三种「不参与」必须分清（REQ-019 §2.7 / §2.10）：
+///
+/// | 情形 | 返回 | 理由 |
+/// | --- | --- | --- |
+/// | 裸 `check`（无变更集） | `None` | 无变更集就无从定档；且不得让 R2b 借这条放行 |
+/// | `tier` 段未启用 | `None` | 回滚口：**输出与改造前逐字一致** |
+/// | `--stdin`（L1） | `None` | payload 已被 [`collect_paths`] 读走；L1 的档位下界由 [`crate::gate::pretool_verdict`] 单独打点（§2.7） |
+/// | 变更集整体落在 `touch.exempt` | `None`（R2b） | 豁免区不参与定档、不消耗档位（§2.10） |
+fn derived_tier(
+    root: &Path,
+    source: &PathSource,
+    paths: &[String],
+    exempt: &[String],
+    declared: crate::tier::Tier,
+) -> Result<Option<crate::tier::Classify>> {
+    if *source == PathSource::None || *source == PathSource::Stdin {
+        return Ok(None);
+    }
+    let cfg = crate::gate::tier_config(root)?;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let side = match source {
+        PathSource::Staged => crate::tierdiff::Side::Staged,
+        PathSource::Range(base) => crate::tierdiff::Side::Range(base.clone()),
+        _ => return Ok(None),
+    };
+    // 这里的 `declared` 只影响输出里的「声明 vs 派生」对照（并集里的**最高**声明档）；
+    // 逐份清单的声明档比对在 `judge` 的 R16 里做（它们在 `LiveReq::tier`），
+    // 那里拿的是每份清单自己的值，故不会因为并集取高而放过某一份的伪造。
+    Ok(
+        match crate::tier::gate_for(root, &side, paths, exempt, declared, &cfg)? {
+            crate::tier::TierGate::NoManagedPath => None,
+            crate::tier::TierGate::Classified(c) => Some(c),
+        },
+    )
+}
+
+/// 变更集相关的清单里**最高**的声明档（无相关清单 → `standard`）。
+///
+/// 取最高而不是最低：这一值只用于输出对照，取低会让人以为「按最松的那份算」，
+/// 而实际判定逐份比对（R16）。取低会让对照失真，取高只是更保守。
+fn declared_for(live: &[LiveReq], paths: &[String], exempt: &[String]) -> crate::tier::Tier {
+    let mut top: Option<crate::tier::Tier> = None;
+    for r in hit_list(live, paths, exempt) {
+        top = Some(match top {
+            Some(cur) if cur.rank() >= r.tier.rank() => cur,
+            _ => r.tier,
+        });
+    }
+    top.unwrap_or(crate::tier::Tier::Standard)
+}
+
+/// 放行时的档位附注（**理由可复算**是这套机制能被人工复核的前提，§2.8）。
+fn tier_note_lines(t: &crate::tier::Classify, live: &[LiveReq], reqs: &[String]) -> String {
+    let mut v = vec![format!(
+        "{}（{}）",
+        t.summary(),
+        t.final_tier.approval_hint()
+    )];
+    v.extend(t.reasons.iter().cloned());
+    v.extend(t.detail.iter().cloned());
+    if !reqs.is_empty() {
+        // 逐份点名声明档：并集取高会掩盖「某一份声明得比并集低」，
+        // 那正是 R16 要拦的伪造（输出看不出它就等于没输出）。
+        let per: Vec<String> = reqs
+            .iter()
+            .map(|id| {
+                let declared = live
+                    .iter()
+                    .find(|r| &r.id == id)
+                    .map(|r| r.tier)
+                    .unwrap_or(crate::tier::Tier::Standard);
+                format!("{id}={declared}")
+            })
+            .collect();
+        v.push(format!("声明档（逐份）：{}", per.join(" ")));
+    }
+    v.push("最终以 CI（L3）复算为准".to_string());
+    v.join("\n")
 }
 
 /// 反查命中集 `H`（R6）：已批清单里声明了本次任一路径的那些。
@@ -601,6 +733,8 @@ pub fn owned_by<'a>(
 /// **绕过窗口在这里判**（令牌与当前时间是薄壳的事，`judge` 不碰）。
 pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
     let live = live_snapshot(root)?;
+    // 放行附注里的档位段落（见 `tier_note_lines`）；拦截时理由已在消息里，不重复附。
+    let mut derived_note: Option<String> = None;
     let verdict = if live.is_empty() {
         // R1 先于绕过：没有清单可批准时，绕过窗口不该凭空造出一个「通过」。
         // `changeset` 不参与判定（R1 在它之前返回），取 `Absent` 只为类型完整。
@@ -611,6 +745,7 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
             MultiMode::Resolve,
             &[],
             Changeset::Absent,
+            None,
         )
     } else if let Some(exp) = active_bypass(root) {
         Verdict::Bypassed {
@@ -628,7 +763,25 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
         } else {
             Changeset::Provided
         };
-        let mut verdict = judge(&live, &paths, ctx.hint.as_deref(), mode, &exempt, changeset);
+        // 派生档（REQ-019）：**R2b 之后**才算 —— 豁免区不参与定档（§2.10）。
+        // R2b 的短路在 `judge` 内部，而 `derived_tier` 自己也会短路，故纯豁免变更集
+        // 这里拿到 `None`，输出与放行里都不带任何档位字段（U-33 / B-07）。
+        let derived = derived_tier(
+            root,
+            &ctx.source,
+            &paths,
+            &exempt,
+            declared_for(&live, &paths, &exempt),
+        )?;
+        let mut verdict = judge(
+            &live,
+            &paths,
+            ctx.hint.as_deref(),
+            mode,
+            &exempt,
+            changeset,
+            derived.as_ref(),
+        );
         // R14 分支名消歧：**只**在歧义（= 无从归因）时兜底，且永不覆盖反查结果。
         // 放在 judge 之外而不是给它加参数：分支名不是权威选择，拿它去过 R3/R9 那些
         // 「选择必须与变更集相交」的校验毫无意义 —— 它恰恰是变更集推不出答案才被问的。
@@ -651,6 +804,7 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
                     mode,
                     &exempt,
                     changeset,
+                    derived.as_ref(),
                 );
                 if verdict.is_pass() {
                     verdict = append_note(verdict, &branch_note(target, multi));
@@ -658,7 +812,7 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
             }
         }
         // `UnknownSelection` 的「已归档 / 拼错」补充信息要读磁盘，故只能在这层加。
-        match (&verdict, ctx.hint.as_deref()) {
+        let verdict = match (&verdict, ctx.hint.as_deref()) {
             (
                 Verdict::Block {
                     kind: BlockKind::UnknownSelection,
@@ -672,7 +826,17 @@ pub fn resolve(root: &Path, ctx: &Ctx) -> Result<Verdict> {
                 message: enrich_archived(root, id, live.len(), message),
             },
             _ => verdict,
+        };
+        if let Verdict::Pass { reqs, .. } = &verdict {
+            if let Some(t) = derived.as_ref() {
+                derived_note = Some(tier_note_lines(t, &live, reqs));
+            }
         }
+        verdict
+    };
+    let verdict = match derived_note {
+        Some(note) => append_note(verdict, &note),
+        None => verdict,
     };
     audit_verdict(root, &live, &verdict);
     Ok(verdict)
@@ -1148,6 +1312,32 @@ fn ambiguous_message(live: &[LiveReq], managed: &[&str]) -> String {
     msg
 }
 
+/// `TierEscalation` 的拦截文案（**纯函数**；理由必须可复算）。
+fn tier_escalation_message(escalated: &[&LiveReq], t: &crate::tier::Classify) -> String {
+    let mut msg = String::from(
+        "[req-guard] ⛔ 拦截：本次改动派生出的档位高于清单声明档（TierEscalation）。\n",
+    );
+    for r in escalated {
+        msg.push_str(&format!(
+            "  - {}：声明 {}，本次改动派生 {}（有效改动行 {}）\n",
+            r.id, r.tier, t.derived, t.total_effective
+        ));
+    }
+    msg.push_str("  理由（可复算）：\n");
+    for reason in &t.reasons {
+        msg.push_str(&format!("    - {reason}\n"));
+    }
+    for d in &t.detail {
+        msg.push_str(&format!("    {d}\n"));
+    }
+    msg.push_str(
+        "  处置：按更高档**重新批准**该清单（声明只能往上抬，不能往下压）。\n\
+        \x20        轻档补 standard 差额 = 再执行两次分段 approve；standard → critical 走 critical 的附加检查。\n\
+        \x20        req-guard approve <需求ID> --step <步骤> --reviewer <姓名>",
+    );
+    msg
+}
+
 fn step_message(bad: &[&LiveReq]) -> String {
     let mut msg = String::from(
         "[req-guard] ⛔ 拦截：本次改动所属的需求尚未通过审核，AI 不得编写/修改源码。\n",
@@ -1213,6 +1403,7 @@ mod tests {
             declares: declares.iter().map(|s| s.to_string()).collect(),
             sum_errors: Vec::new(),
             sum_warnings: Vec::new(),
+            tier: crate::tier::Tier::Standard,
         }
     }
 
@@ -1234,6 +1425,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Provided,
+            None,
         )
     }
 
@@ -1251,6 +1443,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Provided,
+            None,
         );
         assert_eq!(v.block_kind(), Some(BlockKind::NoRequirement));
         assert!(!v.is_pass());
@@ -1258,7 +1451,15 @@ mod tests {
 
     #[test]
     fn R1_msg_给出创建命令() {
-        let v = judge(&[], &[], None, MultiMode::Resolve, &ex(), Changeset::Absent);
+        let v = judge(
+            &[],
+            &[],
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Absent,
+            None,
+        );
         assert!(v.message().unwrap_or_default().contains("create -t"));
     }
 
@@ -1530,6 +1731,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Absent,
+            None,
         );
         assert_eq!(
             absent.block_kind(),
@@ -1603,6 +1805,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Absent,
+            None,
         );
         assert_eq!(
             v.block_kind(),
@@ -1677,6 +1880,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Provided,
+            None,
         );
         assert_eq!(
             v.block_kind(),
@@ -1691,6 +1895,7 @@ mod tests {
             MultiMode::Resolve,
             &ex(),
             Changeset::Provided,
+            None,
         );
         assert_eq!(
             blank.block_kind(),
@@ -1712,6 +1917,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(v.is_pass(), "{v:?}");
         let log = audit_tail(&root);
@@ -1731,6 +1937,173 @@ mod tests {
         let mut r = req(id, true, &["docs/**"]);
         r.sum_errors = vec!["「技术方案」的正文与批准时不一致".to_string()];
         r
+    }
+
+    // ── R16 分级升档（REQ-019） ─────────────────────────────────────────
+
+    /// 造一份派生档（走真的 [`crate::tier::classify`]，不手写结论）。
+    fn classified(
+        declared: crate::tier::Tier,
+        managed: &[&str],
+        files: &[(&str, usize, usize)],
+        risky: &[&str],
+    ) -> crate::tier::Classify {
+        let stats: Vec<crate::tierdiff::FileStat> = files
+            .iter()
+            .map(|(path, a, d)| crate::tierdiff::FileStat {
+                path: path.to_string(),
+                added: *a,
+                deleted: *d,
+                binary: false,
+            })
+            .collect();
+        let cfg = crate::tier::TierConfig {
+            enabled: true,
+            risky_paths: risky.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let owned: Vec<String> = managed.iter().map(|s| s.to_string()).collect();
+        crate::tier::classify(crate::tier::ClassifyInput {
+            declared,
+            managed: &owned,
+            stats: &stats,
+            config: &cfg,
+        })
+    }
+
+    fn judge_tier(live: &[LiveReq], paths: &[&str], t: &crate::tier::Classify) -> Verdict {
+        judge(
+            live,
+            &p(paths),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+            Some(t),
+        )
+    }
+
+    #[test]
+    fn R16_派生档高于声明档报升档并给出理由() {
+        let mut light = req("REQ-001", true, &["core/**"]);
+        light.tier = crate::tier::Tier::Light;
+        let t = classified(
+            crate::tier::Tier::Trivial,
+            &["core/src/gate.rs"],
+            &[("core/src/gate.rs", 200, 0)],
+            &[],
+        );
+        let v = judge_tier(&[light], &["core/src/gate.rs"], &t);
+        assert_eq!(v.block_kind(), Some(BlockKind::TierEscalation));
+        let m = v.message().unwrap_or_default();
+        assert!(m.contains("TierEscalation"), "{m}");
+        assert!(m.contains("声明 light"), "{m}");
+        assert!(m.contains("standard"), "{m}");
+        assert!(m.contains("有效改动行 200"), "{m}");
+        assert!(m.contains("重新批准"), "须给出补救方向：{m}");
+    }
+
+    #[test]
+    fn R16_命中内建锁定时理由点名locked() {
+        let mut light = req("REQ-001", true, &["core/**"]);
+        light.tier = crate::tier::Tier::Light;
+        let t = classified(
+            crate::tier::Tier::Trivial,
+            &["core/src/gate.rs"],
+            &[("core/src/gate.rs", 1, 0)],
+            &[],
+        );
+        let v = judge_tier(&[light], &["core/src/gate.rs"], &t);
+        let m = v.message().unwrap_or_default();
+        assert!(m.contains("critical"), "{m}");
+        assert!(m.contains("locked"), "{m}");
+    }
+
+    #[test]
+    fn R16_声明档不低于派生档时放行() {
+        let mut std = req("REQ-001", true, &["docs/**"]);
+        std.tier = crate::tier::Tier::Standard;
+        let t = classified(
+            crate::tier::Tier::Standard,
+            &["docs/设计/x.md"],
+            &[("docs/设计/x.md", 3, 0)],
+            &[],
+        );
+        let v = judge_tier(&[std], &["docs/设计/x.md"], &t);
+        assert!(v.is_pass(), "{v:?}");
+    }
+
+    #[test]
+    fn R16_并集算一次逐份清单各自校验() {
+        // B-06：派生档按并集算一次；声明 light 的那份升档，声明 standard 的那份放行。
+        let mut light = req("REQ-001", true, &["docs/**"]);
+        light.tier = crate::tier::Tier::Light;
+        let mut std = req("REQ-002", true, &["cli/**"]);
+        std.tier = crate::tier::Tier::Standard;
+        let t = classified(
+            crate::tier::Tier::Trivial,
+            &["docs/设计/a.md", "cli/src/main.rs"],
+            &[("docs/设计/a.md", 100, 0), ("cli/src/main.rs", 100, 0)],
+            &[],
+        );
+        let v = judge(
+            &[light, std],
+            &p(&["docs/设计/a.md", "cli/src/main.rs"]),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+            Some(&t),
+        );
+        assert_eq!(v.block_kind(), Some(BlockKind::TierEscalation));
+        assert_eq!(ids(&v), vec!["REQ-001".to_string()]);
+    }
+
+    #[test]
+    fn R16_未启用分级时判定逐字不变() {
+        let mut light = req("REQ-001", true, &["core/**"]);
+        light.tier = crate::tier::Tier::Light;
+        let with_tier = judge(
+            &[light.clone()],
+            &p(&["core/src/gate.rs"]),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+            Some(&classified(
+                crate::tier::Tier::Critical,
+                &["core/src/gate.rs"],
+                &[("core/src/gate.rs", 500, 0)],
+                &[],
+            )),
+        );
+        let without = judge(
+            &[light],
+            &p(&["core/src/gate.rs"]),
+            None,
+            MultiMode::Resolve,
+            &ex(),
+            Changeset::Provided,
+            None,
+        );
+        assert_eq!(with_tier.block_kind(), Some(BlockKind::TierEscalation));
+        assert!(without.is_pass(), "无派生档时不得拦：{without:?}");
+    }
+
+    #[test]
+    fn R16_升档排在三段状态之前() {
+        // 一份 light 且**未批**的清单 + 派生 critical：先报档位不够，
+        // 否则人会以为「补批那一段」就够了，补完仍被同一处拦。
+        let mut light = req("REQ-001", false, &["core/**"]);
+        light.tier = crate::tier::Tier::Light;
+        let t = classified(
+            crate::tier::Tier::Trivial,
+            &["core/src/gate.rs"],
+            &[("core/src/gate.rs", 500, 0)],
+            &[],
+        );
+        let v = judge_tier(&[light], &["core/src/gate.rs"], &t);
+        assert_eq!(v.block_kind(), Some(BlockKind::TierEscalation));
     }
 
     // ── R11 / R12 ───────────────────────────────────────────────────────
@@ -1786,6 +2159,7 @@ mod tests {
             MultiMode::All,
             &ex(),
             Changeset::Provided,
+            None,
         );
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
         assert_eq!(ids(&v), vec!["REQ-002".to_string()], "保守档与路径无关");
@@ -1798,7 +2172,15 @@ mod tests {
             req("REQ-002", false, &["**"]),
         ];
         // 无变更集 → R2b 不生效（本用例正是「裸 check 不得因空集放行」的一道锁）
-        let v = judge(&live, &[], None, MultiMode::All, &ex(), Changeset::Absent);
+        let v = judge(
+            &live,
+            &[],
+            None,
+            MultiMode::All,
+            &ex(),
+            Changeset::Absent,
+            None,
+        );
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
     }
 
@@ -1925,7 +2307,15 @@ mod tests {
                 .iter()
                 .map(|r| r.id.clone())
                 .collect();
-            let v = judge(&live, &p(&paths), hint, mode, &ex(), Changeset::Provided);
+            let v = judge(
+                &live,
+                &p(&paths),
+                hint,
+                mode,
+                &ex(),
+                Changeset::Provided,
+                None,
+            );
             let from_verdict: Vec<String> = match &v {
                 Verdict::Pass { reqs, .. } => reqs.clone(),
                 Verdict::Bypassed { reqs, .. } => reqs.clone(),
@@ -2024,6 +2414,7 @@ mod tests {
                     MultiMode::Resolve,
                     &ex(),
                     Changeset::Provided,
+                    None,
                 ),
             ),
             (
@@ -2325,6 +2716,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(!v.is_pass(), "落在未批清单范围内的改动不得放行：{v:?}");
         assert_eq!(v.block_kind(), Some(BlockKind::Ambiguous));
@@ -2350,6 +2742,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(v.is_pass(), "无关未批清单不得阻断已批清单：{v:?}");
         assert_eq!(v.reqs(), &["REQ-001".to_string()]);
@@ -2382,6 +2775,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(v.is_pass(), "裁决对象由声明决定，不受文件名序影响：{v:?}");
         assert_eq!(v.reqs(), &["REQ-alice-001".to_string()]);
@@ -2401,6 +2795,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(v.is_pass());
         assert!(
@@ -2430,6 +2825,7 @@ mod tests {
             None,
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         // 未批的那份不在索引里 → 候选只剩已批那份 → 放行（G2）
         assert!(v.is_pass(), "{v:?}");
@@ -2456,6 +2852,7 @@ mod tests {
             Some("REQ-002"),
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert!(ok.is_pass(), "{ok:?}");
         let bad = decide(
@@ -2465,6 +2862,7 @@ mod tests {
             Some("REQ-002"),
             MultiMode::Resolve,
             Changeset::Provided,
+            None,
         );
         assert_eq!(bad.block_kind(), Some(BlockKind::SelectionMismatch));
         crate::testutil::cleanup(&root);
@@ -2483,6 +2881,7 @@ mod tests {
             None,
             MultiMode::All,
             Changeset::Provided,
+            None,
         );
         assert_eq!(v.block_kind(), Some(BlockKind::StepNotApproved));
         assert!(
@@ -2623,25 +3022,34 @@ mod tests {
         crate::testutil::cleanup(&root);
     }
 
+    /// 把令牌文件的 `expires_epoch` 改成「已过期」。
+    ///
+    /// 按**键**改写而不是替换 `expires_epoch=<算出值>` 字面量：夹具与断言各调一次
+    /// `now_epoch()`，跨秒时字面量对不上，替换静默变成空操作 —— 用例随机变红，
+    /// 而根因是时钟不是代码（实测踩到）。
+    fn expire_token(path: &std::path::Path) {
+        let body = std::fs::read_to_string(path).unwrap();
+        let out = body
+            .lines()
+            .map(|l| match l.strip_prefix("expires_epoch=") {
+                Some(_) => format!(
+                    "expires_epoch={}",
+                    crate::gate::now_epoch().saturating_sub(1)
+                ),
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, out).unwrap();
+    }
+
     /// U-06 过期后失效（TTL 到期行为不回归）。
     #[test]
     fn U06_过期令牌不生效() {
         let root = crate::testutil::temp_dir("u06");
         crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
         let p = crate::gate::bypass_token_path(&root);
-        let body = std::fs::read_to_string(&p).unwrap();
-        // 把 created 改晚、expires 改早 → 已过期
-        std::fs::write(
-            &p,
-            body.replace(
-                &format!("expires_epoch={}", crate::gate::now_epoch() + 3600),
-                &format!(
-                    "expires_epoch={}",
-                    crate::gate::now_epoch().saturating_sub(1)
-                ),
-            ),
-        )
-        .unwrap();
+        expire_token(&p);
         assert_eq!(active_bypass(&root), None);
         crate::testutil::cleanup(&root);
     }
@@ -2681,17 +3089,7 @@ mod tests {
         // 新路径：合法、过期 → 不应生效
         crate::testutil::write_valid_bypass(&root, "tester", "t@e.com", 60);
         let p = crate::gate::bypass_token_path(&root);
-        std::fs::write(
-            &p,
-            std::fs::read_to_string(&p).unwrap().replace(
-                &format!("expires_epoch={}", crate::gate::now_epoch() + 3600),
-                &format!(
-                    "expires_epoch={}",
-                    crate::gate::now_epoch().saturating_sub(1)
-                ),
-            ),
-        )
-        .unwrap();
+        expire_token(&p);
         // 旧路径：未过期 → 也不该被采信
         std::fs::create_dir_all(root.join(".gates")).unwrap();
         std::fs::write(

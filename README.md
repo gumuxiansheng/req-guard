@@ -10,6 +10,8 @@
 - **审核评论**：审核人只评论不改正文；步骤级 + 行号锚定；`--blocking` 未 resolve 即拦截
 - **证据不可篡改**：评论独立文件，AI 禁止直接写、禁止 resolve（只能 reply）
 - **审计留痕**：拦截/放行/绕过/评论全部入 `audit/gate-audit.log`
+- **分级门禁**：四档按**有效改动行数**与高危路径自动定档；只改注释/空行 → 免审档，
+  轻档一条命令批三段（三段仍各留台账）；声明只能往上抬，CI 复算为权威
 - **应急绕过**：有时效、必填原因；**不覆盖评论证据保护**
 - **审批锁**：`approve/reject/amend/resolve/bypass/seal` 须出示人类凭据才放行——AI 会话标记（方案 A）、
   审批令牌（方案 B）、带外声明（方案 C）、终端挑战码（方案 D）；**严格模式下无凭据即拒**，
@@ -85,16 +87,62 @@ req-guard bypass --reason "线上热修，事后补审" --ttl 60   # 有痕、�
 req-guard check                                            # 手动判定（CI 用）
 ```
 
-**人肉开发什么时候该用**：bypass 是为**不打算走完整审核**的改动准备的应急阀——
-单行 typo / 文档笔误 / 线上热修 / 实验性试改等，为它们建 REQ 是小题大做。
-但它是**应急阀，不是常规通道**：功能开发、架构改动、任何可能长期存在的代码，
-必须先建 REQ 走三段审核，事后补 REQ 是例外不是常态。
+**人肉开发什么时候该用**：bypass 是为**高档逃逸**准备的应急阀——
+线上热修、实验性试改、以及「来不及走流程」的紧急情况。
+**日常小事已经不需要它了**：只改几行代码 / 只改注释 / 文档笔误走
+[分级门禁](#分级门禁四档按有效改动行数与高危路径自动定档)的 `trivial` 档
+（免审）与 `light` 档（一条命令批三段），不必建 REQ、也不必绕过。
 
 - 每次绕过强制审计：原因（`--reason` 必填）+ 时效（`--ttl`，默认 60 分钟，到期自动失效）
   全部入 `audit/gate-audit.log` 与入库台账 `ledger.md`；
 - 事后请补建 REQ 并归档（`req-guard done <REQ-ID> --author <姓名>`），把账还上；
-- 高频使用（每周数次）是流程失控信号：说明需求拆分或审核节拍出了问题，
+- 高频使用（每周数次）仍是流程失控信号：说明需求拆分或审核节拍出了问题，
   先修流程而不是继续绕。
+
+## 分级门禁（四档：按有效改动行数与高危路径自动定档）
+
+门禁不是只有一档：**改动越重，审批越严；改动越轻，流程越省**。
+档位由**变更集派生**，AI 不能自行选择。
+
+| 档位 | 判定 | 审批形态 | 验收标准 |
+| --- | --- | --- | --- |
+| `trivial` | 有效改动行 ≤ 5 且未命中高危路径 | 免审（免建清单） | 不要求 |
+| `light` | 有效改动行 ≤ 80 且未命中高危路径 | `approve --all-steps`（一条命令批三段） | 选填 |
+| `standard` | 其余 | 三段逐段批准 | 必填 |
+| `critical` | 命中**内建锁定项**（`core/src/**`、`templates/hooks/**`、`templates/ci/**`、`.gates/req-guard.yaml`） | 三段逐段批准 + 附加检查 | 必填 |
+
+- **有效改动行 = 剔除注释行与空行之后的增删行**。判法不是数 `diff` 行，也不是逐行看
+  diff 是不是以 `//` 开头，而是按**文件全文**重建注释状态机再按行号过滤 ——
+  跨 hunk 的块注释、字符串里的 `//` 都判得对。所以「只改注释、只加空行」天然落进免审档。
+- **高危路径可配置**（`.gates/req-guard.yaml` 的 `tier.risky_paths`，支持目录前缀与
+  glob）；**门禁自身源码恒为 `critical` 且不可配置** —— 配置里写 `locked_paths` 键会被
+  直接拒绝（不是忽略）。
+- **声明只能往上抬**：清单 frontmatter 的 `tier` 键与派生档取 `max`。
+  写小不成立 —— CI 会按完整变更集复算，派生档更高时报 `TierEscalation` 并退出码 1，
+  要求把清单按更高档**重新批准**。
+- **三层用同一份判定**：L1 `hook-check` 只看单次写入（**下界**，不拦，只提示
+  「最终以 CI 复算为准」）、L2 pre-commit 看索引内变更集、L3 CI 看完整变更集（**权威**）。
+- **豁免区不参与定档**：改动整体落在 `touch.exempt` 时直接放行并在审计记
+  `PASS no-managed-path`（清单正文、草稿、`target/**` 都在豁免区）。
+
+```bash
+req-guard tier check --staged        # 算档位并输出理由（逐文件有效行 / 命中 glob / 声明 vs 派生）
+req-guard tier check --base origin/main   # CI 口径（权威层）
+req-guard approve REQ-007 --all-steps      # 轻档：一条命令批三段（三段仍各留一条 APPROVE 台账）
+```
+
+`approve --all-steps` 的四条硬约束：**原子性**（任一段不合规则一段都不批）、
+**留痕不减**（三条 `APPROVE`，各带 `sum=`，`channel=quick`）、**凭据不放宽**
+（L3 下需要 `scope` 为 `<需求ID>:*` 的通配票据，一次性；精确票与通配票互不对冲）、
+**实质正文仍强制**（至少写清「改了什么 + 怎么自测」）。
+
+阈值不许拍脑袋写死：改阈值前先跑 `python scripts/calibrate_tier.py`（回放本仓历史
+变更集，输出各档分布与阈值 ±50% 敏感度）。口径与边界详见
+[`docs/设计/分级门禁技术方案.md`](docs/设计/分级门禁技术方案.md)。
+
+**回滚**：`.gates/req-guard.yaml` 的 `tier` 段置空或 `enabled: false` →
+判定退回三段逐段批准，且门禁输出与启用前逐字一致；清单里的 `tier` 键保留即可
+（`standard` 在新旧枚举下都合法）。
 
 ## 合规部署（三层 + 锁）
 
@@ -163,7 +211,7 @@ req-guard whoami             # 本仓库审批身份：git 身份 + sig 指纹 +
 
 ## 命令一览
 
-`init` `create` `approve` `reject` `amend` `apply` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `touch-check` `touch` `verify-content` `seal` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
+`init` `create` `approve` `reject` `amend` `apply` `comment` `resolve` `done` `archive` `status` `list` `ids` `comments` `check` `ac` `tier` `touch-check` `touch` `verify-content` `seal` `install` `bypass` `audit-digest` `whoami` `token` `oob` `ui`
 （`ac check [<需求ID>] [--all]` 校验清单内容：第 3 段验收标准（编号连续 +
 Given/When/Then 齐备）+ **三段实质正文**（模板占位不算）；硬伤退出码 1；
 `approve` 时已跑同一判据，CI 这一步是服务端兜底）
@@ -172,6 +220,9 @@ Given/When/Then 齐备）+ **三段实质正文**（模板占位不算）；硬�
 （`touch-check [--base <ref>]` 校验「实际改动 ⊆ 技术方案段 `GATE:TOUCH` 声明并集」；
 `touch --declare --glob <路径>` 扩张声明范围，AI 禁止调用且会打回技术方案重审；
 CI 侧的 `--base` 是服务端对应物，抵消 `--no-verify`）
+（`tier check [--staged | --base <ref>]` 分级门禁：按变更集算档位并输出**理由**
+（逐文件有效行、命中 glob、声明档 vs 派生档）；只读，不改状态，退出码只表示「算出来了」，
+**不表示通过门禁** —— 门禁裁决仍是 `check`）
 （内部命令 `hook-check`：由拦截脚本调用，读 stdin 做证据保护判定，通常无需手工执行）
 （`req-guard -h` 查看完整参数；`-p` 指定项目根；**操作人身份取 git 身份**（`user.name`），
 `--reviewer` / `--author` 可省略，回退顺序为「参数 → `REQ_GUARD_REVIEWER` → git 身份」，

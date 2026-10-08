@@ -151,15 +151,28 @@ fn run(a: &cli::Args) -> Result<()> {
             let reviewer = resolve_identity(a.reviewer.as_deref(), "审核人", "--reviewer", root)?;
             // 是否强制审核顺序，由 .gates/req-guard.yaml 的 strict_order 决定（缺失时 fail-closed = true）。
             let strict = gate::strict_order(root);
-            let r = requirement::review(root, id, step, &reviewer, pass, comment_of(a), strict)?;
-            println!(
-                "✅ 已{}：{} / {}（{}，审核人 {}）",
-                if pass { "批准" } else { "打回" },
-                r.id,
-                step,
-                requirement::step_label(step),
-                reviewer
-            );
+            let r = if a.all_steps {
+                // 轻档一条命令批三段：三段仍各留一条 APPROVE 台账（channel=quick），
+                // 但**原子性**——任一段不合规则一段都不批。
+                requirement::review_all(root, id, &reviewer, comment_of(a), strict)?
+            } else {
+                requirement::review(root, id, step, &reviewer, pass, comment_of(a), strict)?
+            };
+            if a.all_steps {
+                println!(
+                    "✅ 已一条命令批三段：{}（审核人 {}，channel=quick）\n   三段仍各留一条 APPROVE 台账；strict_order 在本场景显式豁免并已记台账。",
+                    r.id, reviewer
+                );
+            } else {
+                println!(
+                    "✅ 已{}：{} / {}（{}，审核人 {}）",
+                    if pass { "批准" } else { "打回" },
+                    r.id,
+                    step,
+                    requirement::step_label(step),
+                    reviewer
+                );
+            }
             // 附加评论（--comment）
             if let Some(text) = a.text.as_deref() {
                 let c = comment::add(
@@ -494,6 +507,7 @@ fn run(a: &cli::Args) -> Result<()> {
         }
         Action::Token { ref sub } => run_token(root, a, sub)?,
         Action::Ac { ref sub } => run_ac(root, a, sub)?,
+        Action::Tier { ref sub } => run_tier(root, a, sub)?,
         Action::TouchCheck => run_touch_check(root, a)?,
         Action::VerifyContent => run_verify_content(root, a)?,
         Action::Seal => run_seal(root, a)?,
@@ -810,6 +824,94 @@ fn run_ac(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
         println!("共 {} 项告警（不阻断）", warns.len());
     }
     Ok(())
+}
+
+/// `req-guard tier check`：按本次变更集算档位并**输出理由**（REQ-019 §2.8）。
+///
+/// 只读、不改任何状态；退出码 0 表示「算出来了」，**不表示通过门禁**——
+/// 门禁裁决是 `check` 的职责，两者刻意不合并：档位是解释性输出，门禁是拦截口。
+/// 理由可复算是这套机制能被人工复核的前提，故逐文件有效行、命中 glob、
+/// 声明档 vs 派生档都必须打出来。
+fn run_tier(root: &Path, a: &cli::Args, sub: &str) -> Result<()> {
+    if sub != "check" {
+        return Err(GateError::Validation(format!(
+            "未知 tier 子命令: {}（可选 check）",
+            sub
+        )));
+    }
+    let cfg = gate::tier_config(root)?;
+    println!(
+        "分级门禁：{}（阈值 trivial≤{} / light≤{}）",
+        if cfg.enabled {
+            "已启用"
+        } else {
+            "未启用（tier 段缺失或 enabled: false）"
+        },
+        cfg.trivial_max_lines,
+        cfg.light_max_lines
+    );
+    println!(
+        "内建锁定项（恒为 critical，不可配置）：{}",
+        req_guard_core::tier::LOCKED_PATHS.join("  ")
+    );
+    if !cfg.enabled {
+        println!("   未启用时派生档不生效，判定退回三段逐段批准（回滚口）。");
+        return Ok(());
+    }
+    let side = match (a.base.as_deref(), a.staged) {
+        (Some(b), _) => req_guard_core::tierdiff::Side::Range(b.to_string()),
+        (None, true) => req_guard_core::tierdiff::Side::Staged,
+        (None, false) => {
+            return Err(GateError::Validation(
+                "tier check 需要变更集：--staged（pre-commit）或 --base <ref>（CI / L3）".into(),
+            ))
+        }
+    };
+    let paths: Vec<String> = match &side {
+        req_guard_core::tierdiff::Side::Staged => touch::staged_files(root)?,
+        req_guard_core::tierdiff::Side::Range(b) => touch::diff_files(root, b)?,
+    };
+    let exempt = gate::touch_exempt_patterns(root);
+    // 声明档取「候选清单里最低的那个」：派生档是变更集的属性，而结论要按每份
+    // 清单自己的声明档报（`check` 的 R16 逐份比）。这里给的是**下界视角**。
+    let declared = lowest_declared_tier(root, &paths)?;
+    match req_guard_core::tier::gate_for(root, &side, &paths, &exempt, declared, &cfg)? {
+        req_guard_core::tier::TierGate::NoManagedPath => {
+            println!("本次改动全部落在 touch.exempt 豁免区 —— 不参与定档（R2b 优先于定档）。");
+            Ok(())
+        }
+        req_guard_core::tier::TierGate::Classified(c) => {
+            println!("{}", c.summary());
+            for r in &c.reasons {
+                println!("  - {}", r);
+            }
+            for d in &c.detail {
+                println!("{}", d);
+            }
+            println!("审批形态：{}", c.final_tier.approval_hint());
+            if c.escalated() {
+                println!(
+                    "⚠️ 派生档高于声明档：`check` 会报 TierEscalation，需按更高档重新批准该清单。"
+                );
+            }
+            println!("最终以 CI（L3 `check --base`）复算为准。");
+            Ok(())
+        }
+    }
+}
+
+/// 本次变更集相关清单里**最低**的声明档（`None` = 无相关清单，取 `standard`）。
+fn lowest_declared_tier(root: &Path, paths: &[String]) -> Result<req_guard_core::tier::Tier> {
+    let live = resolve::live_snapshot(root)?;
+    let exempt = gate::touch_exempt_patterns(root);
+    let mut lowest: Option<req_guard_core::tier::Tier> = None;
+    for r in resolve::hit_list(&live, paths, &exempt) {
+        lowest = Some(match lowest {
+            Some(cur) if cur.rank() <= r.tier.rank() => cur,
+            _ => r.tier,
+        });
+    }
+    Ok(lowest.unwrap_or(req_guard_core::tier::Tier::Standard))
 }
 
 /// `req-guard touch-check`：变更范围契约判定（判定全在 [`touch::check`]）。

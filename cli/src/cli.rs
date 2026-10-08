@@ -5,6 +5,7 @@
 //! req-guard init                        初始化 .gates/ 门禁（脚本 + AI hook + pre-commit）
 //! req-guard create   -t <标题>           创建需求清单
 //! req-guard approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
+//! req-guard approve  <需求ID> --all-steps               一条命令批三段（轻档；三段各留一条台账）
 //! req-guard reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
 //! req-guard amend    <需求ID> --step <步骤> --comment <意见>   （修订：回退待审+清摘要，必须重审）
 //! req-guard comment  <需求ID> --author <姓名> --text <意见> [--step] [--quote] [--blocking] [--reply C001]
@@ -17,6 +18,7 @@
 //! req-guard check                       手动执行拦截判定（退出码 0 放行 / 1 拦截）
 //! req-guard ac check [<需求ID>] [--all]  验收标准机械校验（A1–A12，见 core/src/ac.rs）
 //! req-guard touch-check [--base <ref>]     变更范围契约（见 core/src/touch.rs）
+//! req-guard tier check [--staged | --base <ref>]  分级门禁：算档位并输出理由（REQ-019）
 //! req-guard touch --declare <glob>... [--reason <原因>]
 //! req-guard ac check [<需求ID>] [--all]  验收标准机械校验（core/src/ac.rs 的 A1–A12）
 //! req-guard install  [--tool <a,b>] [--verify]       安装/修复拦截；--verify 只校验（CI 用）
@@ -81,6 +83,10 @@ pub enum Action {
     /// PreToolUse hook 用：读 stdin 的 AI 工具 payload，做**证据保护**判定。
     /// 退出码 0 放行（交给后续门禁）、1 拦截（脚本据此 exit 1）。
     HookCheck,
+    /// 分级门禁：`tier check`（按变更集算档位，输出档位与理由）。
+    Tier {
+        sub: String,
+    },
 }
 
 pub struct Args {
@@ -142,6 +148,8 @@ pub struct Args {
     pub req: Option<String>,
     /// `touch --declare` 的路径 / glob（可重复；刻意不复用 `--tool`，那个是工具名）。
     pub globs: Vec<String>,
+    /// `approve --all-steps`：一条命令批三段（轻档审批形态，REQ-019 §2.5）。
+    pub all_steps: bool,
 }
 
 pub struct Parsed {
@@ -204,6 +212,7 @@ fn default_args(action: Action) -> Args {
         stdin: false,
         req: None,
         globs: Vec::new(),
+        all_steps: false,
     }
 }
 
@@ -286,6 +295,19 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
                 }
             }
         }
+        "tier" => {
+            // subcommand：`tier check`（REQ-019 §2.8）。
+            let sub = match it.peek() {
+                Some(s) if !s.starts_with('-') => it.next().unwrap().clone(),
+                _ => return Err("tier 需要子命令: check".into()),
+            };
+            match sub.as_str() {
+                "check" => Action::Tier { sub },
+                other => {
+                    return Err(format!("未知 tier 子命令: {}（可选 check）", other));
+                }
+            }
+        }
         "touch-check" => Action::TouchCheck,
         "verify-content" => Action::VerifyContent,
         "seal" => Action::Seal,
@@ -329,6 +351,7 @@ fn parse_from(args: &[String]) -> std::result::Result<Parsed, String> {
             "--stdin" => a.stdin = true,
             "--req" => a.req = Some(next(&mut it, "--req")?),
             "--glob" => a.globs.push(next(&mut it, "--glob")?),
+            "--all-steps" => a.all_steps = true,
             "--tool" => {
                 let v = next(&mut it, "--tool")?;
                 for p in v.split(',') {
@@ -383,8 +406,20 @@ fn validate(a: &Args) -> std::result::Result<(), String> {
             if a.id.is_none() {
                 return Err("需要指定需求 ID，例如：req-guard approve REQ-001 --step decomposition --reviewer 张三".into());
             }
-            if a.step.is_none() {
-                return Err("需要 --step <decomposition|solution|testplan>".into());
+            // `--all-steps` 只对 approve 有意义：reject 的语义是「打回某一段」，
+            // 一次打回三段与「整份打回」在状态机里不是一回事，故拒。
+            if a.all_steps {
+                if !matches!(a.action, Action::Approve) {
+                    return Err("--all-steps 仅用于 approve（打回请逐段 --step）".into());
+                }
+                if a.step.is_some() {
+                    return Err("--all-steps 与 --step 互斥：前者批三段，后者批一段".into());
+                }
+            } else if a.step.is_none() {
+                return Err(
+                    "需要 --step <decomposition|solution|testplan>（或用 --all-steps 一次批三段）"
+                        .into(),
+                );
             }
         }
         Action::Comment => {
@@ -411,7 +446,7 @@ fn validate(a: &Args) -> std::result::Result<(), String> {
         Action::Ui if a.gui && a.tui => {
             return Err("--gui 与 --tui 不能同时使用（不指定则自动探测）".into());
         }
-        Action::Check => {
+        Action::Check | Action::Tier { .. } => {
             // 变更集来源三选一。两个来源混在一起判必然产生无法解释的裁决，
             // 而裁决出错时人根本看不出是哪一条规则导致的 —— 直接拒，不猜。
             let sources = [
@@ -453,7 +488,10 @@ fn help() -> String {
 命令:\n\
   init                       初始化 .gates/ 门禁（脚本 + AI 工具 hook + pre-commit）\n\
   create   -t <标题>         创建需求清单（REQ-001…）\n\
-  approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]\n\
+  approve  <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
+  approve  <需求ID> --all-steps               一次批三段（轻档审批形态）：原子性 + 三条台账
+                             （channel=quick）+ 需 scope 为 <需求ID>:* 的通配票据；
+                              三段实质正文仍强制，AC 选填但写了必须全量合规\n\
   reject   <需求ID> --step <步骤> [--reviewer <姓名>] [--comment <意见>]
   amend    <需求ID> --step <步骤> --comment <意见>    修订（回退待审+清摘要，必须重审）\n\
                              --reviewer 可省略：缺省取 git 身份（user.name）\n\\
@@ -485,6 +523,9 @@ fn help() -> String {
                              --req <需求ID> 显式指定归属（消歧用；亦可写 HOOK_REQ=<ID>）\n\
   ac check [<需求ID>]        验收标准机械校验（A1–A12；硬伤退出码 1）\n\
   ac check --all             同上，且含归档区（审计用，只读）\n\
+  tier check [--staged | --base <ref>]     分级门禁：按变更集算档位（只读）
+                             输出档位、逐文件有效行、命中 glob、声明档 vs 派生档；
+                              只改注释/空行 → 有效行 0 → 免审档；豁免区不参与定档
   touch-check [--base <ref>] 变更范围契约：实际改动 ⊆ GATE:TOUCH 声明并集\n\
                              （touch.scope=strict 时只比「本次改动归属的那一份」，\n\
                                归属不唯一即报错，不猜）\n\

@@ -45,3 +45,18 @@ core/src/resolve.rs	if !ledger_has_bypass_open(root, &actor) {	if false &&	U0_�
 # 失效形态：同上，但绕过「actor/email/sig 三字段缺失」这一最小门槛 ——
 # 一行 printf 就能凑出全部字段形状。
 core/src/resolve.rs	crate::gate::audit(root, "BYPASS-REJECT reason=missing-fields");	if false { crate::gate::audit(root, "BYPASS-DEGRADED reason=missing-fields"); } else { return None; };	U0_绕过令牌	缺字段校验失效时随手一个 printf 即可伪造出形状完整的令牌
+# ── REQ-019：有效改动行剔除注释（轻档的根据）──
+# 失效形态：注释行不再被剔除 → 「加 120 行注释」与「加 120 行逻辑」同档，
+# 分级形同虚设；更坏的方向是门禁**看起来**在按有效行判，实际按物理行判。
+core/src/tierdiff.rs	pub fn comment_lines(content: &str, syntax: Syntax) -> BTreeSet<usize> {	return BTreeSet::new();	tierdiff::tests::u01	注释剔除失效时只改注释也按物理行计档，light/trivial 档形同虚设
+
+# ── REQ-019：内建锁定项（门禁源码恒为 critical）──
+# 失效形态：路径敏感度整体失效 → `core/src/**`、`templates/hooks/**`、
+# `.gates/req-guard.yaml` 不再是最高档，门禁自身源码可被降级审批 ——
+# 与 REQ-012「门禁可被自改」同一族失效。
+core/src/tier.rs	pub fn path_sensitivity(path: &str, config: &TierConfig) -> Option<PathSensitivity> {	return None;	tier::tests::u09	锁定项失效时门禁源码改动可落到 light 档，门禁可被自己调轻
+
+# ── REQ-019：批量批准的通配票据范围 ─
+# 失效形态：scope 校验整体放行 → 一张**精确**票（甚至通用单次票）就能
+# `--all-steps` 批三段，一次交互换三段批准 —— 凭据强度被悄悄抽掉。
+core/src/token.rs	pub fn scope_matches(cfg_scope: &str, scope: &ScopeCheck<'_>) -> bool {	return true;	token::tests::u22	scope 校验失效时一张票即可批量批准三段，通配票据形同虚设

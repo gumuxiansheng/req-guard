@@ -874,7 +874,88 @@ pub fn pretool_verdict(root: &Path, payload: &str) -> PretoolVerdict {
         };
     }
 
+    // 3) 分级下界提示（L1，REQ-019 §2.7）：**不拦**，只把「本次写入算下来是几档」打出来。
+    //
+    // 为什么 L1 只能是下界：hook 只解析单次 PreToolUse 的 stdin payload（`core/src/json.rs`），
+    // 拿不到整体 diff —— 那是物理事实，不是实现偷懒。故 L1 算的是「这一次的有效行」，
+    // 跨调用的累加**不具备记忆**（U-28 明确记录这条边界）。
+    // 定位写死在输出里：「最终以 CI 复算为准」。把下界伪装成权威结论，就是
+    // 「看着在拦、其实拦不住」的另一种形态。
+    tier_pretool_note(root, &fp, payload);
+
     PretoolVerdict::Continue
+}
+
+/// L1 的档位下界提示（**纯输出，不改变裁决**）。
+///
+/// 三条纪律：
+/// - 分级未启用 → 一句话都不打（回滚口，行为与改造前逐字一致）；
+/// - 路径落在 `touch.exempt` → 不定档（R2b 在三层之上，§2.10）；
+/// - 输出走 **stderr**：stdout 是 hook 脚本的契约通道（`ALLOW_DOC_MARKER` 等），
+///   往那里打档位会被脚本当标记解析。
+pub fn tier_pretool_note(root: &Path, fp: &str, payload: &str) {
+    let Ok(cfg) = tier_config(root) else {
+        return; // 配置坏了不该在这里硬拦：真正的门禁在后面接管并会报出来
+    };
+    if !cfg.enabled {
+        return;
+    }
+    let p = fp.replace('\\', "/");
+    let exempt = touch_exempt_patterns(root);
+    if exempt.iter().any(|g| crate::touch::glob_match(g, &p)) {
+        return; // R2b：豁免区不参与定档（含 AI 填清单正文这一最常见场景）
+    }
+    let Some(content) =
+        crate::json::content_of(payload).or_else(|| crate::json::new_string_of(payload))
+    else {
+        return;
+    };
+    // 单次写入的有效行：全文按注释状态机跑一遍（尚未落盘，故只能按「全新内容」算）。
+    let skip = crate::tierdiff::comment_lines(&content, crate::tierdiff::syntax_of(&p));
+    let total = content.lines().count();
+    let effective = total - skip.len();
+    let stats = vec![crate::tierdiff::FileStat {
+        path: p.clone(),
+        added: effective,
+        deleted: 0,
+        binary: false,
+    }];
+    let owned = vec![p.clone()];
+    let declared = live_declared_tier(root, &p).unwrap_or(crate::tier::Tier::Standard);
+    let c = crate::tier::classify(crate::tier::ClassifyInput {
+        declared,
+        managed: &owned,
+        stats: &stats,
+        config: &cfg,
+    });
+    eprintln!(
+        "[req-guard] 档位下界（L1 本次写入）：{}（{} 行中有效 {} 行）",
+        c.summary(),
+        total,
+        effective
+    );
+    for r in &c.reasons {
+        eprintln!("[req-guard]   - {}", r);
+    }
+    eprintln!(
+        "[req-guard]   L1 看不到整体 diff（无跨调用记忆），这是**下界**；最终以 CI（L3）复算为准。"
+    );
+}
+
+/// 该路径相关清单里最低的声明档（无相关清单 → `standard`）。
+fn live_declared_tier(root: &Path, path: &str) -> Option<crate::tier::Tier> {
+    let live = crate::resolve::live_snapshot(root).ok()?;
+    let exempt = touch_exempt_patterns(root);
+    let paths = vec![path.to_string()];
+    let hits = crate::resolve::hit_list(&live, &paths, &exempt);
+    let mut lowest: Option<crate::tier::Tier> = None;
+    for r in hits {
+        lowest = Some(match lowest {
+            Some(cur) if cur.rank() <= r.tier.rank() => cur,
+            _ => r.tier,
+        });
+    }
+    lowest
 }
 
 /// 是否为"需求清单正文"文件（`.gates/requirements/*.md`，评论文件已在上一步排除）。
@@ -1616,6 +1697,168 @@ fn yaml_bool(root: &Path, block: &str, key: &str, default: bool) -> bool {
     match yaml_scalar(root, block, key) {
         Some(v) => !v.eq_ignore_ascii_case("false"),
         None => default,
+    }
+}
+
+/// 读 `tier` 段（`.gates/req-guard.yaml`）并**校验**（REQ-019 T4）。
+///
+/// 返回 [`crate::tier::TierConfig`]。三条硬约束：
+///
+/// 1. **配置里出现 `locked_paths` 键 → [`crate::error::GateError::Validation`]**
+///    （内建锁定项不可配置）。口径是**报错而不是忽略**：静默忽略会让维护者以为
+///    降级生效了 —— 那是「看着在拦、其实没拦」的同族失效（REQ-019 §2.2 / AC-007）。
+/// 2. **语法错误 → 报错并带行号**，不静默退回「不启用分级」（B-04）：
+///    同样理由 —— 静默退回等于「配置看着生效、其实没生效」。
+/// 3. `risky_paths` 与内建锁定项**重叠不算错误**，内建为准
+///    （本仓初始化清单里就有 `core/src/**`，见 REQ-019 §2.2；见
+///    [`crate::tier::path_sensitivity`] 的「内建优先」）。
+///
+/// 缺省段 / 段内全空 → `enabled=false`（**回滚口**：判定退回现行三段语义）。
+pub fn tier_config(root: &Path) -> Result<crate::tier::TierConfig> {
+    let mut cfg = crate::tier::TierConfig::default();
+    let Some(entries) = yaml_block_entries(root, "tier") else {
+        return Ok(cfg);
+    };
+    // 记住「当前 list 键」，这样 `risky_paths:` 之后的 `- x` 行知道该归谁。
+    let mut current_list: Option<String> = None;
+    for (lineno, t) in entries {
+        if let Some(item) = t.strip_prefix("- ") {
+            match current_list.as_deref() {
+                Some("risky_paths") => {
+                    let p = unquote(item);
+                    if !p.is_empty() {
+                        cfg.risky_paths.push(p);
+                    }
+                }
+                _ => return Err(tier_syntax_err(lineno, &t)),
+            }
+            continue;
+        }
+        let Some((key, value)) = split_kv(&t) else {
+            return Err(tier_syntax_err(lineno, &t));
+        };
+        current_list = if value.trim().is_empty() {
+            Some(key.to_string())
+        } else {
+            None
+        };
+        match key {
+            // 键出现即报错：`locked_paths` 的语义由 core 内建常量承担，
+            // 配置侧写它只可能是「想改内建锁定项」——那必须被看见（AC-007）。
+            "locked_paths" => {
+                return Err(GateError::Validation(format!(
+                    ".gates/req-guard.yaml 第 {lineno} 行出现 `locked_paths` 键。\n\
+                     门禁自身源码恒为最高档 `critical`，由 core 内建常量承担，**不可配置**。\n\
+                     内建锁定项：{}\n\
+                     请删除该键；要把更多路径抬到最高档请改 core 的 LOCKED_PATHS 并走评审。",
+                    crate::tier::LOCKED_PATHS.join("  ")
+                )));
+            }
+            "enabled" => {
+                cfg.enabled = !value.trim().eq_ignore_ascii_case("false");
+            }
+            "trivial_max_lines" => {
+                cfg.trivial_max_lines = parse_threshold(value, lineno, key)?;
+            }
+            "light_max_lines" => {
+                cfg.light_max_lines = parse_threshold(value, lineno, key)?;
+            }
+            "risky_paths" => {
+                for item in split_inline_list(value) {
+                    cfg.risky_paths.push(item);
+                }
+            }
+            other => {
+                return Err(GateError::Validation(format!(
+                    ".gates/req-guard.yaml 第 {lineno} 行的 `tier` 段有未知键 `{other}`。\n\
+                     可用键：enabled / trivial_max_lines / light_max_lines / risky_paths"
+                )));
+            }
+        }
+    }
+    Ok(cfg)
+}
+
+/// `tier` 段的语法错误（**带行号**，且明确「不静默退回不启用」—— B-04）。
+fn tier_syntax_err(lineno: usize, text: &str) -> GateError {
+    GateError::Validation(format!(
+        ".gates/req-guard.yaml 第 {lineno} 行的 `tier` 段无法解析：{text:?}\n\
+         每行须为 `键: 值`、`- 列表项`、空行或 `#` 注释。\n\
+         语法错误**不静默退回「不启用分级」** —— 那会让配置看着生效、实际没生效。"
+    ))
+}
+
+/// 取某块的行号 + 去注释/去缩进后的正文（**无块则 `None`**）。
+fn yaml_block_entries(root: &Path, block: &str) -> Option<Vec<(usize, String)>> {
+    let content = fs::read_to_string(root.join(GATE_YAML_REL)).ok()?;
+    let mut in_block = false;
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == format!("{block}:") {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            let v = match t.find(" #") {
+                Some(p) => t[..p].trim(),
+                None => t,
+            };
+            if v.is_empty() {
+                continue;
+            }
+            out.push((i + 1, v.to_string()));
+        } else if !t.is_empty() {
+            in_block = false;
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// `键: 值` 拆对（**纯函数**）。
+fn split_kv(t: &str) -> Option<(&str, &str)> {
+    let (k, v) = t.split_once(':')?;
+    let k = k.trim();
+    if k.is_empty() || k.contains(' ') {
+        return None;
+    }
+    Some((k, v))
+}
+
+fn unquote(v: &str) -> String {
+    v.trim().trim_matches(['"', '\'']).to_string()
+}
+
+/// 拆行内列表 `[a, "b"]`（**纯函数**）；非列表写法按单值返回。
+fn split_inline_list(v: &str) -> Vec<String> {
+    let body = v.trim().trim_start_matches('[').trim_end_matches(']');
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    body.split(',')
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn parse_threshold(value: &str, lineno: usize, key: &str) -> Result<usize> {
+    let v = value.trim();
+    match v.parse::<usize>() {
+        Ok(n) => Ok(n),
+        Err(_) => Err(GateError::Validation(format!(
+            ".gates/req-guard.yaml 第 {lineno} 行的 `{key}` 必须是整数，当前三行是 `{v}`。\n\
+             （不静默退回默认值：配置看着生效、实际没生效是门禁最坏的失效形态）"
+        ))),
     }
 }
 
@@ -2942,6 +3185,182 @@ fn resolve_gate_binary(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::testutil::fill_sections;
+
+    // ── REQ-019 T4：`tier` 段解析与校验 ──────────────────────────────
+
+    fn tier_yaml(root: &std::path::Path, body: &str) {
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        fs::write(root.join(GATE_YAML_REL), body).unwrap();
+    }
+
+    /// 启用分级并放一份 risky 路径（hook 下界用例用）。
+    fn tier_on(root: &std::path::Path) {
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        fs::write(
+            root.join(GATE_YAML_REL),
+            "version: 1\n\
+             tier:\n\
+             \x20 enabled: true\n\
+             \x20 trivial_max_lines: 5\n\
+             \x20 light_max_lines: 80\n\
+             \x20 risky_paths:\n\
+             \x20   - gui/src/**\n",
+        )
+        .unwrap();
+    }
+
+    fn payload_of(path: &str, content: &str) -> String {
+        format!(
+            "{{\"tool_name\":\"Write\",\"tool_input\":{{\"file_path\":\"{path}\",\"content\":\"{}\"}}}}",
+            content.replace('\n', "\\n")
+        )
+    }
+
+    #[test]
+    fn u28_单次写入只按下界算且不改变裁决() {
+        let root = temp_dir("tier-hook");
+        tier_on(&root);
+        // 分级启用 + 只改 3 行 → 判为 trivial，但裁决仍是 Continue（L1 不拦）
+        let v = pretool_verdict(&root, &payload_of("src/app.rs", "a\nb\nc"));
+        assert!(
+            matches!(v, PretoolVerdict::Continue),
+            "L1 只给下界，不得拦：{v:?}"
+        );
+        // 同一文件分三次小写入，每次都不拦 —— L1 **没有跨调用记忆**（U-28 的边界）
+        for _ in 0..3 {
+            let v = pretool_verdict(&root, &payload_of("src/app.rs", "x"));
+            assert!(matches!(v, PretoolVerdict::Continue));
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u28b_豁免区路径不定档() {
+        let root = temp_dir("tier-hook-exempt");
+        tier_on(&root);
+        // 清单正文在豁免区：若 L1 不做 R2b 短路，AI 填清单会被自己的档位机制要求先批方案
+        let v = pretool_verdict(&root, &payload_of(".gates/requirements/REQ-001.md", "正文"));
+        assert!(
+            matches!(v, PretoolVerdict::AllowDoc),
+            "清单正文仍是放行：{v:?}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn u28c_分级未启用时hook输出逐字不变() {
+        let root = temp_dir("tier-hook-off");
+        fs::create_dir_all(root.join(".gates")).unwrap();
+        fs::write(root.join(GATE_YAML_REL), "version: 1\n").unwrap();
+        let v = pretool_verdict(&root, &payload_of("src/app.rs", "a\nb"));
+        assert!(matches!(v, PretoolVerdict::Continue));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段缺省时不启用分级() {
+        let root = temp_dir("tier-absent");
+        tier_yaml(&root, "version: 1\nenabled: true\n");
+        let c = tier_config(&root).unwrap();
+        assert!(!c.enabled, "缺省段必须是不启用（回滚口）");
+        assert_eq!(c.trivial_max_lines, crate::tier::DEFAULT_TRIVIAL_MAX_LINES);
+        assert_eq!(c.light_max_lines, crate::tier::DEFAULT_LIGHT_MAX_LINES);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段解析阈值与块状列表() {
+        let root = temp_dir("tier-parse");
+        tier_yaml(
+            &root,
+            "version: 1\n\
+             tier:\n\
+             \x20 enabled: true\n\
+             \x20 trivial_max_lines: 3\n\
+             \x20 light_max_lines: 40\n\
+             \x20 risky_paths:\n\
+             \x20   - gui/src/**\n\
+             \x20   - scripts/**  # 判决性实验脚本\n\
+             touch:\n\
+             \x20 scope: union\n",
+        );
+        let c = tier_config(&root).unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.trivial_max_lines, 3);
+        assert_eq!(c.light_max_lines, 40);
+        assert_eq!(c.risky_paths, vec!["gui/src/**", "scripts/**"]);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段支持行内数组写法() {
+        let root = temp_dir("tier-inline");
+        tier_yaml(
+            &root,
+            "tier:\n  enabled: true\n  risky_paths: [gui/src/**, \"tui/src/**\"]\n",
+        );
+        let c = tier_config(&root).unwrap();
+        assert_eq!(c.risky_paths, vec!["gui/src/**", "tui/src/**"]);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn 配置里写locked_paths直接报错且点名该键() {
+        let root = temp_dir("tier-locked");
+        tier_yaml(
+            &root,
+            "tier:\n  enabled: true\n  locked_paths: [core/src/**]\n",
+        );
+        let err = tier_config(&root).unwrap_err().to_string();
+        assert!(err.contains("locked_paths"), "{err}");
+        assert!(err.contains("第 3 行"), "{err}");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段语法错误报错并带行号不静默退回() {
+        let root = temp_dir("tier-syntax");
+        tier_yaml(&root, "tier:\n  enabled: true\n  这行没有冒号\n");
+        let err = tier_config(&root).unwrap_err().to_string();
+        assert!(err.contains("第 3 行"), "{err}");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段阈值非整数报错() {
+        let root = temp_dir("tier-threshold");
+        tier_yaml(&root, "tier:\n  enabled: true\n  light_max_lines: 很多\n");
+        let err = tier_config(&root).unwrap_err().to_string();
+        assert!(
+            err.contains("light_max_lines") && err.contains("第 3 行"),
+            "{err}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段未知键报错并列出可用键() {
+        let root = temp_dir("tier-unknown");
+        tier_yaml(&root, "tier:\n  enabled: true\n  fancy: 1\n");
+        let err = tier_config(&root).unwrap_err().to_string();
+        assert!(
+            err.contains("fancy") && err.contains("risky_paths"),
+            "{err}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn tier段关闭时解析结果为不启用() {
+        let root = temp_dir("tier-off");
+        tier_yaml(
+            &root,
+            "tier:\n  enabled: false\n  risky_paths: [gui/src/**]\n",
+        );
+        let c = tier_config(&root).unwrap();
+        assert!(!c.enabled);
+        cleanup(&root);
+    }
 
     /// 存量仓库升级：`write_decl` 保留用户改过的 README，所以草稿契约小节
     /// 只能**补写**。不测这条，就会出现"新装仓库看得到契约、老仓库看不到"的分裂 ——

@@ -82,6 +82,40 @@ touch:
   scope: union
   reapprove: true
 
+# 分级门禁（REQ-019）：按**有效改动行数**与**路径敏感度**自动定档。
+#
+# 四档：trivial / light / standard / critical。档位 = max(清单 frontmatter 的
+# `tier` 声明档, 按本次变更集算出的派生档) —— 声明只能往上抬，不能往下压；
+# 派生档由 CI（L3 `check --base`）完整变更集复算，是权威层。
+#
+# 「有效改动行」剔除注释行与空行：把 `git diff -U0` 的两侧行号按**文件全文**
+# 重建注释状态机后过滤，故只改注释/空行的变更有效行为 0 → 自动落进免审档。
+#
+# 口径与边界详见 docs/设计/分级门禁技术方案.md；回放校准见
+# `python scripts/calibrate_tier.py`（G7：阈值不许拍脑袋写死）。
+tier:
+  # 关掉这一段（或整段置空）即**回滚**：派生档不生效，判定退回三段逐段批准，
+  # 且门禁输出与启用前逐字一致。清单里的 `tier` 键保留即可（standard 在新旧
+  # 枚举下都合法，回滚不需要改任何清单）。
+  enabled: true
+  # 阈值初值 5 / 80 来自历史变更集回放（最近 40 个提交：critical 21 / standard 11 /
+  # light 8 / trivial 0）。本仓真实改动普遍远超 80 行，故 light 档主要覆盖
+  # 「CI 配置 / 脚本小改 / 记忆笔记」这类小变更；**调阈值前请先重跑回放**。
+  trivial_max_lines: 5
+  light_max_lines: 80
+  # 高危路径：命中即**至少 standard**（跳过 light / trivial）。
+  # 内建锁定项（恒为 critical、不可配置）：core/src/**、templates/hooks/**、
+  # templates/ci/**、.gates/req-guard.yaml —— 配置里写 `locked_paths` 键会被
+  # 直接拒绝（GateError::Validation），「门禁可被自己调松」不留口子。
+  risky_paths:
+    - core/src/**
+    - cli/src/**
+    - gui/src/**
+    - tui/src/**
+    - scripts/**
+    - templates/**
+    - .gates/**
+
 # 到期自动归档：done 满 N 天后，req-guard done 成功时自动把清单
 # 物理搬入 .gates/requirements/archive/<创建年份>/（无日期段 → misc/）
 # 0 = done 即刻归档；手动补扫：req-guard archive

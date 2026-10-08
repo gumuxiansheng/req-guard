@@ -8,6 +8,32 @@
 
 ## 未发布
 
+### 新增：分级门禁（REQ-019）
+
+- **四档自动定档**：`trivial` / `light` / `standard` / `critical`，档位由
+  **有效改动行数 + 路径敏感度**派生，AI 不能自行选择。
+  档位 = max(清单 frontmatter 的 `tier` 声明档, 派生档) —— **声明只能往上抬**；
+  派生档更高时 L3 报 `TierEscalation`、退出码 1，要求按更高档重新批准。
+- **有效改动行剔除注释与空行**：按**文件全文**重建注释状态机再按行号过滤
+  （不是数 diff 行、也不是逐行看是不是 `//` 开头），故跨 hunk 的块注释、
+  字符串里的 `//` 都判得对；「只改注释、只加空行」自然落进免审档。
+- **新增命令** `req-guard tier check [--staged | --base <ref>]`：只读输出档位**与理由**
+  （逐文件有效行、命中的 glob、声明档 vs 派生档）。退出码只表示「算出来了」，
+  不表示通过门禁。
+- **`approve --all-steps`**：轻档一条命令批三段。原子性（任一段不合规则一段都不批）、
+  留痕不减（三条 `APPROVE`，各带 `sum=`，`channel=quick`）、凭据不放宽
+  （L3 下需 `scope` 为 `<需求ID>:*` 的通配票据，一次性；精确票与通配票互不对冲）、
+  实质正文仍强制。轻档 AC 选填，但写了必须全量合规（A2–A12 不放松）。
+- **配置**：`.gates/req-guard.yaml` 新增 `tier` 段（`enabled` /
+  `trivial_max_lines`（5）/ `light_max_lines`（80）/ `risky_paths`）。
+  门禁自身源码（`core/src/**`、`templates/hooks/**`、`templates/ci/**`、
+  `.gates/req-guard.yaml`）恒为 `critical` 且**不可配置** ——
+  配置里写 `locked_paths` 键会被直接拒绝（不静默忽略）。
+- **兼容与回滚**：`tier` 缺省或取历史值 `standard` 时三段语义**逐字不变**，
+  存量清单零迁移；把 `tier` 段置空 / `enabled: false` 即完整回滚。
+- **三层边界写进文档**：L1 `hook-check` 只能给**下界**（看不到整体 diff、无跨调用记忆），
+  L2 看不见未暂存改动，L3（`check --base`）是**权威**层；豁免区改动**不参与定档**。
+
 ### ⚠️ 破坏性变更（升级前必读）
 
 - **`bypass --ttl` 上限 240 分钟**：`bypass --ttl 0` 或 `> 240` 从「接受」变为「拒绝」。

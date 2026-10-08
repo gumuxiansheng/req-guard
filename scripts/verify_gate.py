@@ -140,11 +140,17 @@ def run(name, req_content, comments=None, bypass=False, stdin_data=None, extra=N
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(content, encoding="utf-8")
     if bypass:
-        expires = int(time.time()) + 3600
-        (work / ".gates" / ".bypass").write_text(
-            f"reason=hotfix\nactor=kou\ncreated_epoch=0\nexpires_epoch={expires}\n",
-            encoding="utf-8",
+        # 绕过令牌必须**真开一次**，不能手写：REQ-012 起 `active_bypass` 有两道校验
+        # ① `sig` 等于按 actor/email 重算的身份指纹 ② 入库台账有 `BYPASS-OPEN` 行。
+        # 手写的裸 `expires_epoch` 令牌会被这两道判成伪造（实测踩到：场景 5 假红），
+        # 于是「绕过窗口生效」这条从未被真机验证过 —— 夹具骗过了所有人。
+        # 临时仓库没有 .gates/req-guard.yaml → auth 等级 L0，无需人类在场即可签发。
+        r = subprocess.run(
+            [str(BIN), "bypass", "--reason", "hotfix", "--author", "kou", "--ttl", "60"],
+            cwd=work, capture_output=True, text=True, **RUN_KW,
         )
+        if r.returncode != 0:
+            print(f"WARN  场景 {name}: 开启绕过窗口失败：{r.stderr.strip()}")
 
     if stdin_data is not None:
         # 管道 → 非 tty：脚本会读取 stdin JSON（AI 工具 PreToolUse 形态）
@@ -1516,8 +1522,32 @@ def verify_tests_have_teeth() -> bool:
     return ok
 
 
+def verify_tier_gate() -> bool:
+    """REQ-019 T9：分级门禁的判决性实验单独成脚本（场景与真机票据要求不同）。
+
+    这里只做编排：调 `verify_tier.py` 并把退出码并进总账。分成两个文件是因为
+    「装配层失效」要能单独重跑（改了 tier 接线只想复跑这十一个断言时，
+    不该被迫重跑另外四十个场景）。
+    """
+    script = ROOT / "scripts" / "verify_tier.py"
+    if not script.exists():
+        print(f"SKIP  REQ-019: 缺少 {script}")
+        return True
+    r = subprocess.run(
+        [sys.executable, str(script), "--bin", str(BIN)],
+        capture_output=True, **RUN_KW,
+    )
+    print(r.stdout.rstrip())
+    if r.stderr.strip():
+        print(r.stderr.rstrip(), file=sys.stderr)
+    good = r.returncode == 0
+    print(f"{'PASS' if good else 'FAIL'}  REQ-019_分级判决性实验: exit={r.returncode} (期望 0)")
+    return good
+
+
 ok = ok and verify_multi_gate()
 ok = ok and verify_tests_have_teeth()
+ok = ok and verify_tier_gate()
 
 print("\n结论:", "全部通过" if ok else "存在失败")
 sys.exit(0 if ok else 1)
