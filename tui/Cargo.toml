@@ -1,6 +1,6 @@
 [package]
 name = "req-guard-tui"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "req-guard 终端界面（ratatui + crossterm）"
 
