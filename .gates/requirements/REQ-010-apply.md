@@ -1,6 +1,6 @@
 ---
 doc_type: proposal
-tier: standard
+tier: critical
 owner: -
 review_policy: codebound
 verified_at: 2026-10-05
@@ -15,7 +15,7 @@ source_refs: [core/src, cli/src, docs, .gates, packaging/docs, packaging]
 
 <!-- GATE:HEAD id=REQ-010 status=approved created=2026-10-05_00:51:32 -->
 <!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_09:37:48 sum=47b1c3f3931951f2bff04bab4d402d43733e95d9ba1bd2bc8ab8d93b6b27de1d -->
-<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_01:30:58 sum=e6a576193de00c77c85b1634af189f7352473b03567e1919253a3677fe28df29 -->
+<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-09_12:57:19 sum=e6a576193de00c77c85b1634af189f7352473b03567e1919253a3677fe28df29 -->
 <!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_01:32:48 sum=f93e61fd532fc36f64b84b01a1a00866687208b9f3c6beceacc2c4d628365a31 -->
 
 ## 1. 需求分解
@@ -380,4 +380,5 @@ size 会被「改了一个字又改回来」骗过。草稿长度是几百字节
 - 2026-10-05_01:32:48 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | approved | 补 U-09/U-10、E-04、B-05/B-06
 - 2026-10-05_09:32:51 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | amended | 补记账缺口：B-05 并发替换已并入本期，缺 G6 目标行与 P4 子任务行
 - 2026-10-05_09:37:48 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | approved | 补 G6 / P4，与 solution / testplan 的已批内容一致
+- 2026-10-09_12:57:19 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | 档位升至 critical（§8.5 方案 2）
 <!-- /GATE:AUDIT -->

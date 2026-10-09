@@ -1,6 +1,6 @@
 ---
 doc_type: proposal
-tier: standard
+tier: critical
 owner: -
 review_policy: codebound
 verified_at: 2026-10-05
@@ -15,7 +15,7 @@ source_refs: [core/src, cli/src, gui/src, tui/src, README.md]
 
 <!-- GATE:HEAD id=REQ-015 status=approved created=2026-10-05_13:35:31 -->
 <!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:20:44 sum=9c64c8f9c1fbecb32ae68daea809df6ee95d78b35842cea9f1f8357727a6b50d -->
-<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:21:27 sum=f9cdad0940e92d454c4e8a5f4dc5c5e16345e54352403b9a733cce62687f589e -->
+<!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-09_12:57:53 sum=f9cdad0940e92d454c4e8a5f4dc5c5e16345e54352403b9a733cce62687f589e -->
 <!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-05_14:21:39 sum=7928e986af1118d1228c02b3f985ae305d5fbbb7c823a0b799334d6c71dc4890 -->
 
 ## 1. 需求分解
@@ -554,4 +554,5 @@ README.md
 - 2026-10-05_14:20:44 | Mike_Zhu <zhuyuan2706@gmail.com> | decomposition | approved | -
 - 2026-10-05_14:21:27 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | -
 - 2026-10-05_14:21:39 | Mike_Zhu <zhuyuan2706@gmail.com> | testplan | approved | -
+- 2026-10-09_12:57:53 | Mike_Zhu <zhuyuan2706@gmail.com> | solution | approved | 档位升至 critical（§8.5 方案 2）
 <!-- /GATE:AUDIT -->

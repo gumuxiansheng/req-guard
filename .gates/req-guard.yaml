@@ -98,9 +98,17 @@ tier:
   # 且门禁输出与启用前逐字一致。清单里的 `tier` 键保留即可（standard 在新旧
   # 枚举下都合法，回滚不需要改任何清单）。
   enabled: true
-  # 阈值初值 5 / 80 来自历史变更集回放（最近 40 个提交：critical 21 / standard 11 /
-  # light 8 / trivial 0）。本仓真实改动普遍远超 80 行，故 light 档主要覆盖
-  # 「CI 配置 / 脚本小改 / 记忆笔记」这类小变更；**调阈值前请先重跑回放**。
+  # 阈值 5 / 80 来自历史变更集回放（脚本口径，非拍脑袋；G7）。回放快照 2026-10-09
+  # （最近 40 个提交）：critical 20 / standard 15 / light 5 / trivial 0；
+  # ±50% 敏感度：light 5→4→6、standard 15→16→14（判读为「阈值敏感」→ 分布随阈值
+  # 翻转说明在拟合噪声，先改口径或档位定义，别继续拧数字）。
+  # 本仓真实改动普遍远超 80 行，故 light 档主要覆盖「CI 配置 / 脚本小改 / 记忆笔记」
+  # 这类小变更；**调阈值前请先重跑回放**：python scripts/calibrate_tier.py。
+  #
+  # §8.5 方案 2 已落地：会把 `core/src/**` 等锁定路径纳入变更集的 8 份活跃清单
+  # （REQ-009/010/012/015/016/017/019/020）frontmatter 声明 `tier: critical`，
+  # 与派生档对齐 → 不再每次提交都报 TierEscalation。改 frontmatter 不动段正文，
+  # 故 `sum=` 绑定不受影响（已用 `req-guard verify-content` 复核）。
   trivial_max_lines: 5
   light_max_lines: 80
   # 高危路径：命中即**至少 standard**（跳过 light / trivial）。
