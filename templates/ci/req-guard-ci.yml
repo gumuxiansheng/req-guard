@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   # 版本号走**仓库变量**，不在本文件里写死：写死就得每仓手工改一次，
   # 漏改就会静默用旧版二进制判新格式的清单（且没人会发现）。
-  # 设置：gh variable set REQ_GUARD_VERSION --body 0.1.5
+  # 设置：gh variable set REQ_GUARD_VERSION --body 0.1.7
   REQ_GUARD_VERSION: ${{ vars.REQ_GUARD_VERSION }}
 
 jobs:
