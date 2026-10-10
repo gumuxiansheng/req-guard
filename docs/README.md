@@ -49,7 +49,7 @@ docs/
 | `设计/多需求并行门禁裁决技术方案.md` | 提案（未实现） | 方案未实现（P0–P5）；§0.1 实测复现了 `HOOK_SH` 第 2 段「活跃需求单条」假设的**漏拦**（未批清单被放行、审计却记 PASS 另一份清单）与**互锁**；§0.4 记录了它与 `AC与变更范围契约技术方案.md` §3.5 的半修关系 | 保留（作为 P0–P5 唯一实现依据） |
 | `规范/AI工具合规保证规范.md` | 部署与验收口径 | 与代码一致（L2 fail-closed、install --verify、方案 A/B/C、入库台账均已落地） | 保留（仅更新配套路径） |
 | `规范/需求编号防冲突命名规范.md` | 需求 id 命名与查重（2026-09-19 新增） | 规范主体与现有实现一致；§8 P1/P3 当日落地（`core/src/idcheck.rs` + CLI `ids` 子命令，10 项单测），P2 能力就绪（挂 CI / pre-push） | 保留 |
-| `规范/SDD产物接入规范.md`（2026-10-05 新增） | SDD 规格工具（spec-kit 类）产物与 req-guard 清单的**单源路由**：三条硬约束 R1–R3、产物映射表、命令序列、门禁视野边界 | 规范与实现一致（结论基于 `gate::pretool`、`resolve` 的 G4 约定、`touch::cross_refs`、`ac::lint`、`requirement::ensure_touch_declared`）；§7 两档机械兜底**定稿时未启用** | 保留 |
+| `规范/SDD产物接入规范.md`（2026-10-05 新增） | SDD 规格工具（spec-kit 类）产物与 req-guard 清单的**单源路由**：三条硬约束 R1–R3、产物映射表、命令序列、门禁视野边界 | 规范与实现一致（结论基于 `gate::pretool`、`resolve` 的 G4 约定、`touch::cross_refs`、`ac::lint`、`requirement::ensure_touch_declared`）；**§7 机械兜底已于 2026-10-10 启用**（`scripts/verify_sdd_routing.sh`，POSIX sh，接入 GitHub Actions 与 CNB 两侧）；同期 R3 由「不留副本」放宽为「可入库但每个文件须带 `<!-- SDD-SOURCE: REQ-<id> -->` 声明」（REQ-021） | 保留 |
 | `提案/AI协同审核GUI自动弹出技术方案.md` | 未实现的前瞻方案 | 方案未实现；§9 核查结论 + §10 落地路径为后续执行依据 | 保留 + **已合并落地清单** |
 | 根目录 `README.md` | 项目入口（面向用户） | 最新 | 保留在根目录（GitHub 惯例），本次仅修正文档引用路径 |
 
@@ -100,10 +100,12 @@ docs/
 3. 引用代码位置写**文件名 + 符号名**，不写行号（行号必然腐坏，见 4.1）。
 4. 门禁能力/保证边界变化时，须同步 `规范/AI工具合规保证规范.md` 第 2.2、4、6 章并回归其验收清单。
 5. 验证数字（用例数 / 场景数）以**实跑为准**，文档只记录日期快照；
-   `cargo test --workspace`、`python scripts/verify_gate.py`（当前 13 个固定场景 + 1 个需二进制在 PATH 的条件场景）。
+   `cargo test --workspace`、`python scripts/verify_gate.py`（当前 13 个固定场景 + 1 个需二进制在 PATH 的条件场景）、
+   `sh scripts/verify_sdd_routing.sh`（SDD 产物来源声明校验，REQ-021；POSIX sh，无 Python 依赖）。
 6. 项目文档里的**规格类产物**（SDD 生成的 spec/plan/design/research/data-model/contracts）只落在
    `docs/设计/` 或 `docs/规范/`，由清单第 2 段以 `docs/<目录>/<文件>.md §<编号>` 引用；
-   一律不在 `.gates/requirements/` 之外留存第二份需求副本（见 `规范/SDD产物接入规范.md` R1–R3）。
+   一律不在 `.gates/requirements/` 之外留存第二份需求副本（见 `规范/SDD产物接入规范.md` R1–R3）；
+   例外：SDD 产物 `specs/**` 可入库供团队评审，但每个文件须带来源声明指向唯一真相（R3 修订，REQ-021）。
 
 ---
 
@@ -114,4 +116,4 @@ docs/
 | 根目录 `README.md` | 项目入口（GitHub/仓库首页渲染），保持根目录 |
 | `.workbuddy/memory/*.md` | AI 工作记忆（日志与长期备忘），属会话上下文而非项目文档，移动会破坏记忆系统 |
 | `target/`、`dist/` | 构建产物（`.gitignore` 已忽略） |
-| `templates/`、`scripts/` 内注释 | 随代码演进，不单列为文档 |
+| `specs/**` | SDD 产物（spec-kit 生成）：**入库**供团队评审，但每个文件须带 `<!-- SDD-SOURCE: REQ-<id> -->` 声明；校验见 `scripts/verify_sdd_routing.sh`（REQ-021 与 `规范/SDD产物接入规范.md` R3） |

@@ -55,14 +55,31 @@ SDD 工具为每个特性产出 `spec.md` / `plan.md` / `design.md` / `research.
   `source_refs` 由它**单向派生**（`requirement::ensure_touch_declared`），不要求也不允许人工维护第二份。
   SDD 的 `plan.md` 里若再出现一份"涉及文件清单"，就是第二份 —— 按 R3 处理。
 
-### R3 SDD 产物只当草稿源，apply 后不留副本
+### R3 SDD 产物可入库，但每个文件必须声明唯一来源
 
-`specs/<feature>/` 的整个目录只作为**草稿源**存在（语义等价于 `.gates/drafts/<需求ID>.draft.md`，
-该目录按设计不参与任何判定），内容经 `req-guard apply --step <段名>` 进入清单后即失去独立意义：
+> **修订 2026-10-10（REQ-021）**：原文为「只当草稿源，apply 后不留副本 / 禁止并行维护」。
+> 修订理由见本节末尾「为什么放宽」。
 
-- 首选：**apply 后删除 `specs/<feature>/`**（推荐，零副本）；
-- 次选：`specs/**` 进 `.gitignore`（保留本地草稿，不入库）；
-- **禁止**：把 `specs/` 内容长期与清单并行维护，或让 AI 继续往里写。
+`specs/<feature>/` 的内容经路由进入清单三段后，草稿**可以保留在版本库里**
+（团队要在 PR 里评审 SDD 产物），但**每个被 git 跟踪的 `specs/**` 文件必须在其前 15 行内
+含一行机器可解析的声明**：
+
+```markdown
+<!-- SDD-SOURCE: REQ-021 -->
+```
+
+- 声明里的 `REQ-<id>` 必须能解析到真实清单（归档区也算存在）；
+- 冲突时**一律以清单为准** —— 清单是唯一真相，草稿可评审、可提意见，但不可直接据此实施；
+- **禁止**：无来源声明的 `specs/**` 文件进入版本库。由 `scripts/verify_sdd_routing.sh`
+  机械判定，并接入 CI（GitHub Actions 与 CNB 两侧）。
+
+**为什么放宽**：R1 的实质是「唯一真相只有一个」，不是「同一件事只能被写一次」。
+脑裂的定义是「**不知道**哪份是准的」，而不是「存在两份文档」。只要每个副本都机械地声明了
+它从属于哪份清单、且该清单存在，「哪份是准的」就永远有唯一答案。故禁令的对象应精确为
+「**无来源声明**的并行维护」，而非「并行存在」本身。
+
+**代价（采用即须接受）**：内容漂移无法机械判定 —— 清单改了而 `specs/` 没改，脚本查不出来。
+守的是「指向」，不是「一致」。缓解是声明块里写明「以清单为准」+ 人工评审 + doc-guard 时效。
 
 ---
 
@@ -73,9 +90,9 @@ SDD 工具为每个特性产出 `spec.md` / `plan.md` / `design.md` / `research.
 | `spec.md` | → 第 1 段 `decomposition` 需求分解 | FR 编号可保留；**验收口径**在第 3 段落成 `GATE:AC`，不靠 spec.md 兜 |
 | `plan.md` | → 第 2 段 `solution` 技术方案 | 必须含 `<!-- GATE:TOUCH -->` 声明块；架构细节不抄进方案段 |
 | `design.md` / `research.md` / `data-model.md` / `contracts/*` / `quickstart.md` | → `docs/设计/` | 落 `docs/` 之外 = 方案段引用不了 = 批准不了 |
-| `tasks.md` | **不入库** | 语义与第 3 段不同（实施任务 ≠ 测试计划）。只挑「可观测」条目改写为 AC |
+| `tasks.md` | 可入库（带来源声明） | **不可**当作测试计划用：语义与第 3 段不同（实施任务 ≠ 测试计划）。只挑「可观测」条目改写为 AC |
 | `constitution.md` | 流程条款 → `docs/规范/`；其余留原处 | 避免出现两份"项目准则" |
-| `specs/<feature>/` 目录 | 草稿源（R3） | 与清单并存即违反 R1 |
+| `specs/<feature>/` 目录 | 草稿源，**可入库**（R3） | 与清单并存**不**违反 R1 —— 前提是每个文件带 `<!-- SDD-SOURCE: REQ-<id> -->` 且指向的清单存在 |
 
 ---
 
@@ -124,15 +141,32 @@ req-guard seal REQ-0xx ; req-guard done REQ-0xx   # 满 30 天（archive.after_d
 
 ---
 
-## 7 可选机械兜底
+## 7 机械兜底（已启用）
 
-约定若不可机械判定，就会退化成人人记得跑才能跑的流程。可选两档：
+约定若不可机械判定，就会退化成人人记得跑才能跑的流程。
 
-1. **最轻**：`specs/**` 进 `.gitignore`（草稿化），`git status` 里根本不出现副本。
-2. **CI 兜底**：流水线加一步——`git diff --name-only -- specs/` 非空且对应清单第二段未批准 → 退出 1。
-   与 `install --verify` 同风格：**宁可漏，不可扰**，只报出精确文件，不做模糊断言。
+**已启用（2026-10-10，REQ-021）**：`scripts/verify_sdd_routing.sh`（POSIX sh，依赖仅 `git` + `sh`），
+三组检查，与 `install --verify` 同风格：**只报出精确文件，不做模糊断言**：
 
-（两档均可选；本规范定稿时未启用，启用即视为对 `docs/规范/AI工具合规保证规范.md` §4 验收清单的补充。）
+| 组 | 判定 | 退出码 |
+| --- | --- | --- |
+| **A** | 每个被跟踪的 `specs/**` 文件，其**前 15 行内**含 `<!-- SDD-SOURCE: REQ-<3位数字> -->` | 缺 / 位置不合规 → 1 |
+| **B** | 声明里的 `REQ-<id>` 能解析到清单（归档区也算存在） | 否 → 1 |
+| **C** | 活跃清单 frontmatter 的 `review_policy` / `source_refs` 齐备 | **只报告，不改变退出码** |
+
+已接入 `.github/workflows/ci.yml` 与 `.cnb.yml` 两侧。
+
+**为什么用 sh 而不是 Python**：CNB 的 `rust:1-slim-bookworm` 镜像无 `python3`；若沿用
+`verify_gate.py` 那样的「探测不到就跳过」，该侧就完全不校验了——而本项防的正是
+「无声明产物入库」，跳过等于洞开。改用 sh 后两条流水线都能真跑，不需要跳过分支。
+
+**另一条路（实测后未采用）**：在第二段 `GATE:TOUCH` 里声明 `specs/**` 让门禁"看见"。两条实测：
+
+1. **声明是授予「可写」许可，不是施加约束** —— 已声明且三段批准后，裁决即「可写」；
+2. **不声明时 `req-guard check --staged` 反而会拦**（`Ambiguous`），但根因是「多清单导致歧义」，
+   不是「该路径不许改」；仓库只剩 1 份活跃清单时 `live.len() == 1` 退化分支会放行。
+
+→ **不要把「没声明」当作稳定的约束手段。** 本项约束由 A/B 两组 + CI 承担，不由门禁声明承担。
 
 ---
 
@@ -146,7 +180,7 @@ req-guard seal REQ-0xx ; req-guard done REQ-0xx   # 满 30 天（archive.after_d
 
 ## 9 验收清单（改动本规范后必须回归）
 
-- [ ] 仓库内不存在与清单并存的 SDD 需求副本（搜 `specs/` 下的 `spec.md`，每条都能对应到 `.gates/requirements/*.md`，或该目录已不在版本库内）
+- [ ] 仓库内每个 `specs/**` 文件都能对应到一份清单（`sh scripts/verify_sdd_routing.sh` 通过即证明）
 - [ ] 第 2 段存在 `<!-- GATE:TOUCH -->`，条目归一有效（不含 `..`、不以 `/` 开头）
 - [ ] 方案段引用的文档全部在 `docs/` 下、小节号存在（`req-guard approve --step solution` 通过即证明）
 - [ ] 第 3 段 AC 编号连续且 Given/When/Then 齐备（`req-guard ac check` 绿）

@@ -59,6 +59,11 @@ jobs:
           PY=$(command -v python3 || command -v python || echo python)
           "$PY" scripts/verify_gate.py
 
+      # REQ-021：SDD 产物必须声明唯一来源（POSIX sh，不依赖 python，本侧与 CNB 侧都跑）
+      - name: SDD 产物路由校验
+        shell: bash
+        run: sh scripts/verify_sdd_routing.sh
+
       - name: 构建 release（默认：零 UI 依赖）
         run: cargo build --release
 

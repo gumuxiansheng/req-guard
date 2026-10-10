@@ -22,6 +22,10 @@ main:
               echo "请在本地或 GitHub Actions 执行：python3 scripts/verify_gate.py"
             fi
 
+            # REQ-021：SDD 产物路由校验。刻意用 POSIX sh 而非 python —— 本镜像无 python3，
+            # 若跟随上面「探测+跳过」的写法，本侧就完全不校验了（详见 REQ-021 设计 6）。
+            sh scripts/verify_sdd_routing.sh
+
             # 门禁自举（与 GitHub Actions gate-selfcheck 一致的**工具无关**生命周期）：
             # 真实验证 install --verify（L1 缺口检出）、check（L3 硬拦截）与
             # ids --check（编号防冲突）三条命令。

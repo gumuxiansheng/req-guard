@@ -18,6 +18,12 @@ gui/assets/unicodes.txt
 # 草稿区（AI 拟改清单内容的暂存处，工作态；apply 消费后即删除）
 /.gates/drafts
 
+# spec-kit 注入的 agent 目录（.codebuddy/commands/**）：每次 `specify init` 重新生成，
+# 且 spec-kit 自己在 init 结束时提示「agent 目录可能含凭据，建议 gitignore」→ 不入库。
+# 注意区分：SDD **产物**（specs/**）是**入库**的（团队要在 PR 里评审），但每个文件必须带
+# `<!-- SDD-SOURCE: REQ-<id> -->` 声明指向唯一真相；校验见 scripts/verify_sdd_routing.sh（REQ-021）。
+/.codebuddy/
+
 # Python 字节码缓存：scripts/ 下的注入器与 verify_gate.py 跑起来会生成，
 # 入库即多一份可再生物（且每次 mtime 不同会让 git status 常带噪声）。
 __pycache__/
