@@ -77,6 +77,54 @@ jobs:
         # 故只在 Windows / macOS 原生执行机构建。
         run: cargo build -p req-guard --release --features gui
 
+  # ── L3 门禁：本仓库自己也要被门禁管 ──────────────────────────────────
+  # 背景：此前本仓库的编排**从未真正调用** req-guard —— gate-selfcheck 里的调用是
+  # `"$BIN" check -p "$P"`，判的是临时演示项目，不是本仓库。故 `req-guard install --verify`
+  # 一直红在「存在 CI 编排但未执行 req-guard 子命令」：本机 --no-verify 在服务端无人抵消。
+  # 本 job 补上这个洞（REQ-021 实施期发现并顺手修掉）。
+  #
+  # **只在 PR 上跑**：push 到 main 时 `--base origin/main` 的差异为空，而无变更集就无从
+  # 归因（多份未归档清单 → `Ambiguous` 恒拦）。门禁要挡的是「正要合进来的改动」，
+  # 已经进 main 的内容再判一次只会恒红。
+  req-guard-gate:
+    name: req-guard gate (L3)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # actions/checkout 默认 depth=1 → origin/main 在本地不存在 → --base 硬失败
+          fetch-depth: 0
+
+      # 本仓库就是 req-guard，直接编出来用（默认成员 core + cli，零 UI 依赖）。
+      - name: 构建 req-guard
+        run: cargo build --release
+
+      # 必须放成仓库根的 ./req-guard：install --verify 的接入检测按「req-guard 紧跟子命令」
+      # 做字面量匹配，写成 ./target/release/req-guard 识别不到（会被判为 L3 缺口）。
+      - name: 就位二进制
+        run: cp target/release/req-guard ./req-guard
+
+      # 裁决对象是本次变更集，故对多需求仓库也能按需求归因。
+      # 未过审 / 有未解决阻塞评论 / 内容冻结被破坏 / 无法归因 → 退出码 1。
+      - name: req-guard check（未过审即失败）
+        run: ./req-guard check --base "origin/${{ github.base_ref }}"
+
+      # approve 时已跑同一判据，这一步是服务端兜底：挡住「本地改了正文但没重新过审」。
+      - name: req-guard ac check（验收标准格式校验）
+        run: ./req-guard ac check --all
+
+      # 变更范围契约的服务端对应物：pre-commit 是本机墙，--no-verify 一穿而过，
+      # 这一步用同一份判定（core::touch）比对相对 base 的差异 ⊆ GATE:TOUCH 并集。
+      - name: req-guard touch-check（变更范围契约，抵消 --no-verify）
+        run: ./req-guard touch-check --base "origin/${{ github.base_ref }}"
+
+      - name: req-guard ids --check（编号防冲突查重）
+        run: ./req-guard ids --check
+
+      # 刻意**不**在这里跑 `install --verify`：它是本机体检（含夹具里的人类审批动作），
+      # 放进 CI 会因与门禁判定无关的原因变红；L3 的判定由上面四条承担。
+
   # 门禁自举演示（给使用方项目的 CI 样例，见 templates/ci/req-guard-ci.yml）：
   # 实际验证 install --verify、check、ids --check 三个命令的完整生命周期，
   # 并让该样例随 install 生成。
