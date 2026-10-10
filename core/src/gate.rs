@@ -2928,22 +2928,50 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '-')" "$1" >>"$AUDIT_LOG" 2>/dev/null || true
 }
 
-# ---------- 0) AI 禁止直接修改评论文件（★ 必须先于应急绕过：逃逸阀不覆盖证据完整性） ----------
+# ---------- 0) 定位 req-guard 二进制（REQ-022） ----------
+#
+# 变量优先于 PATH：`PATH` 是**继承**来的，GUI 应用（macOS 上由 launchd 派生）与终端
+# 拿到的常常不是同一份 —— 只认 PATH 时「明明装了，门禁却说找不到」无从自证，
+# 用户只剩 `git commit --no-verify` 一条路，而那是逃逸阀，不是解法。
+#
+# 定位失败**不在本段拦截**：第 1 段要靠「`RG_BIN` 为空」走正则兜底，保住
+# `BLOCK-AI-WRITE-COMMENTS` 这条「证据被篡改」的精确归因。提前 `exit` 会拦得更早，
+# 却把归因换成笼统的 `no-binary` —— 拦得住不等于说得清。第 2 段才 fail-closed。
+#
+# 刻意**不**往 PATH 追加任何候选目录：把用户可写目录塞进查找链，等于允许任何能写
+# 该目录的主体替换裁决者 —— 那是本项目最坏的失效「看着在拦、其实没拦」。
+# 环境怎么配是人的事（本变量 / launchctl / CI 里写全 PATH），门禁只认**写明的**路径。
+#
+# 只接受「可执行文件路径」：`-x` 判不过的一律按不可用处理，变量值不参与任何求值，
+# 故 `REQ_GUARD_BIN="req-guard --flag"` 这类命令串不会被当成命令执行。
+RG_BIN=""
+RG_BAD=""
+if [ -n "${REQ_GUARD_BIN:-}" ]; then
+  if [ -x "${REQ_GUARD_BIN}" ]; then
+    RG_BIN="${REQ_GUARD_BIN}"
+  else
+    RG_BAD="${REQ_GUARD_BIN}"
+  fi
+elif command -v req-guard >/dev/null 2>&1; then
+  RG_BIN="req-guard"
+fi
+
+# ---------- 1) AI 禁止直接修改评论文件（★ 必须先于应急绕过：逃逸阀不覆盖证据完整性） ----------
 if [ ! -t 0 ]; then
   STDIN_DATA=$(cat 2>/dev/null || true)
   if [ -n "$STDIN_DATA" ]; then
     # 优先交给 req-guard 用 Rust **真解析** JSON：AI 工具 payload 允许 Unicode 转义
     # （".gates\u002f…comments.md" 与 ".gates/…comments.md" 完全等价），正则匹配不到
     # 会静默放过——那正是本工具最坏的失效：看着在拦，其实没拦。
-    if command -v req-guard >/dev/null 2>&1; then
+    if [ -n "$RG_BIN" ]; then
       # 拦截时 req-guard 已把原因打到 stderr（AI 看得见），这里只接退出码
-      OUT=$(printf '%s' "$STDIN_DATA" | req-guard hook-check) || exit 1
+      OUT=$(printf '%s' "$STDIN_DATA" | "$RG_BIN" hook-check) || exit 1
       case "$OUT" in
         # 清单正文（状态行未改动）：放行本次写，不再要求三段已批准
         *REQ_GUARD_ALLOW_DOC=1*) exit 0 ;;
       esac
     else
-      # 兜底：二进制不在 PATH（受限环境）时退回正则粗判。
+      # 兜底：二进制不可用（未装 / 不在 PATH / REQ_GUARD_BIN 指错）时退回正则粗判。
       # 只保留证据保护，**不**放行清单正文（无法校验状态行 → 宁可维持 fail-closed）
       FP=$(printf '%s' "$STDIN_DATA" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
       case "$FP" in
@@ -2958,9 +2986,9 @@ if [ ! -t 0 ]; then
   fi
 fi
 
-# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+# ---------- 2) 裁决（判定在 core；脚本只取参与渲染） ----------
 #
-# 为什么第 1 段之后的一切都被删掉了：三段检查、阻塞评论、评论摘要、内容冻结，
+# 为什么第 2 段之后的一切都被删掉了：三段检查、阻塞评论、评论摘要、内容冻结，
 # 现在全部由 `req-guard check` 判定（core/src/resolve.rs）。本脚本**不含任何裁决分支** ——
 # ① 判定散落到第二处的那一刻起，它就与 core 版本漂移，而门禁最坏的失效不是"报错"
 # 而是"看着在拦、其实没拦"；② 任何加进本脚本的判定都必须在 HOOK_PS1 里逐行镜像一遍，
@@ -2969,18 +2997,28 @@ fi
 # 三个上下文各取一种变更集，**不得混用**（两个变更集混判必然产生无法解释的裁决）：
 #   有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON，不在 sh 里 sed 抠
 #   无 payload（pre-commit / 人工）→ --staged：已暂存文件集
-if ! command -v req-guard >/dev/null 2>&1; then
+if [ -n "$RG_BIN" ]; then
+  if [ -n "${STDIN_DATA:-}" ]; then
+    printf '%s' "$STDIN_DATA" | "$RG_BIN" check --stdin || exit 1
+  else
+    "$RG_BIN" check --staged || exit 1
+  fi
+elif [ -n "$RG_BAD" ]; then
+  # 变量设了却不可用 → **不回退 PATH**。显式声明是环境契约：静默改用另一份二进制
+  # 会让「实际由谁裁决」取决于 PATH 里恰好有什么 —— 版本漂移即判定口径漂移，
+  # 且现象随机、最难排查。fail-closed 与本项目其余部分一致：宁可让人修环境，不猜。
+  log "BLOCK no-binary-badenv"
+  echo "[req-guard] ⛔ 拦截：REQ_GUARD_BIN 指向的文件不可用（${RG_BAD}），本次写/提交已被阻止。" >&2
+  echo "          请确认该路径存在、是文件且有执行位（POSIX）；清空该变量即回到 PATH 查找。" >&2
+  exit 1
+else
   log "BLOCK no-binary"
   echo "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。" >&2
   echo "          判定在 core，缺二进制即无从判定 —— fail-closed，不猜。" >&2
   echo "          请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。" >&2
+  echo "          亦可用 REQ_GUARD_BIN=<绝对路径> 显式指定（GUI 应用与终端的 PATH 常常不是同一份）。" >&2
   echo "          确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）" >&2
   exit 1
-fi
-if [ -n "${STDIN_DATA:-}" ]; then
-  printf '%s' "$STDIN_DATA" | req-guard check --stdin || exit 1
-else
-  req-guard check --staged || exit 1
 fi
 "#;
 
@@ -2999,16 +3037,34 @@ function Write-GateAudit([string]$msg) {
   Add-Content -Path $AUDIT_LOG -Value $line -Encoding UTF8
 }
 
-# ---------- 0) AI 禁止直接修改评论文件（★ 必须先于应急绕过） ----------
+# ---------- 0) 定位 req-guard 二进制（REQ-022；与 HOOK_SH 第 0 段逐条镜像） ----------
+# 变量优先于 PATH：PATH 是**继承**来的，GUI 应用与终端拿到的常常不是同一份，
+# 只认 PATH 时「明明装了却报找不到」无从自证。定位失败**不在本段拦截** ——
+# 第 1 段要靠「$rgBin 为空」走正则兜底，保住「证据被篡改」那条精确归因。
+# 刻意**不**往 PATH 追加任何目录：那等于允许替换裁决者（理由见 HOOK_SH 第 0 段）。
+# Windows 没有 POSIX 执行位，故只判「是文件」（`Leaf`）—— 与 POSIX 侧唯一的语义差。
+$rgBin = ''
+$rgBad = ''
+if ($env:REQ_GUARD_BIN) {
+  if (Test-Path -LiteralPath $env:REQ_GUARD_BIN -PathType Leaf) {
+    $rgBin = $env:REQ_GUARD_BIN
+  } else {
+    $rgBad = $env:REQ_GUARD_BIN
+  }
+} elseif (Get-Command req-guard -ErrorAction SilentlyContinue) {
+  $rgBin = 'req-guard'
+}
+
+# ---------- 1) AI 禁止直接修改评论文件（★ 必须先于应急绕过） ----------
 if (-not [Console]::IsInputRedirected) {
   $stdinData = ''
 } else {
   $stdinData = [Console]::In.ReadToEnd()
 }
 if ($stdinData.Trim()) {
-  # 优先交给 req-guard 用 Rust **真解析**（正则会被 Unicode 转义绕过，详见 HOOK_SH 第 0 段）
-  if (Get-Command req-guard -ErrorAction SilentlyContinue) {
-    $out = $stdinData | req-guard hook-check
+  # 优先交给 req-guard 用 Rust **真解析**（正则会被 Unicode 转义绕过，详见 HOOK_SH 第 1 段）
+  if ($rgBin) {
+    $out = $stdinData | & $rgBin hook-check
     if ($LASTEXITCODE -ne 0) { exit 1 }
     # 清单正文（状态行未改动）：放行本次写，不再要求三段已批准
     if ($out -match 'REQ_GUARD_ALLOW_DOC=1') { exit 0 }
@@ -3023,22 +3079,28 @@ if ($stdinData.Trim()) {
   }
 }
 
-# ---------- 1) 裁决（判定在 core；脚本只取参与渲染） ----------
+# ---------- 2) 裁决（判定在 core；脚本只取参与渲染） ----------
 # 与 HOOK_SH 同构：本地 sh 是唯一真实部署面，本文件是它的逐行镜像（Windows 资产）。
-# 镜像负债之所以只剩这一处，正是因为第 1 段之后的一切裁决都已下沉到 core。
-if (-not (Get-Command req-guard -ErrorAction SilentlyContinue)) {
-    Write-GateAudit "BLOCK no-binary"
-    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install）。确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）。"
+# 镜像负债之所以只剩这一处，正是因为第 2 段之外的一切裁决都已下沉到 core。
+if ($rgBin) {
+    if ($stdinData.Trim()) {
+        # 有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON
+        $stdinData | & $rgBin check --stdin | Out-Host
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+    } else {
+        # 无 payload（pre-commit / 人工）→ --staged
+        & $rgBin check --staged | Out-Host
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+    }
+} elseif ($rgBad) {
+    # 变量设了却不可用 → **不回退 PATH**（理由见 HOOK_SH 第 2 段）
+    Write-GateAudit "BLOCK no-binary-badenv"
+    Write-Error "[req-guard] ⛔ 拦截：REQ_GUARD_BIN 指向的文件不可用（$rgBad），本次写/提交已被阻止。请确认该路径存在且是文件；清空该环境变量即回到 PATH 查找。"
     exit 1
-}
-if ($stdinData.Trim()) {
-    # 有 payload（AI PreToolUse）→ --stdin：路径由 Rust 真解析 JSON
-    $stdinData | req-guard check --stdin | Out-Host
-    if ($LASTEXITCODE -ne 0) { exit 1 }
 } else {
-    # 无 payload（pre-commit / 人工）→ --staged
-    req-guard check --staged | Out-Host
-    if ($LASTEXITCODE -ne 0) { exit 1 }
+    Write-GateAudit "BLOCK no-binary"
+    Write-Error "[req-guard] ⛔ 拦截：无法裁决（req-guard 不在 PATH），本次写/提交已被阻止。判定在 core，缺二进制即无从判定 —— fail-closed，不猜。请把 req-guard 加入 PATH 后重试（安装见 req-guard install），亦可用 REQ_GUARD_BIN=<绝对路径> 显式指定（GUI 应用与终端的 PATH 常常不是同一份）。确需本次放行：git commit --no-verify / req-guard bypass --reason \"<原因>\"（应急绕过，须人类凭据）。"
+    exit 1
 }
 exit 0
 "#;
@@ -3088,13 +3150,17 @@ pub fn verify_warnings(root: &Path) -> Vec<String> {
     let Some(sh) = read_hook(root, HOOK_SH_REL) else {
         return out;
     };
+    // REQ-022：命令名不再写死 —— 它来自定位结果（`REQ_GUARD_BIN` 优先，否则 PATH 上的
+    // `req-guard`）。故判据从 `req-guard check --stdin` 收敛为 `check --stdin`；
+    // 收敛掉的那部分（"确实在调用某个二进制，而不是注释里写着玩"）由下面那条定位检查补上，
+    // 否则脚本里留一句 `check --stdin` 的注释也能骗过本检查 —— 存在性 ≠ 行为。
     for (needle, why) in [
         (
-            "req-guard check --stdin",
+            "check --stdin",
             "主门禁脚本未委托 core 判定（PreToolUse 侧）",
         ),
         (
-            "req-guard check --staged",
+            "check --staged",
             "主门禁脚本未委托 core 判定（pre-commit 侧）",
         ),
     ] {
@@ -3104,6 +3170,12 @@ pub fn verify_warnings(root: &Path) -> Vec<String> {
                  行为由实跑语义自检判定"
             ));
         }
+    }
+    if !sh.contains("REQ_GUARD_BIN") && !sh.contains("command -v req-guard") {
+        out.push(format!(
+            "{HOOK_SH_REL} 未定位 req-guard 二进制（既无 `REQ_GUARD_BIN` 也无 \
+             `command -v req-guard`）——脚本无从裁决，只能恒拦（fail-closed）"
+        ));
     }
     out
 }
@@ -3185,6 +3257,173 @@ fn resolve_gate_binary(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::testutil::fill_sections;
+
+    // ── REQ-022：门禁脚本支持 REQ_GUARD_BIN（U-01 … U-08） ──────────────
+
+    /// 沙箱：git init + 落一份 `HOOK_SH`（不跑 `install`，避免自证）。
+    fn req022_sandbox(tag: &str) -> PathBuf {
+        let p = super::sandbox_repo(tag).expect("REQ-022 沙箱需要 git");
+        let dst = p.join(HOOK_SH_REL);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&dst, HOOK_SH).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&dst).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&dst, perm).unwrap();
+        }
+        p
+    }
+
+    /// 造一个假二进制（替代真 `req-guard`，便于断言「调用了谁、传了什么」）。
+    fn req022_fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&p, perm).unwrap();
+        }
+        p
+    }
+
+    /// 实跑脚本：`bin` = `REQ_GUARD_BIN` 的取值（`None` 视为未设置 → 传空串，测 B-01），
+    /// `path` = 子进程的 PATH，`payload` = stdin（给就是 PreToolUse 场景）。
+    fn req022_run(root: &Path, bin: Option<&str>, path: &str, payload: Option<&str>) -> (i32, String) {
+        use std::io::Write;
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(root)
+            .arg(root.join(HOOK_SH_REL))
+            .env("PATH", path)
+            .env("REQ_GUARD_BIN", bin.unwrap_or(""))
+            .env_remove(crate::auth::AI_CTX_ENV)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn sh");
+        if let Some(p) = payload {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(p.as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().expect("wait");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    fn req022_count(hay: &str, needle: &str) -> usize {
+        hay.lines().filter(|l| l.contains(needle)).count()
+    }
+
+    #[test]
+    fn req022_u01_hook_sh_mentions_var() {
+        assert!(
+            req022_count(HOOK_SH, "REQ_GUARD_BIN") >= 3,
+            "HOOK_SH 至少要在定位 / 拦截报错 / 提示三处提到 REQ_GUARD_BIN"
+        );
+        assert!(HOOK_SH.contains("RG_BAD"), "HOOK_SH 需区分「没配」与「配了不可用」");
+        assert!(HOOK_SH.contains("RG_BIN"), "HOOK_SH 需有定位结果变量");
+    }
+
+    #[test]
+    fn req022_u02_hook_ps1_mentions_var() {
+        assert!(HOOK_PS1.contains("$env:REQ_GUARD_BIN"), "PS1 需镜像变量定位");
+        assert!(HOOK_PS1.contains("$rgBin"), "PS1 需有定位结果变量");
+        assert!(HOOK_PS1.contains("$rgBad"), "PS1 需镜像「配了不可用」分支");
+        // 变量优先于 PATH：`Get-Command req-guard` 必须落在 elseif，不能在 if。
+        assert!(
+            HOOK_PS1.contains("} elseif (Get-Command req-guard -ErrorAction SilentlyContinue)"),
+            "PS1 的 PATH 查找必须在变量的 elseif 分支（否则变量优先级被反转）"
+        );
+    }
+
+    #[test]
+    fn req022_u03_calls_are_quoted() {
+        assert!(HOOK_SH.contains("\"$RG_BIN\" hook-check"));
+        assert!(HOOK_SH.contains("\"$RG_BIN\" check --stdin"));
+        assert!(HOOK_SH.contains("\"$RG_BIN\" check --staged"));
+        assert!(HOOK_SH.contains("[ -x \"${REQ_GUARD_BIN}\" ]"));
+        assert!(HOOK_PS1.contains("Test-Path -LiteralPath $env:REQ_GUARD_BIN -PathType Leaf"));
+    }
+
+    #[test]
+    fn req022_u04_var_points_to_ok_binary() {
+        let root = req022_sandbox("req022-u04");
+        let fake = req022_fake_bin(&root, "fake-ok", "exit 0");
+        let (rc, _) = req022_run(&root, Some(&fake.display().to_string()), "/usr/bin:/bin", None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rc, 0, "变量指向可用二进制时必须走它并放行");
+    }
+
+    #[test]
+    fn req022_u05_var_points_to_missing() {
+        let root = req022_sandbox("req022-u05");
+        let (rc, err) = req022_run(&root, Some("/tmp/definitely-not-exist-req-guard"), "/usr/bin:/bin", None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rc, 1, "变量指向不可用路径必须 fail-closed");
+        assert!(
+            err.contains("/tmp/definitely-not-exist-req-guard"),
+            "拦截文案必须打出那个路径，实际：{err}"
+        );
+        assert!(err.contains("REQ_GUARD_BIN"), "需说明是变量不可用，而不是笼统的 PATH 缺失");
+    }
+
+    #[test]
+    fn req022_u06_no_var_no_path_still_blocks() {
+        let root = req022_sandbox("req022-u06");
+        let (rc, err) = req022_run(&root, None, "/usr/bin:/bin", None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rc, 1, "未设变量且 PATH 上没有二进制 → 必须恒拦（不回归）");
+        assert!(err.contains("req-guard 不在 PATH"), "文案保持既有字面量，实际：{err}");
+    }
+
+    #[test]
+    fn req022_u07_regex_fallback_survives() {
+        // 设计 4 的高危项：定位段若提前 exit，第 1 段的正则兜底会永远不可达，
+        // 审计里将不再有 BLOCK-AI-WRITE-COMMENTS 这条「证据被篡改」的精确归因。
+        let root = req022_sandbox("req022-u07");
+        let payload = format!(
+            "{{\"file_path\":\"{}/.gates/requirements/REQ-001.comments.md\"}}",
+            root.display()
+        );
+        let (rc, _) = req022_run(&root, None, "/usr/bin:/bin", Some(&payload));
+        let log = fs::read_to_string(root.join(".gates/audit/gate-audit.log")).unwrap_or_default();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rc, 1, "AI 写评论文件必须被拦");
+        assert!(
+            log.contains("BLOCK-AI-WRITE-COMMENTS"),
+            "二进制不可用时仍要走正则兜底并留下精确归因，实际日志：{log}"
+        );
+    }
+
+    #[test]
+    fn req022_u08_var_used_in_pretooluse() {
+        // 变量必须也在 AI PreToolUse 侧生效（那边才是 L1 的主战场）。
+        let root = req022_sandbox("req022-u08");
+        let calls = root.join("calls.txt");
+        let fake = req022_fake_bin(
+            &root,
+            "fake-rec",
+            &format!("printf '%s\\n' \"$1\" >> \"{}\"\nexit 0", calls.display()),
+        );
+        let payload = format!("{{\"file_path\":\"{}/core/src/a.rs\"}}", root.display());
+        let (rc, _) = req022_run(&root, Some(&fake.display().to_string()), "/usr/bin:/bin", Some(&payload));
+        let recorded = fs::read_to_string(&calls).unwrap_or_default();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rc, 0, "假二进制恒 0，脚本应放行");
+        assert!(
+            recorded.contains("hook-check"),
+            "变量指定的二进制必须被调用且收到 hook-check 子命令，实际记录：{recorded}"
+        );
+    }
 
     // ── REQ-019 T4：`tier` 段解析与校验 ──────────────────────────────
 
@@ -4441,8 +4680,11 @@ mod tests {
 
     #[test]
     fn hook_脚本优先调用rust解析且保留兜底() {
+        // REQ-022：命令名由定位结果给出（优先 `REQ_GUARD_BIN`，否则 PATH 上的 `req-guard`），
+        // 故判据从字面量 `req-guard hook-check` 改为 `"$RG_BIN" hook-check` —— 意图不变：
+        // 脚本必须走 Rust 真解析，而不是自己 sed 抠 JSON。
         assert!(
-            HOOK_SH.contains("req-guard hook-check"),
+            HOOK_SH.contains("\"$RG_BIN\" hook-check"),
             "sh 脚本应优先走 Rust 真解析"
         );
         assert!(HOOK_PS1.contains("hook-check"), "ps1 脚本同理");

@@ -1193,8 +1193,12 @@ def verify_multi_gate() -> bool:
         payload_path="core/src/a.rs", expect=1, hint="REQ-002")
 
     # ⑥ 委托接线（反回归）：脚本必须委��� core，且不再自带任何裁决。
-    for needle, should in (("req-guard check --stdin", True),
-                           ("req-guard check --staged", True),
+    # REQ-022：命令名不再写死 —— 它来自定位结果（REQ_GUARD_BIN 优先，否则 PATH 上的
+    # req-guard），故前两条收敛为子命令；收敛掉的部分由第三条定位判据补上，
+    # 否则脚本里写一句含 `check --stdin` 的注释就能骗过（存在性 != 行为，REQ-012 教训）。
+    for needle, should in (("check --stdin", True),
+                           ("check --staged", True),
+                           ("REQ_GUARD_BIN", True),
                            ("sort -r", False), ("GATE:STEP", False),
                            ("verify-content", False), ("expires_epoch=", False)):
         present = needle in HOOK

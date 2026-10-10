@@ -160,3 +160,10 @@
 | 2026-10-10 17:24:07 | DERIVE_SOURCE_REFS REQ-021 - -> .gitignore,scripts,.github/workflows,.cnb.yml,docs/规范,docs,specs,.specify |
 | 2026-10-10 17:24:07 | APPROVE REQ-021 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
 | 2026-10-10 17:24:18 | APPROVE REQ-021 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 18:52:06 | DONE REQ-021 actor=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 19:19:14 | APPROVE REQ-022 step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 19:19:33 | DERIVE_SOURCE_REFS REQ-022 - -> core/src,.gates/hooks,packaging/docs |
+| 2026-10-10 19:19:33 | APPROVE REQ-022 step=solution reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 19:19:40 | APPROVE REQ-022 step=testplan reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 19:51:30 | AMEND step=decomposition reviewer=Mike_Zhu channel=interactive tty=1 ai=0 email=zhuyuan2706@gmail.com sig=490ced91b512 |
+| 2026-10-10 19:58:43 | RESEAL REQ-022 sums=需求分解:f796953f,技术方案:d7a962d4,测试计划:d6cae3ef reason=内容已变更：补设计_7（判据收敛）+_声明范围扩张到_scripts/verify_gate.py |
