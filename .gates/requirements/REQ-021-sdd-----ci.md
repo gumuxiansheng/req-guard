@@ -20,7 +20,7 @@ source_refs: [.gitignore, scripts, .github/workflows, .cnb.yml, docs/规范, doc
 > **本清单是唯一真相**：SDD 产物**保留入库**以供团队评审，但每个文件顶部必须带
 > `<!-- SDD-SOURCE: REQ-021 -->` 声明指向本清单；冲突时一律以本清单为准。
 
-<!-- GATE:HEAD id=REQ-021 status=approved created=2026-10-10_13:14:13 -->
+<!-- GATE:HEAD id=REQ-021 status=done created=2026-10-10_13:14:13 done=2026-10-10_18:52:06 -->
 <!-- GATE:STEP name=decomposition label=需求分解 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-10_17:20:57 sum=495872de9f999511dd6b79c234e680126d6bce8914d5c405a8f356b72dfeb78c -->
 <!-- GATE:STEP name=solution label=技术方案 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-10_17:24:07 sum=23941e0067f35c2a6c57fc222e3e604eee51b07279ea62f94c965e146c755af1 -->
 <!-- GATE:STEP name=testplan label=测试计划 status=approved reviewer=Mike_Zhu email=zhuyuan2706@gmail.com sig=490ced91b512 updated=2026-10-10_17:24:18 sum=f15691880de34dcc84a73fffed74e61c30efe694182a465deb7650471c47ff75 -->
